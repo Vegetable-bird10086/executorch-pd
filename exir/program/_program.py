@@ -1387,11 +1387,17 @@ def to_edge_transform_and_lower(  # noqa: C901
 
     if transform_passes is not None:
         edge_manager = edge_manager.transform(transform_passes)
+    # graph_name = "kv_forward"
+    # print(f"\n===== [{graph_name}] after transform =====\n")
+    # for n in edge_manager._edge_programs[graph_name].graph.nodes:
+    #     print(n.op, n.name, n.target, n.args)
+    #     print("  dtype:", n.meta.get("val", None))
+    #     print("  quant attr:", n.meta.get("quant_attrs", None))
+    #     if generate_etrecord:
+    #         edge_manager._etrecord.add_extra_export_modules(
+    #             {"edge_after_transform": copy.deepcopy(edge_manager)}
+    #         )
 
-        if generate_etrecord:
-            edge_manager._etrecord.add_extra_export_modules(
-                {"edge_after_transform": copy.deepcopy(edge_manager)}
-            )
 
     max_num_partitioners = 0
     for partitioner_list in partitioner.values():

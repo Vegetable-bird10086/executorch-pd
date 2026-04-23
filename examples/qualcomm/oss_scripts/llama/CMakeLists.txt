@@ -35,6 +35,8 @@ list(
   ${CMAKE_CURRENT_LIST_DIR}/runner/prompt_processor.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/token_generator.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/token_generator.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/pte_rebuilder.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/pte_rebuilder.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/imem_alloc.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/client_mem.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/lhd_token_generator.cpp
@@ -82,6 +84,96 @@ target_include_directories(
 target_compile_options(qnn_llama_runner PUBLIC ${_common_compile_options})
 set_target_properties(
   qnn_llama_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+)
+
+# build qnn llama pd runner without touching the original runner entrypoint
+set(_llama_pd_runner__srcs ${_llama_runner__srcs})
+list(FILTER _llama_pd_runner__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")
+list(FILTER _llama_pd_runner__srcs EXCLUDE REGEX ".*runner/runner\.(cpp|h)")
+list(
+  PREPEND
+  _llama_pd_runner__srcs
+  ${CMAKE_CURRENT_LIST_DIR}/qnn_llama_pd_runner.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/pd_runner.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/pd_runner.h
+)
+
+add_executable(qnn_llama_pd_runner ${_llama_pd_runner__srcs})
+target_include_directories(
+  qnn_llama_pd_runner PUBLIC ${_common_include_directories}
+)
+target_include_directories(
+  qnn_llama_pd_runner PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
+)
+target_include_directories(
+  qnn_llama_pd_runner PUBLIC ${CMAKE_BINARY_DIR}/../../schema/include
+)
+target_include_directories(
+  qnn_llama_pd_runner PUBLIC ${EXECUTORCH_ROOT}/third-party/flatbuffers/include
+)
+target_link_libraries(
+  qnn_llama_pd_runner
+  qnn_executorch_backend
+  executorch_core
+  extension_data_loader
+  extension_flat_tensor
+  extension_llm_runner
+  extension_module
+  extension_tensor
+  gflags
+  custom_ops
+  quantized_ops_lib
+  quantized_kernels
+  tokenizers::tokenizers
+)
+target_compile_options(qnn_llama_pd_runner PUBLIC ${_common_compile_options})
+set_target_properties(
+  qnn_llama_pd_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+)
+
+# build qnn llama end-to-end pd runner that exports handoff then launches
+# llama-pd-cli for decode
+set(_llama_pd_e2e_runner__srcs ${_llama_pd_runner__srcs})
+list(FILTER _llama_pd_e2e_runner__srcs EXCLUDE REGEX ".*qnn_llama_pd_runner.*")
+list(
+  PREPEND
+  _llama_pd_e2e_runner__srcs
+  ${CMAKE_CURRENT_LIST_DIR}/qnn_llama_pd_e2e_runner.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/runner.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/runner.h
+)
+
+add_executable(qnn_llama_pd_e2e_runner ${_llama_pd_e2e_runner__srcs})
+target_include_directories(
+  qnn_llama_pd_e2e_runner PUBLIC ${_common_include_directories}
+)
+target_include_directories(
+  qnn_llama_pd_e2e_runner PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
+)
+target_include_directories(
+  qnn_llama_pd_e2e_runner PUBLIC ${CMAKE_BINARY_DIR}/../../schema/include
+)
+target_include_directories(
+  qnn_llama_pd_e2e_runner PUBLIC ${EXECUTORCH_ROOT}/third-party/flatbuffers/include
+)
+target_link_libraries(
+  qnn_llama_pd_e2e_runner
+  qnn_executorch_backend
+  executorch_core
+  extension_data_loader
+  extension_flat_tensor
+  extension_llm_runner
+  extension_module
+  extension_tensor
+  gflags
+  custom_ops
+  quantized_ops_lib
+  quantized_kernels
+  tokenizers::tokenizers
+)
+target_compile_options(qnn_llama_pd_e2e_runner PUBLIC ${_common_compile_options})
+set_target_properties(
+  qnn_llama_pd_e2e_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
 )
 
 # build qnn multimodal runner preprocess qnn runner src files for multimodal

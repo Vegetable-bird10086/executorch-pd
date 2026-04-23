@@ -30,7 +30,7 @@ class EagerEvalWrapper(eval_wrapper):
         use_kv_cache: bool = False,
     ):
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        super().__init__(device=device, pretrained="gpt2")
+        super().__init__(device=device, pretrained="Qwen/Qwen3-0.6B")
         self._model = model
         self._tokenizer = tokenizer
         self._device = torch.device(device)

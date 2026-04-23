@@ -512,7 +512,7 @@ def _generate(
     max_cache_len = max_seq_len - ar_len
     num_tokens = len(total_token_list)
     if lookahead_config is None:
-        while total_token_list[-1] != tokenizer.eos_id and num_tokens < max_seq_len:
+        while total_token_list[-1] != tokenizer.eos_id and num_tokens < max_seq_len and num_tokens < len(total_token_list)+50:
             chunk_start_idx = min(pos, max_cache_len)
             # Take a chunk of generated tokens, up to ar_len length.
             chunk_end_idx = num_tokens

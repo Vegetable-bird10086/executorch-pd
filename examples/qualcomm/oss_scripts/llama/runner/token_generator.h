@@ -63,6 +63,11 @@ class TokenGenerator {
   virtual const std::vector<uint16_t>& get_all_logits();
 
   /**
+   * @brief Clear cached logits collected for analysis.
+   */
+  virtual void clear_all_logits();
+
+  /**
      * @brief Generate tokens.
      * @param tokens Vector of input tokens.
      * @param start_pos Starting position for generation.

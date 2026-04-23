@@ -209,6 +209,11 @@ const std::vector<uint16_t>& TokenGenerator<T>::get_all_logits() {
   return token_all_logits_;
 }
 
+template <typename T>
+void TokenGenerator<T>::clear_all_logits() {
+  token_all_logits_.clear();
+}
+
 // This function only considers the case where token_generator_ar_len equals 1.
 template <typename T>
 void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos) {

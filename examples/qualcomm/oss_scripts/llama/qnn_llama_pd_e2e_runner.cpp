@@ -1,35 +1,25 @@
-/*
- * Copyright (c) Qualcomm Innovation Center, Inc.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/**
- * @file
- *
- * This tool can run Llama2 110M, Llama3.2 1B / 3B, Gemma 2B, Gemma2 2B, Gemma3
- * 1B, Granite3.3 2B, phi4-mini-instruct, Qwen2.5 0.5B / 1.5B, Qwen3 0.6B
- * / 1.7B, SmolLM2 135M, SmolLM3 3B with Qualcomm AI Engine Direct.
- *
- */
-
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/pd_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/pte_rebuilder.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
 #include <executorch/extension/data_loader/buffer_data_loader.h>
-#include <executorch/extension/llm/runner/irunner.h>
 #include <executorch/runtime/platform/log.h>
 #include <gflags/gflags.h>
 
-#include <cstdint>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
-DEFINE_string(decoder_model_version, "llama2", "The decoder model to execute.");
+DEFINE_string(decoder_model_version, "qwen3", "The decoder model to execute.");
 DEFINE_string(
     model_path,
     "kv_llama_qnn.pte",
@@ -37,12 +27,11 @@ DEFINE_string(
 DEFINE_string(
     stripped_model_path,
     "",
-    "Stripped model serialized in flatbuffer format. When provided with index_bin_path and a rebuild source, the original PTE is rebuilt in memory.");
+    "Stripped model serialized in flatbuffer format.");
 DEFINE_string(
     index_bin_path,
     "",
     "Path to the binary strip index used to rebuild a stripped PTE in memory.");
-
 DEFINE_string(
     qat_checkpoint_path,
     "",
@@ -63,51 +52,45 @@ DEFINE_string(
     qat_qweight_mode,
     "qweight_minus_qzeros",
     "QAT qweight decoding mode used during stripped PTE rebuild.");
-DEFINE_string(
-    attention_sink_rope_path,
-    "",
-    "[Attention Sink] The Attention Sink Rope Model is serialized using the flatbuffer format. If specified, seq_len can exceed the context length defined in the model.");
+DEFINE_string(tokenizer_path, "tokenizer.bin", "Tokenizer path.");
 DEFINE_string(
     output_path,
     "outputs.txt",
-    "Executorch inference data output path.");
+    "Output path. In WikiText PPL mode, writes wiki_ppl=<value>.");
 DEFINE_string(
     performance_output_path,
     "inference_speed.txt",
-    "Records inference speed. For CI purpose.");
-DEFINE_string(
-    dump_logits_path,
-    "",
-    "If path is provided, program will dump all logits generated. This option is for analysis purpose. It is not recommended for general usage as it will cause token rate drop and increase in memory usage.");
-DEFINE_string(tokenizer_path, "tokenizer.bin", "Tokenizer stuff.");
-DEFINE_string(
-    prompt,
-    "The answer to the ultimate question is",
-    "User prompts for Llama. When multiple prompts are entered, a multi-turn conversation will be initiated. Note that this feature is currently for testing purposes only.");
+    "Performance report output path used by WikiText PPL mode.");
+DEFINE_string(prompt, "", "Prompt text to prefill and decode.");
 DEFINE_string(
     tokenized_prompt,
     "",
-    "This is an alternative of passing prompts. Users could provide this in a raw file, with tokens saved in uint64 format.");
-DEFINE_string(
-    system_prompt,
-    "",
-    "Tells the model what kind of assistant it should be. For example, You are a helpful AI assistant for travel tips and recommendations. Default is None");
+    "Optional raw uint64 token file used instead of string prompt.");
+DEFINE_string(system_prompt, "", "Optional system prompt.");
 DEFINE_string(
     wikitext_path,
     "",
-    "Path to a local WikiText text file. When provided, the runner computes WikiText perplexity instead of generating text.");
+    "Path to a local WikiText text file. When provided, the runner computes WikiText perplexity and skips PD handoff/decode.");
 DEFINE_int32(
     wikitext_max_tokens,
     0,
     "Maximum number of WikiText target tokens to score. Non-positive values mean score all available tokens.");
-DEFINE_double(
-    temperature,
-    0.0f,
-    "Temperature; Default is 0.0f. 0 = greedy argmax sampling (deterministic). Lower temperature = more deterministic");
+DEFINE_string(
+    prefill_export_dir,
+    "",
+    "Optional output directory for PD handoff export. When omitted, a temporary directory is created.");
+DEFINE_string(
+    kv_quant_attrs_path,
+    "",
+    "Required KV quant attrs JSON for 8-bit KV PD export. Use the Prefill-side file such as prefill_kv_quant_attrs.json.");
+DEFINE_string(
+    attention_sink_rope_path,
+    "",
+    "Attention sink rope PTE. Not supported in PD v1 export.");
 DEFINE_int32(
     seq_len,
-    128,
-    "Total number of tokens to generate (prompt + output).");
+    1024,
+    "Compiled sequence length budget to respect during prefill export.");
 DEFINE_int32(
     eval_mode,
     1,
@@ -115,30 +98,60 @@ DEFINE_int32(
 DEFINE_bool(
     shared_buffer,
     false,
-    "Specifies to use shared buffers for zero-copy use case between the application and device/co-processor associated with the backend.");
-DEFINE_int32(num_iters, 1, "total num of iterations to run.");
+    "Whether to use shared RPC buffers.");
+
+DEFINE_bool(
+    prefill_only,
+    false,
+    "Only export the PD handoff and skip llama.cpp decode.");
+DEFINE_string(
+    llama_pd_cli_path,
+    "",
+    "Path to the llama-pd-cli executable used for decode. Required unless --prefill_only=true.");
+DEFINE_string(
+    decode_gguf_path,
+    "",
+    "Path to the decode-side GGUF model. When omitted, --gguf_model_path is reused.");
 DEFINE_int32(
-    ngram,
-    0,
-    "[Lookahead Decoding] Represents the size of the n-grams used in the lookahead process.");
+    decode_n_predict,
+    128,
+    "Number of tokens to generate after importing the PD handoff.");
 DEFINE_int32(
-    window,
-    0,
-    "[Lookahead Decoding] Determines how many future tokens the algorithm attempts to predict in each step.");
+    decode_threads,
+    4,
+    "Decode-side thread count passed to llama-pd-cli.");
 DEFINE_int32(
-    gcap,
+    decode_ctx,
+    2048,
+    "Decode-side llama.cpp context size.");
+DEFINE_double(
+    decode_temp,
+    0.0f,
+    "Decode-side sampling temperature.");
+DEFINE_int32(
+    decode_ngl,
     0,
-    "[Lookahead Decoding] Represents the maximum number of speculations or candidate n-grams that the algorithm considers in each step for verification. It balances the trade-off between computation efficiency and exploring more possibilities.");
+    "Decode-side number of offloaded layers (-ngl).");
+DEFINE_bool(
+    decode_import_ro,
+    false,
+    "Only validate/import the PD handoff in llama.cpp without continuing decode.");
+DEFINE_bool(
+    decode_roundtrip_check,
+    false,
+    "Ask llama-pd-cli to re-serialize the imported KV sequence and compare it byte-for-byte with the imported PD blob.");
+DEFINE_bool(
+    decode_native_compare,
+    false,
+    "Ask llama-pd-cli to compare imported-KV resume logits against a native GGUF prefill resume on the same prompt tokens.");
+
+namespace fs = std::filesystem;
 
 namespace {
 
 struct ModuleBundle {
   std::unique_ptr<executorch::extension::Module> module;
-  std::shared_ptr<std::vector<uint8_t>> rebuilt_pte;
-  double rebuild_time_ms{0.0};
-  size_t rebuilt_records{0};
-  bool rebuilt_from_stripped{false};
-  bool specialized_fast_path_used{false};
+  std::shared_ptr<std::vector<uint8_t>> pte_bytes;
 };
 
 struct ModuleMetaInfo {
@@ -183,13 +196,17 @@ bool should_rebuild_from_stripped() {
 ModuleBundle load_module_from_file_or_rebuild() {
   ModuleBundle bundle;
   if (!should_rebuild_from_stripped()) {
-    bundle.module = std::make_unique<executorch::extension::Module>(
-        FLAGS_model_path.c_str(),
-        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+    bundle.pte_bytes =
+        std::make_shared<std::vector<uint8_t>>(read_binary_file(FLAGS_model_path));
+    auto data_loader = std::make_unique<executorch::extension::BufferDataLoader>(
+        bundle.pte_bytes->data(), bundle.pte_bytes->size());
+    bundle.module =
+        std::make_unique<executorch::extension::Module>(std::move(data_loader));
     return bundle;
   }
 
-  const std::vector<uint8_t> stripped_pte = read_binary_file(FLAGS_stripped_model_path);
+  const std::vector<uint8_t> stripped_pte =
+      read_binary_file(FLAGS_stripped_model_path);
   const std::vector<uint8_t> index_bytes = read_binary_file(FLAGS_index_bin_path);
   example::PteRebuildResult rebuild_result;
   if (!FLAGS_gguf_model_path.empty()) {
@@ -207,30 +224,22 @@ ModuleBundle load_module_from_file_or_rebuild() {
         FLAGS_qat_group_size,
         FLAGS_qat_qweight_mode);
   }
-
-  bundle.rebuilt_pte = rebuild_result.rebuilt_pte;
-  bundle.rebuild_time_ms = rebuild_result.rebuild_time_ms;
-  bundle.rebuilt_records = rebuild_result.rebuilt_records;
-  bundle.specialized_fast_path_used = rebuild_result.specialized_fast_path_used;
-  bundle.rebuilt_from_stripped = true;
-
+  bundle.pte_bytes = rebuild_result.rebuilt_pte;
   auto data_loader = std::make_unique<executorch::extension::BufferDataLoader>(
-      bundle.rebuilt_pte->data(), bundle.rebuilt_pte->size());
-  bundle.module = std::make_unique<executorch::extension::Module>(std::move(data_loader));
+      bundle.pte_bytes->data(), bundle.pte_bytes->size());
+  bundle.module =
+      std::make_unique<executorch::extension::Module>(std::move(data_loader));
   return bundle;
 }
-
 
 ModuleMetaInfo read_module_meta(executorch::extension::Module* module) {
   ModuleMetaInfo meta;
   auto method_names = module->method_names();
   ET_CHECK_MSG(method_names.ok(), "Failed to read module method names");
-
   if (method_names->count("get_kv_io_bit_width") > 0) {
     meta.kv_bitwidth = static_cast<example::KvBitWidth>(
         module->get("get_kv_io_bit_width").get().toScalar().to<int64_t>());
   }
-
   if (method_names->count("get_logits_scale") > 0) {
     meta.logits_scale =
         static_cast<float>(module->get("get_logits_scale").get().toDouble());
@@ -240,7 +249,6 @@ ModuleMetaInfo read_module_meta(executorch::extension::Module* module) {
     meta.logits_zero_point =
         module->get("get_logits_zero_point").get().toScalar().to<int64_t>();
   }
-
   return meta;
 }
 
@@ -264,8 +272,7 @@ std::string get_formatted_prompt(
       break;
     case example::DecoderModelVersion::kLlama3:
       if (!system_prompt.empty()) {
-        formatted_prompt.append(
-            "<|start_header_id|>system<|end_header_id|>\n\n");
+        formatted_prompt.append("<|start_header_id|>system<|end_header_id|>\n\n");
         formatted_prompt.append(system_prompt);
         formatted_prompt.append("<|eot_id|>");
       }
@@ -355,141 +362,254 @@ std::string get_formatted_prompt(
       formatted_prompt.append("<|assistant|>\n");
       break;
     default:
-      ET_CHECK_MSG(false, "unsupported llama version");
+      ET_CHECK_MSG(false, "unsupported decoder version");
       break;
   }
   return formatted_prompt;
 }
 
-} // namespace
+std::string create_temp_handoff_dir() {
+  std::string pattern = "/tmp/qnn_pd_handoff_XXXXXX";
+  std::vector<char> writable(pattern.begin(), pattern.end());
+  writable.push_back('\0');
+  char* created = mkdtemp(writable.data());
+  ET_CHECK_MSG(created != nullptr, "mkdtemp failed: %s", std::strerror(errno));
+  return std::string(created);
+}
+
+std::string resolve_decode_gguf_path() {
+  if (!FLAGS_decode_gguf_path.empty()) {
+    return FLAGS_decode_gguf_path;
+  }
+  return FLAGS_gguf_model_path;
+}
+
+int run_decode_process(const std::string& handoff_dir) {
+  ET_CHECK_MSG(
+      !FLAGS_llama_pd_cli_path.empty(),
+      "--llama_pd_cli_path is required unless --prefill_only=true");
+  const std::string decode_gguf_path = resolve_decode_gguf_path();
+  ET_CHECK_MSG(
+      !decode_gguf_path.empty(),
+      "Provide --decode_gguf_path or --gguf_model_path for decode");
+
+  std::vector<std::string> args = {
+      FLAGS_llama_pd_cli_path,
+      "--pd-import",
+      handoff_dir,
+      "-m",
+      decode_gguf_path,
+      "-n",
+      std::to_string(FLAGS_decode_n_predict),
+      "-c",
+      std::to_string(FLAGS_decode_ctx),
+      "-ngl",
+      std::to_string(FLAGS_decode_ngl),
+      "--temp",
+      std::to_string(FLAGS_decode_temp),
+  };
+  if (FLAGS_decode_threads > 0) {
+    args.push_back("-t");
+    args.push_back(std::to_string(FLAGS_decode_threads));
+  }
+  if (FLAGS_decode_import_ro) {
+    args.push_back("--pd-import-ro");
+  }
+  if (FLAGS_decode_roundtrip_check) {
+    args.push_back("--pd-roundtrip-check");
+  }
+  if (FLAGS_decode_native_compare) {
+    args.push_back("--pd-native-compare");
+  }
+
+  ET_LOG(Info, "Launching decode via llama-pd-cli");
+  for (const auto& arg : args) {
+    ET_LOG(Info, "  arg: %s", arg.c_str());
+  }
+
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (auto& arg : args) {
+    argv.push_back(arg.data());
+  }
+  argv.push_back(nullptr);
+
+  const pid_t pid = fork();
+  ET_CHECK_MSG(pid >= 0, "fork failed: %s", std::strerror(errno));
+  if (pid == 0) {
+    execvp(argv[0], argv.data());
+    std::fprintf(
+        stderr,
+        "execvp failed for %s: %s\n",
+        FLAGS_llama_pd_cli_path.c_str(),
+        std::strerror(errno));
+    _exit(127);
+  }
+
+  int status = 0;
+  ET_CHECK_MSG(waitpid(pid, &status, 0) == pid, "waitpid failed: %s", std::strerror(errno));
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  if (WIFSIGNALED(status)) {
+    return 128 + WTERMSIG(status);
+  }
+  return 1;
+}
 
 template <typename T>
-void start_runner(
+void run_wikitext_ppl(
     ModuleBundle module_bundle,
-    ModuleMetaInfo module_meta,
-    std::vector<std::string>& prompts,
+    const ModuleMetaInfo& module_meta,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
-  bool use_tokenized_prompt =
-      gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
-                                                                         : true;
   example::Runner<T> runner(
       std::move(module_bundle.module),
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
       FLAGS_tokenizer_path.c_str(),
       FLAGS_performance_output_path.c_str(),
-      FLAGS_dump_logits_path.c_str(),
-      FLAGS_temperature,
+      "",
+      0.0f,
       FLAGS_eval_mode,
       FLAGS_shared_buffer,
-      FLAGS_ngram,
-      FLAGS_window,
-      FLAGS_gcap,
+      0,
+      0,
+      0,
       nullptr,
       std::move(attention_sink_rope_module));
 
-  if (module_bundle.rebuilt_from_stripped) {
-    ET_LOG(
-        Info,
-        "pte_rebuild_time_ms=%.3f rebuilt_records=%zu specialized_fast_path=%s",
-        module_bundle.rebuild_time_ms,
-        module_bundle.rebuilt_records,
-        module_bundle.specialized_fast_path_used ? "true" : "false");
-  }
+  double wiki_ppl = 0.0;
+  const auto ppl_error = runner.evaluate_wikitext_ppl(
+      FLAGS_wikitext_path,
+      FLAGS_wikitext_max_tokens,
+      module_meta.logits_scale,
+      module_meta.logits_zero_point,
+      &wiki_ppl);
+  ET_CHECK_MSG(
+      ppl_error == executorch::runtime::Error::Ok,
+      "Failed to evaluate WikiText perplexity");
 
-  if (!FLAGS_wikitext_path.empty()) {
-    double wiki_ppl = 0.0;
-    const auto ppl_error = runner.evaluate_wikitext_ppl(
-        FLAGS_wikitext_path,
-        FLAGS_wikitext_max_tokens,
-        module_meta.logits_scale,
-        module_meta.logits_zero_point,
-        &wiki_ppl);
-    ET_CHECK_MSG(
-        ppl_error == executorch::runtime::Error::Ok,
-        "Failed to evaluate WikiText perplexity");
-    std::ofstream fout(FLAGS_output_path.c_str());
-    fout << "wiki_ppl=" << wiki_ppl << "\n";
-    fout.close();
-    ET_LOG(Info, "wiki_ppl=%f", wiki_ppl);
-    return;
-  }
-
-  auto decoder_model_version = runner.get_decoder_model_version();
-  std::vector<char> buf;
-  buf.reserve(5 * FLAGS_seq_len);
   std::ofstream fout(FLAGS_output_path.c_str());
-  auto callback = [&](const std::string& piece) {
-    for (const char c : piece) {
-      buf.push_back(c);
-    }
-  };
-  executorch::extension::llm::GenerationConfig config{
-      true,
-      false,
-      -1,
-      false,
-      FLAGS_seq_len,
-      static_cast<float>(FLAGS_temperature),
-      0,
-      0};
-  if (use_tokenized_prompt) {
-    runner.generate_from_prompt_or_file(
-        FLAGS_tokenized_prompt.c_str(), use_tokenized_prompt, config, callback);
-  } else {
-    for (int i = 0; i < FLAGS_num_iters; i++) {
-      for (const auto& prompt : prompts) {
-        std::string formatted_prompt =
-            get_formatted_prompt(prompt, FLAGS_system_prompt, decoder_model_version.get());
-        runner.generate_from_prompt_or_file(
-            formatted_prompt.c_str(), use_tokenized_prompt, config, callback);
-      }
-    }
-  }
-
-  fout.write(buf.data(), buf.size());
+  fout << "wiki_ppl=" << wiki_ppl << "\n";
   fout.close();
+  ET_LOG(
+      Info,
+      "wiki_ppl=%f (ExecuTorch-side prompt-logit evaluation; PD handoff/decode skipped)",
+      wiki_ppl);
 }
+
+template <typename T>
+void run_pd_e2e(
+    ModuleBundle module_bundle,
+    const std::string& prompt_input,
+    bool tokenized_prompt,
+    const std::string& handoff_dir,
+    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
+  example::PDPrefillRunner<T> runner(
+      std::move(module_bundle.module),
+      FLAGS_decoder_model_version.c_str(),
+      get_model_path_for_runner(),
+      FLAGS_tokenizer_path.c_str(),
+      module_bundle.pte_bytes,
+      FLAGS_eval_mode,
+      FLAGS_shared_buffer,
+      nullptr,
+      std::move(attention_sink_rope_module));
+
+  const auto decoder_version = runner.get_decoder_model_version().get();
+  const std::string formatted_prompt = tokenized_prompt
+      ? prompt_input
+      : get_formatted_prompt(prompt_input, FLAGS_system_prompt, decoder_version);
+  ET_CHECK_MSG(
+      runner.export_prefill_handoff(
+          formatted_prompt,
+          tokenized_prompt,
+          FLAGS_seq_len,
+          handoff_dir,
+          FLAGS_kv_quant_attrs_path) == executorch::runtime::Error::Ok,
+      "PD prefill export failed");
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
   std::vector<std::string> prompts = CollectPrompts(argc, argv);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
-  if (!gflags::GetCommandLineFlagInfoOrDie("prompt").is_default &&
-      !gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default) {
-    ET_CHECK_MSG(false, "Only provide prompt or tokenized_input but not both.");
-  }
-  if (!gflags::GetCommandLineFlagInfoOrDie("dump_logits_path").is_default &&
-      FLAGS_eval_mode != 0) {
-    ET_CHECK_MSG(
-        false, "Only TokenGenerator(kv) mode is supported to dump all logits.");
-  }
+
+  ET_CHECK_MSG(
+      FLAGS_attention_sink_rope_path.empty(),
+      "PD prefill export does not support attention sink in v1");
+  ET_CHECK_MSG(
+      FLAGS_eval_mode != 2,
+      "PD prefill export does not support lookahead decoding in v1");
+  ET_CHECK_MSG(
+      gflags::GetCommandLineFlagInfoOrDie("prompt").is_default ||
+          gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default,
+      "Only provide prompt or tokenized_prompt, not both");
+
+  const bool use_tokenized_prompt =
+      !gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default;
   if (!FLAGS_wikitext_path.empty()) {
     ET_CHECK_MSG(
         gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default,
         "tokenized_prompt is not supported in wikitext PPL mode");
+  } else {
+    ET_CHECK_MSG(
+        use_tokenized_prompt || prompts.size() == 1,
+        "PD flow only supports a single prompt");
+    ET_CHECK_MSG(
+        use_tokenized_prompt || !prompts.empty(),
+        "Provide --prompt or --tokenized_prompt");
+    ET_CHECK_MSG(
+        !use_tokenized_prompt || FLAGS_system_prompt.empty(),
+        "tokenized_prompt mode does not support system_prompt reformatting");
   }
 
   ModuleBundle module_bundle = load_module_from_file_or_rebuild();
-  std::unique_ptr<executorch::extension::Module> attention_sink_rope_module;
-  if (!FLAGS_attention_sink_rope_path.empty()) {
-    attention_sink_rope_module =
-        std::make_unique<executorch::extension::Module>(
-            FLAGS_attention_sink_rope_path.c_str(),
-            executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
-  }
   ModuleMetaInfo module_meta = read_module_meta(module_bundle.module.get());
+  std::unique_ptr<executorch::extension::Module> attention_sink_rope_module;
 
+  if (!FLAGS_wikitext_path.empty()) {
+    if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth8) {
+      run_wikitext_ppl<uint8_t>(
+          std::move(module_bundle),
+          module_meta,
+          std::move(attention_sink_rope_module));
+    } else if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth16) {
+      run_wikitext_ppl<uint16_t>(
+          std::move(module_bundle),
+          module_meta,
+          std::move(attention_sink_rope_module));
+    } else {
+      ET_CHECK_MSG(
+          false,
+          "Unsupported kv bitwidth: %ld",
+          static_cast<int64_t>(module_meta.kv_bitwidth));
+    }
+    return 0;
+  }
+
+  const std::string handoff_dir = FLAGS_prefill_export_dir.empty()
+      ? create_temp_handoff_dir()
+      : FLAGS_prefill_export_dir;
+  fs::create_directories(handoff_dir);
+  ET_LOG(Info, "Using PD handoff directory: %s", handoff_dir.c_str());
+
+  const std::string prompt_input =
+      use_tokenized_prompt ? FLAGS_tokenized_prompt : prompts.front();
   if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth8) {
-    start_runner<uint8_t>(
+    run_pd_e2e<uint8_t>(
         std::move(module_bundle),
-        module_meta,
-        prompts,
+        prompt_input,
+        use_tokenized_prompt,
+        handoff_dir,
         std::move(attention_sink_rope_module));
   } else if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth16) {
-    start_runner<uint16_t>(
+    run_pd_e2e<uint16_t>(
         std::move(module_bundle),
-        module_meta,
-        prompts,
+        prompt_input,
+        use_tokenized_prompt,
+        handoff_dir,
         std::move(attention_sink_rope_module));
   } else {
     ET_CHECK_MSG(
@@ -498,5 +618,12 @@ int main(int argc, char** argv) {
         static_cast<int64_t>(module_meta.kv_bitwidth));
   }
 
+  if (FLAGS_prefill_only) {
+    ET_LOG(Info, "Prefill completed; handoff is ready at %s", handoff_dir.c_str());
+    return 0;
+  }
+
+  const int decode_rc = run_decode_process(handoff_dir);
+  ET_CHECK_MSG(decode_rc == 0, "llama-pd-cli exited with code %d", decode_rc);
   return 0;
 }

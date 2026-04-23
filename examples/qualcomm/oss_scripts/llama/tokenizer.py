@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import os
 import json
 import logging
 import re
@@ -81,7 +82,20 @@ class TokenizerWrapper:
         return runtime_tokenizer_path, tokenizer
 
     def _from_hf(self):
-        tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
+        # Ensure repo_id is valid before calling os.path.isdir
+        if not self.repo_id:
+            raise ValueError(
+                "Tokenizer repo_id is None. Please provide --tokenizer_model or set repo_id for this model."
+            )
+
+        # Support local repo paths (absolute or relative) by using
+        # `local_files_only=True` when the path exists on disk. HF hub
+        # validates repo ids and will raise for absolute paths like
+        # '/root/...' unless we tell it to load from local files.
+        if os.path.isdir(self.repo_id):
+            tokenizer = AutoTokenizer.from_pretrained(self.repo_id, local_files_only=True)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
         chat_template = (
             tokenizer.apply_chat_template
             if hasattr(tokenizer, "apply_chat_template") and self.apply_chat_template
@@ -115,11 +129,27 @@ class TokenizerWrapper:
             runtime_tokenizer_path, tokenizer = self._from_tokenizer_model_and_bin(
                 tokenizer_model, tokenizer_bin
             )
-        elif "llama3_2" in self.decoder_model:
+        elif "llama3_2" in self.decoder_model :
             runtime_tokenizer_path, tokenizer = self._from_tokenizer_model(
                 tokenizer_model
             )
+            tokenizer.eos_id = tokenizer.special_tokens["<|eot_id|>"]  # Set EOS token ID to 2 for llama3_2
         else:
+            # Some model configs (e.g. llama-2-7b) set repo_id=None. Prefer
+            # a provided tokenizer_model as a fallback before attempting HF.
+            if not self.repo_id and tokenizer_model:
+                try:
+                    tokenizer = get_tokenizer(tokenizer_model)
+                    runtime_tokenizer_path = tokenizer_model
+                    chat_template = None
+                    return runtime_tokenizer_path, tokenizer, chat_template
+                except Exception as e:
+                    logging.warning(
+                        "Failed to load tokenizer from tokenizer_model '%s': %s. Falling back to HF repo_id.",
+                        tokenizer_model,
+                        e,
+                    )
+
             runtime_tokenizer_path, tokenizer, chat_template = self._from_hf()
 
         return runtime_tokenizer_path, tokenizer, chat_template
@@ -307,6 +337,14 @@ class TokenizerWrapper:
             Formatted prompt string
         """
 
+        # If tokenizer does not provide a chat template, fall back to a
+        # simple concatenation of system prompt and user prompt so that
+        # downstream code can continue without relying on HF chat templates.
+        if chat_template is None:
+            if system_prompt:
+                return system_prompt + "\n" + prompt
+            return prompt
+
         messages = []
         message = {"role": "user", "content": prompt}
         if self.decoder_model in VLM_SPECIAL_TOKENS:
@@ -328,9 +366,18 @@ class TokenizerWrapper:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
-        template_prompt = chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            template_prompt = chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except ValueError as e:
+            logging.warning(
+                "Chat template application failed: %s. Falling back to simple prompt.",
+                e,
+            )
+            if system_prompt:
+                return system_prompt + "\n" + prompt
+            return prompt
 
         # edge cases handling:
         # Gemma may produce unexpected output if the prompt contains an extra <bos> token.

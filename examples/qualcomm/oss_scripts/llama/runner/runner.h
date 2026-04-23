@@ -87,8 +87,14 @@ class Runner : public executorch::extension::llm::IRunner {
       const executorch::extension::llm::GenerationConfig& config,
       std::function<void(const std::string&)> token_callback = {},
       std::function<void(const executorch::llm::Stats&)> stats_callback = {});
+  executorch::runtime::Error evaluate_wikitext_ppl(
+      const std::string& wikitext_path,
+      int32_t max_eval_tokens,
+      float logits_scale,
+      int32_t logits_zero_point,
+      double* ppl_out);
   void stop() override {};
-  void reset() override {};
+  void reset() override;
   executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version();
 
  private:
@@ -102,6 +108,9 @@ class Runner : public executorch::extension::llm::IRunner {
   std::unique_ptr<executorch::extension::Module> module_;
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module_;
   int32_t context_len_{0};
+  int32_t prompt_processor_ar_len_{0};
+  int32_t token_generator_ar_len_{0};
+  int32_t vocab_size_{0};
 
   int ngram_{0};
   int window_{0};
@@ -112,6 +121,7 @@ class Runner : public executorch::extension::llm::IRunner {
   CacheMode cache_mode_{CacheMode::StaticCahce};
   int64_t cur_pos_{0};
 
+  std::string model_path_;
   std::string tokenizer_path_;
   std::string performance_output_path_;
   std::string dump_logits_path_;

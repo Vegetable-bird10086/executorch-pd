@@ -189,7 +189,93 @@ class Llama3_3BQuantRecipe(StaticLLMQuantRecipe):
             .add_regex(
                 {
                     r"output\.conv",
-                    r"layers\.2[1-7]\.feed_forward\.w2_conv",
+                    #r"layers\.2[1-7]\.feed_forward\.w2_conv",
+                },
+                QuantDtype.use_16a8w,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_CHANNEL,
+            )
+        )
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+
+class Llama3_8BQuantRecipe(StaticLLMQuantRecipe):
+    default_quant_dtype = QuantDtype.use_16a4w_block
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+
+        self.recipe = (
+            QuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+            )
+            # === Conv（如果有的话，基本照搬）===
+            .add_node_target(
+                {
+                    torch.ops.aten.conv2d.default,
+                },
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                extra_kwargs={"block_size": (1, 32, 1, 1)},
+            )
+
+
+            # === FFN down_proj（最敏感，必须提精度）===
+            .add_regex(
+                {   
+                    r"output\.conv",
+                    #r"layers\.\d+\.feed_forward\.w2",   # down_proj
+                },
+                QuantDtype.use_16a8w,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_CHANNEL,
+            )
+
+        )
+
+        # KV cache 用 8bit（非常关键）
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+
+class Llama2_7BQuantRecipe(StaticLLMQuantRecipe):
+    # Default to groupwise 4-bit weights with 16-bit activations.
+    # Group size defaults to 128 (matches README examples); can be adjusted
+    # by constructing the recipe with a different `group_size` value.
+    default_quant_dtype = QuantDtype.use_16a4w_block
+
+    def __init__(self, verbose: bool = False, group_size: int = 128):
+        super().__init__()
+
+        block_size = (1, group_size, 1, 1)
+
+        self.recipe = (
+            QuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+            )
+            .add_node_target(
+                {
+                    torch.ops.aten.conv2d.default,
+                },
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                extra_kwargs={"block_size": block_size},
+            )
+            .add_regex(
+                {
+                    r"output\.conv",
+                    r"layers\..*\.feed_forward\.w2_conv",
                 },
                 QuantDtype.use_16a8w,
                 False,
@@ -589,7 +675,7 @@ class Qwen3_1_7BQuantRecipe(StaticLLMQuantRecipe):
                 False,
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_BLOCK,
-                extra_kwargs={"block_size": (1, 16, 1, 1)},
+                extra_kwargs={"block_size": (1, 32, 1, 1)},
             )
             .add_regex(
                 {

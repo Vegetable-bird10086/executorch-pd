@@ -46,6 +46,7 @@ DECODER_MODEL_VERSION = {
     "stories110m": "llama2",
     "llama3_2-1b_instruct": "llama3",
     "llama3_2-3b_instruct": "llama3",
+    "llama3-8b_instruct": "llama3",
     "codegen2_1b": "codegen",
     "gemma-2b": "gemma",
     "gemma2-2b": "gemma2",
@@ -61,4 +62,5 @@ DECODER_MODEL_VERSION = {
     "glm-1_5b": "glm",
     "smolvlm_500m_instruct": "smolvlm",
     "internvl3_1b": "internvl3",
+    "llama-2-7b": "llama2",
 }

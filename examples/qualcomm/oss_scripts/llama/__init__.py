@@ -41,6 +41,9 @@ from executorch.examples.models.smollm3 import (
 from executorch.examples.models.smolvlm import (
     convert_weights as convert_smolvlm_weights,
 )
+from executorch.examples.models.llama.convert_weights import (
+    convert_weights as convert_llama_weights,
+)
 
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     DECODER_MODEL_VERSION,
@@ -68,6 +71,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     InternVL3_1B_QuantRecipe,
     Llama3_1BQuantRecipe,
     Llama3_3BQuantRecipe,
+    Llama3_8BQuantRecipe, 
     LlamaStories110MQuantRecipe,
     LlamaStories260KQuantRecipe,
     Phi4MiniQuantRecipe,
@@ -79,6 +83,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Smollm3QuantRecipe,
     SmolVLMQuantRecipe,
     StaticLLMQuantRecipe,
+    Llama2_7BQuantRecipe,
 )
 from tabulate import tabulate
 
@@ -249,6 +254,23 @@ class Llama3_2_1B_Instruct(LLMModelConfig):
     quant_recipe = Llama3_1BQuantRecipe
 
 
+@register_llm_model("llama-2-7b")
+@dataclass(init=False, frozen=True)
+class Llama2_7B(LLMModelConfig):
+    repo_id = None
+    params_path = None
+    convert_weights = None
+    transform_weight = True
+    instruct_model = False
+    num_sharding = 8
+    masked_softmax = False
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+    # Use Llama2 specific quant recipe by default (groupwise 4-bit)
+    quant_recipe = Llama2_7BQuantRecipe
+
 @register_llm_model("llama3_2-3b_instruct")
 @dataclass(init=False, frozen=True)
 class Llama3_2_3B_Instruct(LLMModelConfig):
@@ -266,6 +288,26 @@ class Llama3_2_3B_Instruct(LLMModelConfig):
     r3 = False
     quant_recipe = Llama3_3BQuantRecipe
 
+@register_llm_model("llama3-8b_instruct")
+@dataclass(init=False, frozen=True)
+class Llama3_8B_Instruct(LLMModelConfig):
+    repo_id = None
+    params_path = None
+    convert_weights = None
+
+    # 跟现有 Llama3 族保持一致：导出时做权重变换
+    transform_weight = True
+
+    # 这里先沿用现有 Qualcomm Llama3 配置风格
+    instruct_model = False
+    num_sharding = 8
+    masked_softmax = False
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+
+    quant_recipe = Llama3_8BQuantRecipe
 
 @register_llm_model("codegen2_1b")
 @dataclass(init=False, frozen=True)
@@ -463,7 +505,7 @@ class Qwen3_0_6B(LLMModelConfig):
 @register_llm_model("qwen3-1_7b")
 @dataclass(init=False, frozen=True)
 class Qwen3_1_7B(LLMModelConfig):
-    repo_id: str = "Qwen/Qwen3-1.7B"
+    repo_id: str = "/root/autodl-tmp/Qwen3-1.7b-dequantized-e2e"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3/config/1_7b_config.json"
     )
@@ -557,3 +599,6 @@ class SmolVLM_500M(LLMModelConfig):
     r2 = False
     r3 = False
     quant_recipe = SmolVLMQuantRecipe
+
+
+

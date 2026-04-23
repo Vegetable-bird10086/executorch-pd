@@ -232,11 +232,17 @@ void PromptProcessor<T>::prepare_io(
 }
 
 template <typename T>
+void PromptProcessor<T>::clear_all_logits() {
+  prompt_all_logits_.clear();
+}
+
+template <typename T>
 Result<uint64_t> PromptProcessor<T>::prefill(
     std::vector<uint64_t> prompt_tokens,
     int64_t start_pos,
     bool dump_logits,
-    AttentionSinkRopeRunner* attention_sink_rope_runner) {
+    AttentionSinkRopeRunner* attention_sink_rope_runner,
+    bool force_greedy_argmax) {
   ET_CHECK_MSG(!prompt_tokens.empty(), "Prompt cannot be null");
 
   int64_t shifted_pos = start_pos;
@@ -359,9 +365,11 @@ Result<uint64_t> PromptProcessor<T>::prefill(
     shifted_pos += metadata_.ar_len;
   }
 
-  cur_token = decoder_runner_->logits_to_token(
-      output_tensors_[0],
-      (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len);
+  const int64_t logits_pos =
+      (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
+  cur_token = force_greedy_argmax
+      ? decoder_runner_->logits_to_argmax_token(output_tensors_[0], logits_pos)
+      : decoder_runner_->logits_to_token(output_tensors_[0], logits_pos);
   return cur_token;
 }
 

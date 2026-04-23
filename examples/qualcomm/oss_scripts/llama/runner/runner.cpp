@@ -19,11 +19,17 @@
 #include <executorch/extension/llm/runner/util.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
+#include <executorch/runtime/core/portable_type/half.h>
 #include <executorch/runtime/platform/log.h>
 #include <pytorch/tokenizers/hf_tokenizer.h>
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <limits>
+#include <numeric>
+#include <sstream>
+#include <vector>
 
 using executorch::extension::Module;
 using executorch::extension::llm::get_rss_bytes;
@@ -82,6 +88,43 @@ void save_logits(
   }
 }
 
+std::string read_text_file(const std::string& path) {
+  std::ifstream input(path);
+  ET_CHECK_MSG(input.is_open(), "Unable to read text file: %s", path.c_str());
+  std::stringstream buffer;
+  buffer << input.rdbuf();
+  return buffer.str();
+}
+
+double nll_from_quantized_logits(
+    const uint16_t* logits,
+    int32_t vocab_size,
+    int64_t target_token,
+    float logits_scale,
+    int32_t logits_zero_point) {
+  ET_CHECK_MSG(target_token >= 0 && target_token < vocab_size, "Target token out of range");
+  ET_CHECK_MSG(logits_scale > 0.0f, "logits_scale must be positive");
+  double max_logit = -std::numeric_limits<double>::infinity();
+  for (int32_t i = 0; i < vocab_size; ++i) {
+    const double dequantized =
+        (static_cast<double>(logits[i]) - static_cast<double>(logits_zero_point)) *
+        static_cast<double>(logits_scale);
+    max_logit = std::max(max_logit, dequantized);
+  }
+  double exp_sum = 0.0;
+  for (int32_t i = 0; i < vocab_size; ++i) {
+    const double dequantized =
+        (static_cast<double>(logits[i]) - static_cast<double>(logits_zero_point)) *
+        static_cast<double>(logits_scale);
+    exp_sum += std::exp(dequantized - max_logit);
+  }
+  const double target_logit =
+      (static_cast<double>(logits[target_token]) -
+       static_cast<double>(logits_zero_point)) *
+      static_cast<double>(logits_scale);
+  return std::log(exp_sum) + max_logit - target_logit;
+}
+
 } // namespace
 
 template <typename T>
@@ -90,8 +133,8 @@ Runner<T>::Runner(
     const std::string& decoder_model_version,
     const std::string& model_path,
     const std::string& tokenizer_path,
-    const std::string& dump_logits_path,
     const std::string& performance_output_path,
+    const std::string& dump_logits_path,
     const float temperature,
     const int eval_mode,
     const bool shared_buffer,
@@ -104,6 +147,7 @@ Runner<T>::Runner(
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
+      model_path_(model_path),
       tokenizer_path_(tokenizer_path),
       performance_output_path_(performance_output_path),
       dump_logits_path_(dump_logits_path),
@@ -146,7 +190,7 @@ Runner<T>::Runner(
     ET_CHECK_MSG(false, "Unsupported Decoder Model");
   }
 
-  ET_LOG(Info, "creating module: model_path=%s", model_path.c_str());
+  ET_LOG(Info, "creating module: model_path=%s", model_path_.c_str());
   ET_LOG(Info, "creating runner: tokenizer_path=%s", tokenizer_path_.c_str());
   ET_LOG(Info, "eval mode=%d", eval_mode_);
 }
@@ -222,6 +266,7 @@ Error Runner<T>::load() {
   // For some tokenizer.json, runtime vocab_size might be different, use output
   // shape to get vocab size.
   int32_t vocab_size = method_meta->output_tensor_meta(0)->sizes()[2];
+  vocab_size_ = vocab_size;
   decoder_runner_ =
       std::make_unique<DecoderRunner>(module_.get(), vocab_size, temperature_);
 
@@ -249,6 +294,7 @@ Error Runner<T>::load() {
   // atten mask: [1, AR-N, CL]
   auto atten_mask_meta_token = method_meta->input_tensor_meta(1);
   token_generator_ar_len = atten_mask_meta_token->sizes()[1];
+  token_generator_ar_len_ = token_generator_ar_len;
   context_len_ = atten_mask_meta_token->sizes()[2];
   if (eval_mode_ == EvalMode::kKVCached) {
     prompt_processor_ar_len = token_generator_ar_len;
@@ -260,6 +306,7 @@ Error Runner<T>::load() {
             ->input_tensor_meta(1);
     prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[1];
   }
+  prompt_processor_ar_len_ = prompt_processor_ar_len;
   if (prompt_processor_ar_len == context_len_)
     max_cache_len = context_len_;
   else
@@ -367,6 +414,28 @@ Error Runner<T>::generate(
     std::function<void(const Stats&)> stats_callback) {
   return generate_from_prompt_or_file(
       prompt, false, config, token_callback, stats_callback);
+}
+
+template <typename T>
+void Runner<T>::reset() {
+  cur_pos_ = 0;
+  context_len_ = 0;
+  prompt_processor_ar_len_ = 0;
+  token_generator_ar_len_ = 0;
+  vocab_size_ = 0;
+  stats_.reset();
+  if (prompt_processor_ != nullptr) {
+    prompt_processor_->clear_all_logits();
+  }
+  if (token_generator_ != nullptr) {
+    token_generator_->clear_all_logits();
+  }
+  buffer_manager_.reset();
+  kv_manager_.reset();
+  prompt_processor_.reset();
+  token_generator_.reset();
+  decoder_runner_.reset();
+  attention_sink_rope_runner_.reset();
 }
 
 template <typename T>
@@ -493,6 +562,106 @@ Error Runner<T>::generate_from_prompt_or_file(
   if (stats_callback) {
     stats_callback(stats_);
   }
+  return Error::Ok;
+}
+
+template <typename T>
+Error Runner<T>::evaluate_wikitext_ppl(
+    const std::string& wikitext_path,
+    int32_t max_eval_tokens,
+    float logits_scale,
+    int32_t logits_zero_point,
+    double* ppl_out) {
+  ET_CHECK_MSG(ppl_out != nullptr, "ppl_out cannot be null");
+  ET_CHECK_MSG(!wikitext_path.empty(), "wikitext_path cannot be empty");
+  ET_CHECK_MSG(max_eval_tokens != 0, "wikitext_max_tokens cannot be zero");
+
+  reset();
+  const int64_t model_load_start_ms = time_in_ms();
+  ET_CHECK_OK_OR_RETURN_ERROR(load());
+  const int64_t model_load_end_ms = time_in_ms();
+  const int64_t inference_start_ms = time_in_ms();
+
+  const std::string text = read_text_file(wikitext_path);
+  auto encode_res = tokenizer_->encode(text, 0, 0);
+  ET_CHECK_TK_OK_OR_RETURN_ERROR(
+      encode_res.error(), "failed to encode wikitext %s", wikitext_path.c_str());
+  std::vector<uint64_t> tokens = encode_res.get();
+  ET_CHECK_MSG(tokens.size() >= 2, "WikiText input must contain at least 2 tokens");
+
+  int64_t eval_tokens = static_cast<int64_t>(tokens.size()) - 1;
+  if (max_eval_tokens > 0) {
+    eval_tokens = std::min<int64_t>(eval_tokens, max_eval_tokens);
+  }
+  ET_CHECK_MSG(eval_tokens > 0, "No tokens available for perplexity evaluation");
+
+  const int64_t max_window_tokens =
+      static_cast<int64_t>(context_len_) - static_cast<int64_t>(prompt_processor_ar_len_);
+  ET_CHECK_MSG(
+      max_window_tokens > 0,
+      "Invalid prompt processor budget: context_len=%d ar_len=%d",
+      context_len_,
+      prompt_processor_ar_len_);
+  const int64_t score_stride =
+      std::min<int64_t>(static_cast<int64_t>(prompt_processor_ar_len_), max_window_tokens);
+
+  double total_nll = 0.0;
+  int64_t total_scored_tokens = 0;
+  for (int64_t score_start = 0; score_start < eval_tokens; score_start += score_stride) {
+    const int64_t score_count =
+        std::min<int64_t>(score_stride, eval_tokens - score_start);
+    const int64_t window_end = score_start + score_count;
+    const int64_t window_start = std::max<int64_t>(0, window_end - max_window_tokens);
+    const int64_t window_token_count = window_end - window_start;
+    ET_CHECK_MSG(
+        window_token_count > 0 && window_token_count <= max_window_tokens,
+        "Invalid WikiText window size: %ld",
+        window_token_count);
+
+    if (score_start != 0) {
+      reset();
+      ET_CHECK_OK_OR_RETURN_ERROR(load());
+    }
+
+    std::vector<uint64_t> window_tokens(
+        tokens.begin() + window_start, tokens.begin() + window_end);
+    prompt_processor_->clear_all_logits();
+    auto prefill_res = prompt_processor_->prefill(
+        window_tokens, 0, true, attention_sink_rope_runner_.get());
+    ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+    const auto& prompt_logits = prompt_processor_->get_all_logits();
+    ET_CHECK_MSG(
+        prompt_logits.size() >=
+            static_cast<size_t>(window_token_count) * vocab_size_,
+        "Prompt logits buffer smaller than expected");
+
+    const int64_t first_score_row = score_start - window_start;
+    for (int64_t i = 0; i < score_count; ++i) {
+      const uint16_t* row = prompt_logits.data() +
+          static_cast<size_t>(first_score_row + i) * vocab_size_;
+      total_nll += nll_from_quantized_logits(
+          row,
+          vocab_size_,
+          tokens[score_start + i + 1],
+          logits_scale,
+          logits_zero_point);
+    }
+    total_scored_tokens += score_count;
+  }
+
+  const int64_t inference_end_ms = time_in_ms();
+  stats_.reset();
+  stats_.model_load_start_ms = model_load_start_ms;
+  stats_.model_load_end_ms = model_load_end_ms;
+  stats_.inference_start_ms = inference_start_ms;
+  stats_.prompt_eval_end_ms = inference_end_ms;
+  stats_.inference_end_ms = inference_end_ms;
+  stats_.num_prompt_tokens = total_scored_tokens;
+  stats_.num_generated_tokens = 0;
+  print_report(stats_);
+  print_performance_report(stats_, performance_output_path_);
+
+  *ppl_out = std::exp(total_nll / static_cast<double>(total_scored_tokens));
   return Error::Ok;
 }
 

@@ -56,15 +56,9 @@ class DecoderRunner {
   inline int32_t logits_to_token(
       const executorch::aten::Tensor& logits_tensor,
       int64_t pos) {
-    auto* logits = logits_tensor.mutable_data_ptr<uint16_t>();
-    auto num_tokens = logits_tensor.size(1);
+    auto* logits_last = logits_ptr_for_pos(logits_tensor, pos);
     auto vocab_size = logits_tensor.size(2);
     static std::vector<float> logits_f(vocab_size);
-    auto* logits_last = logits;
-    // offset to the meaningful logit we want for prefill model.
-    if (num_tokens > 1) {
-      logits_last += pos * vocab_size;
-    }
     // Discard dequantization (converting uint16_t to float) because the
     // relative order of elements remains the same without conversion
     for (int i = 0; i < vocab_size; i++) {
@@ -73,7 +67,36 @@ class DecoderRunner {
     return sampler_->sample(logits_f.data());
   }
 
+  inline int32_t logits_to_argmax_token(
+      const executorch::aten::Tensor& logits_tensor,
+      int64_t pos) {
+    auto* logits_last = logits_ptr_for_pos(logits_tensor, pos);
+    const auto vocab_size = logits_tensor.size(2);
+    int32_t best_token = 0;
+    uint16_t best_logit = logits_last[0];
+    for (int32_t token = 1; token < vocab_size; ++token) {
+      if (logits_last[token] > best_logit) {
+        best_logit = logits_last[token];
+        best_token = token;
+      }
+    }
+    return best_token;
+  }
+
  protected:
+  inline uint16_t* logits_ptr_for_pos(
+      const executorch::aten::Tensor& logits_tensor,
+      int64_t pos) {
+    auto* logits = logits_tensor.mutable_data_ptr<uint16_t>();
+    auto num_tokens = logits_tensor.size(1);
+    auto vocab_size = logits_tensor.size(2);
+    auto* logits_last = logits;
+    if (num_tokens > 1) {
+      logits_last += pos * vocab_size;
+    }
+    return logits_last;
+  }
+
   executorch::extension::Module* module_;
   std::unique_ptr<executorch::extension::llm::Sampler> sampler_;
 };

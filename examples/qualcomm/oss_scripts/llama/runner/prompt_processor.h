@@ -58,6 +58,11 @@ class PromptProcessor {
   virtual const std::vector<uint16_t>& get_all_logits();
 
   /**
+   * @brief Clear cached logits collected for analysis.
+   */
+  virtual void clear_all_logits();
+
+  /**
    * Prefill an LLM Module with the given text input.
    * @param prompt_tokens The text prompt tokens to the LLM Module. Encoded by
    * tokenizer.
@@ -71,7 +76,8 @@ class PromptProcessor {
       std::vector<uint64_t> prompt_tokens,
       int64_t start_pos,
       bool dump_logits,
-      AttentionSinkRopeRunner* attention_sink_rope_runner);
+      AttentionSinkRopeRunner* attention_sink_rope_runner,
+      bool force_greedy_argmax = false);
   /**
    * @brief Get total I/O size in bytes (excluding the KV cache size)
    * @return Total I/O size in bytes.

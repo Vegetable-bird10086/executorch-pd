@@ -527,6 +527,176 @@ def _build_parser():
     )
 
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--dump_quant_info",
+        action="store_true",
+        help=(
+            "Dump quantization-related graph/module info after prepare_pt2e and "
+            "convert_pt2e."
+        ),
+    )
+    parser.add_argument(
+        "--dump_quant_filter",
+        default=None,
+        type=str,
+        help=(
+            "Optional substring filter for quant dumps, for example "
+            "'layers.0.attention.wq'."
+        ),
+    )
+    parser.add_argument(
+        "--save_layer_qweights",
+        action="store_true",
+        help=(
+            "Save per-layer quantized weights (qweight) after convert_pt2e "
+            "to artifact directory."
+        ),
+    )
+    parser.add_argument(
+        "--enable_force_fill_qweight",
+        action="store_true",
+        help=(
+            "Enable force-fill experiment for quantized qweight tensors "
+            "after convert_pt2e and before backend lowering."
+        ),
+    )
+    parser.add_argument(
+        "--force_fill_layer_keyword",
+        default=None,
+        type=str,
+        help=(
+            "Target layer keyword for force-fill, e.g. "
+            "'layers.0.attention.wq_conv'."
+        ),
+    )
+    parser.add_argument(
+        "--force_fill_qweight_attr",
+        default=None,
+        type=str,
+        help=(
+            "Fallback get_attr tensor name for force-fill when layer keyword "
+            "matching fails."
+        ),
+    )
+    parser.add_argument(
+        "--force_fill_qweight_value",
+        default=-1,
+        type=int,
+        help="Force-fill value used by force-fill transform (default: -1).",
+    )
+    parser.add_argument(
+        "--force_fill_require_unique",
+        action="store_true",
+        help=(
+            "Require exactly one matched qweight attr for target layer when "
+            "force-fill is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--replace_with_qat_checkpoint",
+        default=None,
+        type=str,
+        help=(
+            "Optional safetensors checkpoint path from QAT model. If provided, "
+            "export will replace decoder attention(4) and ffn(3) qweight/scale "
+            "after convert_pt2e."
+        ),
+    )
+    parser.add_argument(
+        "--qat_qweight_mode",
+        default="qweight_minus_qzeros",
+        choices=["qweight_minus_qzeros", "qweight"],
+        type=str,
+        help=(
+            "How to build source qweight from QAT checkpoint: "
+            "'qweight_minus_qzeros' (default) or raw 'qweight'."
+        ),
+    )
+    parser.add_argument(
+        "--qat_replace_debug",
+        action="store_true",
+        help=(
+            "Enable detailed per-attr logs for QAT qweight/scale replacement, "
+            "including source/target shapes and before/after min/max."
+        ),
+    )
+    parser.add_argument(
+        "--qat_verify_chain",
+        action="store_true",
+        help=(
+            "After replacement, verify per-layer qweight/scale/zero_point alignment "
+            "between QAT checkpoint and converted graph, and print diagnostic stats."
+        ),
+    )
+    parser.add_argument(
+        "--qat_post_replace_smoke_test",
+        action="store_true",
+        help=(
+            "Run one decoder forward smoke test immediately after QAT replacement "
+            "(before backend lowering), and log output min/max/nan/inf stats."
+        ),
+    )
+    parser.add_argument(
+        "--qat_source_wbits",
+        default=2,
+        type=int,
+        choices=[2, 3, 4, 8],
+        help=(
+            "Bit-width of packed qweight/qzeros in QAT checkpoint (default: 2)."
+        ),
+    )
+    parser.add_argument(
+        "--qat_source_group_size",
+        default=32,
+        type=int,
+        help=(
+            "Group size used by QAT checkpoint for per-group zero/scale (default: 32)."
+        ),
+    )
+    parser.add_argument(
+        "--qat_scale_clip_min",
+        default=1e-4,
+        type=float,
+        help=(
+            "Minimum scale value used when replacing QAT scales to align with "
+            "EfficientQAT clamp behavior (default: 1e-4)."
+        ),
+    )
+    parser.add_argument(
+        "--qat_scale_clip_max",
+        default=1e4,
+        type=float,
+        help=(
+            "Maximum scale value used when replacing QAT scales to align with "
+            "EfficientQAT clamp behavior (default: 1e4)."
+        ),
+    )
+    parser.add_argument(
+        "--qat_post_replace_generate_text",
+        action="store_true",
+        help=(
+            "Run one post-replace text generation on the converted graph module "
+            "before backend lowering, and log full decoded text."
+        ),
+    )
+    parser.add_argument(
+        "--qat_post_replace_generate_prompt",
+        default=None,
+        type=str,
+        help=(
+            "Optional prompt used by post-replace text generation. If not set, "
+            "fallback to --prompt."
+        ),
+    )
+    parser.add_argument(
+        "--qat_post_replace_generate_max_seq_len",
+        default=None,
+        type=int,
+        help=(
+            "Optional max_seq_len for post-replace text generation. If not set, "
+            "fallback to model max context len."
+        ),
+    )
 
     return parser
 
