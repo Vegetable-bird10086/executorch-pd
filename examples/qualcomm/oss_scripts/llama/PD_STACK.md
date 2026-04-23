@@ -60,6 +60,24 @@ Instead of hardcoding absolute paths, use environment variables:
 
 See `pd_stack_env.sh` in the same directory for a helper that exports them.
 
+## ExecuTorch-side Tools
+
+For the stripped-PTE workflow, use the canonical helper under:
+
+- `examples/qualcomm/oss_scripts/llama/tools/pte_qat_checkpoint_reverse_strip.py`
+
+It rebuilds quantized blocks from the QAT checkpoint, strips them from a source
+`.pte`, and writes:
+
+- `stripped.pte`
+- `index.json`
+- `index.bin`
+- `report.txt`
+
+Usage notes and ready-to-run examples are documented in:
+
+- `examples/qualcomm/oss_scripts/llama/tools/README.md`
+
 ## Suggested Ownership Split
 
 Keep code ownership roughly like this:
