@@ -86,6 +86,42 @@ set_target_properties(
   qnn_llama_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
 )
 
+# build qnn llama benchmark runner
+set(_llama_bench__srcs ${_llama_runner__srcs})
+list(FILTER _llama_bench__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")
+list(
+  PREPEND
+  _llama_bench__srcs
+  ${CMAKE_CURRENT_LIST_DIR}/qnn_llama_bench.cpp
+)
+
+add_executable(qnn_llama_bench ${_llama_bench__srcs})
+target_include_directories(
+  qnn_llama_bench PUBLIC ${_common_include_directories}
+)
+target_link_libraries(
+  qnn_llama_bench
+  qnn_executorch_backend
+  executorch_core
+  extension_data_loader
+  extension_flat_tensor
+  extension_llm_runner
+  extension_module
+  extension_tensor
+  gflags
+  custom_ops
+  quantized_ops_lib
+  quantized_kernels
+  tokenizers::tokenizers
+)
+target_include_directories(
+  qnn_llama_bench PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
+)
+target_compile_options(qnn_llama_bench PUBLIC ${_common_compile_options})
+set_target_properties(
+  qnn_llama_bench PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+)
+
 # build qnn llama pd runner without touching the original runner entrypoint
 set(_llama_pd_runner__srcs ${_llama_runner__srcs})
 list(FILTER _llama_pd_runner__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")

@@ -64,3 +64,22 @@ def define_common_targets():
         platforms = [ANDROID],
         **get_oss_build_kwargs()
     )
+
+    runtime.cxx_binary(
+        name = "qnn_llama_bench",
+        srcs = [
+            "qnn_llama_bench.cpp",
+        ],
+        compiler_flags = [
+            "-Wno-global-constructors",
+        ],
+        deps = [
+            ":runner_lib",
+            "//executorch/extension/threadpool:threadpool", # this depeneency shouldn't be needed. But it fails to build..
+        ],
+        external_deps = [
+            "gflags",
+        ],
+        platforms = [ANDROID],
+        **get_oss_build_kwargs()
+    )
