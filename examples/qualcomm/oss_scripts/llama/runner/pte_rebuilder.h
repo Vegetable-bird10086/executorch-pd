@@ -31,6 +31,11 @@ PteRebuildResult rebuild_pte_from_stripped_checkpoint(
     int group_size,
     const std::string& qweight_mode);
 
+PteRebuildResult rebuild_pte_from_stripped_tmac_gguf(
+    const std::vector<uint8_t>& stripped_pte,
+    const std::vector<uint8_t>& index_bytes,
+    const std::vector<uint8_t>& gguf_bytes);
+
 PteRebuildResult rebuild_pte_from_stripped_gguf(
     const std::vector<uint8_t>& stripped_pte,
     const std::vector<uint8_t>& index_bytes,

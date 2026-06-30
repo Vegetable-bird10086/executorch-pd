@@ -486,7 +486,7 @@ class Qwen2_5_1_5B(LLMModelConfig):
 @register_llm_model("qwen3-0_6b")
 @dataclass(init=False, frozen=True)
 class Qwen3_0_6B(LLMModelConfig):
-    repo_id: str = "Qwen/Qwen3-0.6B"
+    repo_id: str = "/root/autodl-tmp/Qwen3-0.6B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3/config/0_6b_config.json"
     )
@@ -505,7 +505,7 @@ class Qwen3_0_6B(LLMModelConfig):
 @register_llm_model("qwen3-1_7b")
 @dataclass(init=False, frozen=True)
 class Qwen3_1_7B(LLMModelConfig):
-    repo_id: str = "/root/autodl-tmp/Qwen3-1.7b-dequantized-e2e"
+    repo_id: str = "/root/autodl-tmp/Qwen3-1.7B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3/config/1_7b_config.json"
     )

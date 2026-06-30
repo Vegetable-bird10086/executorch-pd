@@ -150,7 +150,7 @@ class Llama3_1BQuantRecipe(StaticLLMQuantRecipe):
             .add_regex(
                 {
                     r"output\.conv",
-                    r"layers\.[0-3]\.feed_forward\.w2_conv",
+                    #r"layers\.[0-3]\.feed_forward\.w2_conv",
                 },
                 QuantDtype.use_16a8w,
                 False,
@@ -189,7 +189,7 @@ class Llama3_3BQuantRecipe(StaticLLMQuantRecipe):
             .add_regex(
                 {
                     r"output\.conv",
-                    #r"layers\.2[1-7]\.feed_forward\.w2_conv",
+                    r"layers\.2[1-7]\.feed_forward\.w2_conv",
                 },
                 QuantDtype.use_16a8w,
                 False,
@@ -643,7 +643,8 @@ class Qwen3_0_6BQuantRecipe(StaticLLMQuantRecipe):
             )
             .add_regex(
                 {
-                    r"layers\..*\.feed_forward\.w2_conv",
+                    #r"layers\..*\.feed_forward\.w2_conv",
+                    r"output\.conv",
                 },
                 QuantDtype.use_16a8w,
                 False,

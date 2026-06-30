@@ -93,6 +93,7 @@ enum class GgufValueType : uint32_t {
 enum class GgufTensorType : uint32_t {
   F16 = 1,
   I2 = 37,
+  GPTQ2_32 = 42,
 };
 
 struct RebuildRecord {
@@ -130,6 +131,40 @@ float read_f32_le(const uint8_t* data) {
   uint32_t bits = read_u32_le(data);
   float value = 0.0f;
   std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+float read_f16_le_as_f32(const uint8_t* data) {
+  const uint16_t bits = read_u16_le(data);
+  const uint32_t sign = static_cast<uint32_t>(bits & 0x8000U) << 16;
+  const uint32_t exponent = (bits >> 10) & 0x1FU;
+  const uint32_t mantissa = bits & 0x03FFU;
+
+  uint32_t fp32_bits = 0;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      fp32_bits = sign;
+    } else {
+      uint32_t mant = mantissa;
+      int exp = -14;
+      while ((mant & 0x0400U) == 0) {
+        mant <<= 1;
+        --exp;
+      }
+      mant &= 0x03FFU;
+      fp32_bits =
+          sign | static_cast<uint32_t>((exp + 127) << 23) | (mant << 13);
+    }
+  } else if (exponent == 0x1FU) {
+    fp32_bits = sign | 0x7F800000U | (mantissa << 13);
+  } else {
+    fp32_bits = sign |
+        static_cast<uint32_t>((static_cast<int>(exponent) - 15 + 127) << 23) |
+        (mantissa << 13);
+  }
+
+  float value = 0.0f;
+  std::memcpy(&value, &fp32_bits, sizeof(value));
   return value;
 }
 
@@ -296,6 +331,13 @@ struct DirectTmacI2TensorView {
   const uint8_t* packed_weights{nullptr};
   const uint8_t* tail_ptr{nullptr};
   bool has_explicit_zeros{false};
+};
+
+struct DirectGptq2_32TensorView {
+  size_t rows{0};
+  size_t cols{0};
+  size_t num_groups{0};
+  const uint8_t* data{nullptr};
 };
 
 const TensorView& require_tensor(const SafeTensorsView& view, const std::string& name);
@@ -837,6 +879,16 @@ uint8_t decode_tmac_i2_qzero(
       kBits));
 }
 
+uint8_t decode_gptq2_32_qzero(const uint8_t* group_ptr) {
+  static constexpr size_t kBits = 2;
+  const float scale =
+      std::max(read_f16_le_as_f32(group_ptr + 8), 1.0e-4f);
+  const float zero_bias = read_f16_le_as_f32(group_ptr + 10);
+  return static_cast<uint8_t>(rounded_zero_point(
+      static_cast<int16_t>(std::lround(zero_bias / scale)),
+      kBits));
+}
+
 DirectTmacI2TensorView parse_direct_tmac_i2_tensor(const GgufTensorInfo& tensor) {
   DirectTmacI2TensorView out;
   if (tensor.tensor_type != GgufTensorType::I2 || tensor.shape.size() != 2) {
@@ -866,6 +918,30 @@ DirectTmacI2TensorView parse_direct_tmac_i2_tensor(const GgufTensorInfo& tensor)
   return out;
 }
 
+DirectGptq2_32TensorView parse_direct_gptq2_32_tensor(
+    const GgufTensorInfo& tensor) {
+  DirectGptq2_32TensorView out;
+  if (tensor.tensor_type != GgufTensorType::GPTQ2_32 || tensor.shape.size() != 2) {
+    throw std::runtime_error(
+        "Unsupported GGUF tensor type for GPTQ2_32 rebuild");
+  }
+
+  out.cols = static_cast<size_t>(tensor.shape[0]);
+  out.rows = static_cast<size_t>(tensor.shape[1]);
+  if (out.cols % 32 != 0) {
+    throw std::runtime_error("GPTQ2_32 GGUF tensor cols must be divisible by 32");
+  }
+  out.num_groups = out.cols / 32;
+
+  const size_t expected_bytes = out.rows * out.num_groups * 12;
+  if (tensor.num_bytes != expected_bytes) {
+    throw std::runtime_error("Unexpected GPTQ2_32 GGUF tensor payload size");
+  }
+
+  out.data = tensor.data;
+  return out;
+}
+
 void build_tmac_i2_qzeros_cache(
     const DirectTmacI2TensorView& tensor,
     size_t row_start,
@@ -883,7 +959,21 @@ void build_tmac_i2_qzeros_cache(
   }
 }
 
-uint32_t pack_gs32_int4_from_tmac_qbytes(uint8_t low_qbyte, uint8_t high_qbyte, uint8_t zp) {
+void build_gptq2_32_qzeros_cache(
+    const DirectGptq2_32TensorView& tensor,
+    size_t row_start,
+    std::vector<uint8_t>* cache) {
+  cache->assign(tensor.num_groups * 64, 0);
+  for (size_t group = 0; group < tensor.num_groups; ++group) {
+    for (size_t row = 0; row < 64; ++row) {
+      const uint8_t* group_ptr =
+          tensor.data + ((row_start + row) * tensor.num_groups + group) * 12;
+      (*cache)[group * 64 + row] = decode_gptq2_32_qzero(group_ptr);
+    }
+  }
+}
+
+uint32_t pack_gs32_int4_from_qbytes(uint8_t low_qbyte, uint8_t high_qbyte, uint8_t zp) {
   static const std::array<std::array<uint32_t, 65536>, 4> kPackedLut = []() {
     std::array<std::array<uint32_t, 65536>, 4> lut{};
     static constexpr std::array<int, 8> perm = {4, 0, 5, 1, 6, 2, 7, 3};
@@ -975,7 +1065,44 @@ void write_int4_block_from_tmac_i2_direct(
             const uint8_t qbyte1 = pack_tmac_i2_nibbles(nibble10, nibble11);
             const uint8_t zp = qzeros_cache[group * 64 + rr0 + r];
             const uint32_t packed_row =
-                pack_gs32_int4_from_tmac_qbytes(qbyte0, qbyte1, zp);
+                pack_gs32_int4_from_qbytes(qbyte0, qbyte1, zp);
+            std::memcpy(dst, &packed_row, sizeof(packed_row));
+            dst += sizeof(packed_row);
+          }
+        }
+      }
+    }
+  }
+}
+
+void write_int4_block_from_gptq2_32_direct(
+    const DirectGptq2_32TensorView& tensor,
+    int block_id,
+    uint8_t* dst) {
+  const size_t row_start = static_cast<size_t>(block_id) * 64;
+  const size_t tile_cols = tensor.cols / 32;
+  std::vector<uint8_t> qzeros_cache;
+  build_gptq2_32_qzeros_cache(tensor, row_start, &qzeros_cache);
+
+  for (size_t bc = 0; bc < tile_cols; ++bc) {
+    const size_t c0 = bc * 32;
+    for (size_t br = 0; br < 2; ++br) {
+      const size_t r0 = br * 32;
+      for (size_t tile_bc = 0; tile_bc < 4; ++tile_bc) {
+        const size_t cc0 = c0 + tile_bc * 8;
+        const size_t group = cc0 / 32;
+        const size_t group_qbyte_offset = (cc0 % 32) / 4;
+        for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
+          const size_t rr0 = r0 + tile_br * 8;
+          for (size_t r = 0; r < 8; ++r) {
+            const size_t row = row_start + rr0 + r;
+            const uint8_t* group_ptr =
+                tensor.data + (row * tensor.num_groups + group) * 12;
+            const uint8_t qbyte0 = group_ptr[group_qbyte_offset + 0];
+            const uint8_t qbyte1 = group_ptr[group_qbyte_offset + 1];
+            const uint8_t zp = qzeros_cache[group * 64 + rr0 + r];
+            const uint32_t packed_row =
+                pack_gs32_int4_from_qbytes(qbyte0, qbyte1, zp);
             std::memcpy(dst, &packed_row, sizeof(packed_row));
             dst += sizeof(packed_row);
           }
@@ -1417,7 +1544,7 @@ PteRebuildResult rebuild_pte_from_index(
       true};
 }
 
-PteRebuildResult rebuild_pte_from_gguf_index(
+PteRebuildResult rebuild_pte_from_tmac_gguf_index(
     const std::vector<uint8_t>& stripped_pte,
     const ParsedIndex& parsed_index,
     const std::vector<uint8_t>& gguf_bytes) {
@@ -1444,7 +1571,7 @@ PteRebuildResult rebuild_pte_from_gguf_index(
     } */
     if (rec.weight_id.kind == kWeightKindOutputConv) {
       throw std::runtime_error(
-          "GGUF-backed rebuild does not support output.conv yet");
+          "T-MAC GGUF-backed rebuild does not support output.conv yet");
     }
     const std::string tensor_name = gguf_tensor_name_from_record(rec);
     if (!have_current_tensor || current_tensor_name != tensor_name) {
@@ -1455,6 +1582,60 @@ PteRebuildResult rebuild_pte_from_gguf_index(
     }
 
     write_int4_block_from_tmac_i2_direct(
+        current_tensor,
+        rec.block_id,
+        rebuilt->data() + insert_at);
+    dst_cursor = insert_at + rec_len;
+  }
+
+  const size_t tail_len = parsed_index.old_size - dst_cursor;
+  if (tail_len > 0) {
+    std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, tail_len);
+  }
+
+  return PteRebuildResult{
+      rebuilt,
+      0.0,
+      parsed_index.records.size(),
+      true};
+}
+
+PteRebuildResult rebuild_pte_from_gguf_index(
+    const std::vector<uint8_t>& stripped_pte,
+    const ParsedIndex& parsed_index,
+    const std::vector<uint8_t>& gguf_bytes) {
+  const auto gguf = parse_gguf(gguf_bytes);
+  auto rebuilt = std::make_shared<std::vector<uint8_t>>(parsed_index.old_size);
+
+  std::string current_tensor_name;
+  DirectGptq2_32TensorView current_tensor;
+  bool have_current_tensor = false;
+
+  size_t src_ptr = 0;
+  size_t dst_cursor = 0;
+  for (const auto& rec : parsed_index.records) {
+    const size_t insert_at = static_cast<size_t>(rec.source_offset);
+    const size_t rec_len = static_cast<size_t>(rec.length);
+    const size_t keep_len = insert_at - dst_cursor;
+    if (keep_len > 0) {
+      std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, keep_len);
+      src_ptr += keep_len;
+    }
+
+    if (rec.weight_id.kind == kWeightKindOutputConv) {
+      throw std::runtime_error(
+          "GGUF-backed rebuild does not support output.conv for GPTQ2_32 models");
+    }
+
+    const std::string tensor_name = gguf_tensor_name_from_record(rec);
+    if (!have_current_tensor || current_tensor_name != tensor_name) {
+      current_tensor =
+          parse_direct_gptq2_32_tensor(require_gguf_tensor(gguf, tensor_name));
+      current_tensor_name = tensor_name;
+      have_current_tensor = true;
+    }
+
+    write_int4_block_from_gptq2_32_direct(
         current_tensor,
         rec.block_id,
         rebuilt->data() + insert_at);
@@ -1491,6 +1672,20 @@ PteRebuildResult rebuild_pte_from_stripped_checkpoint(
       bits_hint,
       group_size,
       qweight_mode);
+  const auto end = std::chrono::steady_clock::now();
+  result.rebuild_time_ms =
+      std::chrono::duration<double, std::milli>(end - start).count();
+  return result;
+}
+
+PteRebuildResult rebuild_pte_from_stripped_tmac_gguf(
+    const std::vector<uint8_t>& stripped_pte,
+    const std::vector<uint8_t>& index_bytes,
+    const std::vector<uint8_t>& gguf_bytes) {
+  const auto start = std::chrono::steady_clock::now();
+  const ParsedIndex parsed_index = parse_binary_index(index_bytes);
+  auto result =
+      rebuild_pte_from_tmac_gguf_index(stripped_pte, parsed_index, gguf_bytes);
   const auto end = std::chrono::steady_clock::now();
   result.rebuild_time_ms =
       std::chrono::duration<double, std::milli>(end - start).count();

@@ -29,9 +29,13 @@ DEFINE_string(
     "",
     "Path to the QAT safetensors checkpoint used to rebuild a stripped PTE in memory.");
 DEFINE_string(
-    gguf_model_path,
+    tmac_model_path,
     "",
     "Path to the T-MAC GGUF model used to rebuild stripped decoder blocks in memory.");
+DEFINE_string(
+    gguf_model_path,
+    "",
+    "Path to the llama.cpp GPTQ2_32 GGUF model used to rebuild stripped decoder blocks in memory.");
 DEFINE_int32(
     qat_bits_hint,
     2,
@@ -118,11 +122,17 @@ bool should_rebuild_from_stripped() {
   const bool has_stripped = !FLAGS_stripped_model_path.empty();
   const bool has_index = !FLAGS_index_bin_path.empty();
   const bool has_checkpoint = !FLAGS_qat_checkpoint_path.empty();
+  const bool has_tmac_gguf = !FLAGS_tmac_model_path.empty();
   const bool has_gguf = !FLAGS_gguf_model_path.empty();
+  const int rebuild_source_count =
+      static_cast<int>(has_checkpoint) +
+      static_cast<int>(has_tmac_gguf) +
+      static_cast<int>(has_gguf);
   ET_CHECK_MSG(
-      !(has_checkpoint && has_gguf),
-      "Provide either qat_checkpoint_path or gguf_model_path, but not both");
-  const bool has_rebuild_source = has_checkpoint || has_gguf;
+      rebuild_source_count <= 1,
+      "Provide only one of qat_checkpoint_path, tmac_model_path, or gguf_model_path");
+  const bool has_rebuild_source =
+      has_checkpoint || has_tmac_gguf || has_gguf;
   ET_CHECK_MSG(
       has_stripped == has_index && has_index == has_rebuild_source,
       "Provide stripped_model_path, index_bin_path, and one rebuild source together");
@@ -146,6 +156,10 @@ ModuleBundle load_module_from_file_or_rebuild() {
   if (!FLAGS_gguf_model_path.empty()) {
     const std::vector<uint8_t> gguf_bytes = read_binary_file(FLAGS_gguf_model_path);
     rebuild_result = example::rebuild_pte_from_stripped_gguf(
+        stripped_pte, index_bytes, gguf_bytes);
+  } else if (!FLAGS_tmac_model_path.empty()) {
+    const std::vector<uint8_t> gguf_bytes = read_binary_file(FLAGS_tmac_model_path);
+    rebuild_result = example::rebuild_pte_from_stripped_tmac_gguf(
         stripped_pte, index_bytes, gguf_bytes);
   } else {
     const std::vector<uint8_t> checkpoint_bytes =
