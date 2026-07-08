@@ -94,6 +94,8 @@ namespace {
 struct ModuleBundle {
   std::unique_ptr<executorch::extension::Module> module;
   std::shared_ptr<std::vector<uint8_t>> pte_bytes;
+  size_t materialized_weight_bytes{0};
+  example::PteSplitMaterializationStats split_stats;
 };
 
 struct ModuleMetaInfo {
@@ -152,6 +154,7 @@ ModuleBundle load_module_from_file_or_rebuild() {
 
   const std::vector<uint8_t> stripped_pte = read_binary_file(FLAGS_stripped_model_path);
   const std::vector<uint8_t> index_bytes = read_binary_file(FLAGS_index_bin_path);
+  bundle.split_stats = example::analyze_split_materialization(index_bytes);
   example::PteRebuildResult rebuild_result;
   if (!FLAGS_gguf_model_path.empty()) {
     const std::vector<uint8_t> gguf_bytes = read_binary_file(FLAGS_gguf_model_path);
@@ -173,6 +176,7 @@ ModuleBundle load_module_from_file_or_rebuild() {
         FLAGS_qat_qweight_mode);
   }
   bundle.pte_bytes = rebuild_result.rebuilt_pte;
+  bundle.materialized_weight_bytes = rebuild_result.materialized_weight_bytes;
   auto data_loader = std::make_unique<executorch::extension::BufferDataLoader>(
       bundle.pte_bytes->data(), bundle.pte_bytes->size());
   bundle.module = std::make_unique<executorch::extension::Module>(std::move(data_loader));
@@ -314,6 +318,13 @@ void run_pd_export(
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
   example::PDPrefillRunner<T> runner(
       std::move(module_bundle.module),
+      {},
+      {},
+      {},
+      false,
+      64,
+      2048,
+      {},
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
       FLAGS_tokenizer_path.c_str(),
@@ -371,6 +382,14 @@ int main(int argc, char** argv) {
       "tokenized_prompt mode does not support system_prompt reformatting");
 
   ModuleBundle module_bundle = load_module_from_file_or_rebuild();
+  if (should_rebuild_from_stripped()) {
+    ET_LOG(
+        Info,
+        "pte_materialized_weight_bytes=%zu split_peak_weight_bytes=%zu num_splits=%zu",
+        module_bundle.materialized_weight_bytes,
+        module_bundle.split_stats.peak_split_materialized_weight_bytes,
+        module_bundle.split_stats.num_splits);
+  }
   ModuleMetaInfo module_meta = read_module_meta(module_bundle.module.get());
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module;
 

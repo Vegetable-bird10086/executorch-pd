@@ -505,14 +505,14 @@ class Qwen3_0_6B(LLMModelConfig):
 @register_llm_model("qwen3-1_7b")
 @dataclass(init=False, frozen=True)
 class Qwen3_1_7B(LLMModelConfig):
-    repo_id: str = "/root/autodl-tmp/Qwen3-1.7B"
+    repo_id: str = "/root/autodl-tmp/Qwen3-1.7b-dequantized-e2e"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3/config/1_7b_config.json"
     )
     convert_weights = convert_qwen3_weights
     transform_weight = False
     instruct_model = True
-    num_sharding = 1
+    num_sharding = 4
     masked_softmax = True
     seq_mse_candidates = 0
     r1 = False
@@ -599,6 +599,5 @@ class SmolVLM_500M(LLMModelConfig):
     r2 = False
     r3 = False
     quant_recipe = SmolVLMQuantRecipe
-
 
 

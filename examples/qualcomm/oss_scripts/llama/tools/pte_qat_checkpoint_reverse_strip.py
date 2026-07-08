@@ -60,13 +60,14 @@ TARGET_MAP = {
     "feed_forward.w2_conv": "mlp.down_proj",
 }
 BINARY_INDEX_MAGIC = 0x49515445
-BINARY_INDEX_VERSION = 1
+BINARY_INDEX_VERSION = 2
 BINARY_INDEX_HEADER_SIZE = 32
 BINARY_INDEX_RECORD_SIZE = 20
 WEIGHT_KIND_OUTPUT_CONV = 0
 WEIGHT_KIND_DECODER_LINEAR = 1
 INVALID_LAYER_ID = 0xFF
 INVALID_OP_ID = 0xFF
+DEFAULT_NUM_LAYERS = 28
 
 
 @dataclass
@@ -77,9 +78,11 @@ class QATWeightSpec:
     quant_type: str = "int4block"
 
 
-def expected_reverse_names(include_output: bool = True) -> List[str]:
+def expected_reverse_names(
+    include_output: bool = True, layer_start: int = 0, layer_end_exclusive: int = DEFAULT_NUM_LAYERS
+) -> List[str]:
     names: List[str] = ["output.conv"] if include_output else []
-    for layer_id in range(27, -1, -1):
+    for layer_id in range(layer_end_exclusive - 1, layer_start - 1, -1):
         prefix = f"layers.{layer_id}"
         for op in REVERSE_LAYER_OPS:
             names.append(f"{prefix}.{op}")
@@ -88,7 +91,9 @@ def expected_reverse_names(include_output: bool = True) -> List[str]:
 
 
 
-def build_qat_specs(include_output: bool = True) -> Dict[str, QATWeightSpec]:
+def build_qat_specs(
+    include_output: bool = True, layer_start: int = 0, layer_end_exclusive: int = DEFAULT_NUM_LAYERS
+) -> Dict[str, QATWeightSpec]:
     out: Dict[str, QATWeightSpec] = {}
     if include_output:
         out["output.conv"] = QATWeightSpec(
@@ -97,7 +102,7 @@ def build_qat_specs(include_output: bool = True) -> Dict[str, QATWeightSpec]:
             qat_base_key="lm_head",
             quant_type="int8_per_channel",
         )
-    for layer_id in range(28):
+    for layer_id in range(layer_start, layer_end_exclusive):
         for local_op, qat_local in TARGET_MAP.items():
             name = f"layers.{layer_id}.{local_op}"
             out[name] = QATWeightSpec(
@@ -126,6 +131,34 @@ def encode_weight_id(name: str) -> Tuple[int, int, int]:
     except ValueError as exc:
         raise ValueError(f"unsupported decoder op: {name}") from exc
     return (WEIGHT_KIND_DECODER_LINEAR, layer_id, op_id)
+
+
+def build_split_starts(num_layers: int, num_splits: int) -> List[int]:
+    if num_splits <= 1:
+        return [0]
+    step = int(num_layers / num_splits)
+    if step <= 0:
+        raise ValueError(
+            f"num_splits={num_splits} is too large for num_layers={num_layers}"
+        )
+    return list(range(0, num_layers, step))
+
+
+def split_id_for_record(
+    layer_id: Optional[int], num_layers: int, num_splits: int
+) -> int:
+    if num_splits <= 1:
+        return 0
+    if layer_id is None:
+        return num_splits - 1
+    split_starts = build_split_starts(num_layers, num_splits)
+    split_id = 0
+    for idx, start in enumerate(split_starts):
+        if layer_id >= start:
+            split_id = idx
+        else:
+            break
+    return min(split_id, num_splits - 1)
 
 
 def _enc_nibble_pair(high: int, low: int) -> int:
@@ -445,8 +478,15 @@ def realtime_delete(
     strict: bool = True,
     show_progress: bool = True,
     search_direction: str = "reverse",
+    num_splits: int = 1,
+    layer_start: int = 0,
+    layer_end_exclusive: int = DEFAULT_NUM_LAYERS,
 ) -> Tuple[bytearray, Dict[str, Any], List[str]]:
-    order = expected_reverse_names(include_output=include_output)
+    order = expected_reverse_names(
+        include_output=include_output,
+        layer_start=layer_start,
+        layer_end_exclusive=layer_end_exclusive,
+    )
     source_bytes = old_pte.read_bytes()
     old_size = len(source_bytes)
 
@@ -517,6 +557,9 @@ def realtime_delete(
                         "weight_kind": None,
                         "layer_id": spec.layer_id,
                         "op_id": None,
+                        "split_id": split_id_for_record(
+                            spec.layer_id, DEFAULT_NUM_LAYERS, num_splits
+                        ),
                         "block_id": block_id,
                         "quant_type": spec.quant_type,
                         "current_offset_before_delete": None,
@@ -540,6 +583,9 @@ def realtime_delete(
                     "weight_kind": weight_kind,
                     "layer_id": layer_id,
                     "op_id": op_id,
+                    "split_id": split_id_for_record(
+                        spec.layer_id, DEFAULT_NUM_LAYERS, num_splits
+                    ),
                     "block_id": block_id,
                     "quant_type": spec.quant_type,
                     "current_offset_before_delete": int(hit),
@@ -600,6 +646,10 @@ def realtime_delete(
         "qweight_mode": qweight_mode,
         "bits_hint": bits_hint,
         "group_size": group_size,
+        "num_splits": num_splits,
+        "layer_start": layer_start,
+        "layer_end_exclusive": layer_end_exclusive,
+        "split_layer_starts": build_split_starts(DEFAULT_NUM_LAYERS, num_splits),
         "records": records,
     }
     return stripped_buf, index_payload, report_lines
@@ -616,7 +666,7 @@ def write_binary_index(index_bin: Path, index_payload: Dict[str, Any]) -> None:
         BINARY_INDEX_VERSION,
         BINARY_INDEX_HEADER_SIZE,
         BINARY_INDEX_RECORD_SIZE,
-        0,
+        int(index_payload.get("num_splits", 1)),
         len(records),
         int(index_payload["old_pte_size"]),
         int(index_payload["final_pte_size"]),
@@ -635,7 +685,7 @@ def write_binary_index(index_bin: Path, index_payload: Dict[str, Any]) -> None:
                 weight_kind,
                 layer_id,
                 op_id,
-                0,
+                int(rec.get("split_id", 0)),
                 int(rec["block_id"]),
                 int(rec["source_offset"]),
                 int(rec["length"]),
@@ -672,6 +722,7 @@ def write_outputs(
         f"delete_order_mode={index_payload['delete_order_mode']}",
         f"source_file_modified={index_payload.get('source_file_modified', False)}",
         f"working_buffer_mode={index_payload.get('working_buffer_mode', 'in_memory_copy')}",
+        f"num_splits={index_payload.get('num_splits', 1)}",
         f"consistency_ok={calc_deleted == index_payload['total_deleted_bytes']}",
         "",
     ]
@@ -695,6 +746,24 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--bits-hint", type=int, default=2, help="Packed source bits hint")
     ap.add_argument("--group-size", type=int, default=32, help="QAT source group size")
+    ap.add_argument(
+        "--num-splits",
+        type=int,
+        default=1,
+        help="Logical shard count used to assign stripped decoder blocks to split-level rebuild groups.",
+    )
+    ap.add_argument(
+        "--layer-start",
+        type=int,
+        default=0,
+        help="First decoder layer id to strip, inclusive.",
+    )
+    ap.add_argument(
+        "--layer-end-exclusive",
+        type=int,
+        default=DEFAULT_NUM_LAYERS,
+        help="Last decoder layer id to strip, exclusive.",
+    )
     ap.add_argument(
         "--qweight-mode",
         choices=["qweight", "qweight_minus_qzeros"],
@@ -737,8 +806,17 @@ def main() -> None:
     if not qat_checkpoint.exists():
         raise FileNotFoundError(f"qat checkpoint not found: {qat_checkpoint}")
 
+    if args.layer_start < 0 or args.layer_end_exclusive > DEFAULT_NUM_LAYERS or args.layer_start >= args.layer_end_exclusive:
+        raise ValueError(
+            f"invalid layer range: [{args.layer_start}, {args.layer_end_exclusive})"
+        )
+
     qat_sd = load_file(str(qat_checkpoint))
-    specs_by_name = build_qat_specs(include_output=not args.keep_output)
+    specs_by_name = build_qat_specs(
+        include_output=not args.keep_output,
+        layer_start=args.layer_start,
+        layer_end_exclusive=args.layer_end_exclusive,
+    )
     strict = not args.no_strict
 
     stripped, index_payload, report_lines = realtime_delete(
@@ -752,6 +830,9 @@ def main() -> None:
         strict=strict,
         show_progress=not args.no_progress,
         search_direction=args.search_direction,
+        num_splits=args.num_splits,
+        layer_start=args.layer_start,
+        layer_end_exclusive=args.layer_end_exclusive,
     )
 
     out_dir = Path(args.out_dir).expanduser().resolve()

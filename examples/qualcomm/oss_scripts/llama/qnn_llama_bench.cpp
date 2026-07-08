@@ -466,6 +466,7 @@ void run_benchmarks(
 
   example::Runner<T> runner(
       std::move(module_bundle.module),
+      {},
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
       FLAGS_tokenizer_path.c_str(),

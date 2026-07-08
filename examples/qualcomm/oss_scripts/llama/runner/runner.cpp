@@ -130,6 +130,7 @@ double nll_from_quantized_logits(
 template <typename T>
 Runner<T>::Runner(
     std::unique_ptr<executorch::extension::Module> module,
+    std::vector<std::string> prefill_shard_paths,
     const std::string& decoder_model_version,
     const std::string& model_path,
     const std::string& tokenizer_path,
@@ -144,6 +145,7 @@ Runner<T>::Runner(
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
     : module_(std::move(module)),
+      prefill_shard_paths_(std::move(prefill_shard_paths)),
       ngram_(ngram),
       window_(window),
       gcap_(gcap),
@@ -268,9 +270,8 @@ Error Runner<T>::load() {
   int32_t vocab_size = method_meta->output_tensor_meta(0)->sizes()[2];
   vocab_size_ = vocab_size;
   decoder_runner_ =
-      std::make_unique<DecoderRunner>(module_.get(), vocab_size, temperature_);
-
-  ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
+      std::make_unique<DecoderRunner>(
+          module_.get(), vocab_size, temperature_, prefill_shard_paths_);
 
   ET_LOG(Info, "Reading metadata from model");
   // retrieve any method meta, can be either prefill or kv
@@ -313,6 +314,15 @@ Error Runner<T>::load() {
     max_cache_len = context_len_ -
         std::min(token_generator_ar_len, prompt_processor_ar_len);
   max_ar_len = std::max(token_generator_ar_len, prompt_processor_ar_len);
+
+  decoder_runner_->configure_prefill_shards(
+      num_layers,
+      context_len_,
+      prompt_processor_ar_len,
+      vocab_size,
+      cache_mode_ == CacheMode::HybridCache);
+
+  ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
 
   // Load the sliding window size if the model supports it.
   // This is used to configure the attention mask for models with window

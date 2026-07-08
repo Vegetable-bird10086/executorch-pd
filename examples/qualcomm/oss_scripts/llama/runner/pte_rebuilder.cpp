@@ -44,7 +44,7 @@ constexpr std::array<const char*, 7> kForwardTargetOps = {
 };
 
 constexpr uint32_t kBinaryIndexMagic = 0x49515445U;
-constexpr uint16_t kBinaryIndexVersion = 1;
+constexpr uint16_t kBinaryIndexVersion = 2;
 constexpr uint16_t kBinaryIndexHeaderSizeV1 = 32;
 constexpr uint16_t kBinaryIndexRecordSize = 20;
 constexpr uint8_t kWeightKindOutputConv = 0;
@@ -98,6 +98,7 @@ enum class GgufTensorType : uint32_t {
 
 struct RebuildRecord {
   EncodedWeightId weight_id;
+  uint8_t split_id{0};
   int block_id{0};
   int64_t source_offset{0};
   int64_t length{0};
@@ -275,8 +276,31 @@ struct ParsedIndex {
   size_t old_size{0};
   size_t final_size{0};
   size_t total_deleted{0};
+  size_t num_splits{1};
   std::vector<RebuildRecord> records;
 };
+
+std::vector<const RebuildRecord*> select_records_for_split(
+    const ParsedIndex& parsed_index,
+    int split_id) {
+  std::vector<const RebuildRecord*> out;
+  out.reserve(parsed_index.records.size());
+  for (const auto& rec : parsed_index.records) {
+    if (split_id < 0 || static_cast<int>(rec.split_id) == split_id) {
+      out.push_back(&rec);
+    }
+  }
+  return out;
+}
+
+size_t total_materialized_weight_bytes(
+    const std::vector<const RebuildRecord*>& records) {
+  size_t total = 0;
+  for (const auto* rec : records) {
+    total += static_cast<size_t>(rec->length);
+  }
+  return total;
+}
 
 struct GgufTensorInfo {
   std::vector<uint64_t> shape;
@@ -522,6 +546,7 @@ ParsedIndex parse_binary_index(const std::vector<uint8_t>& index_bytes) {
   out.old_size = static_cast<size_t>(read_u64_le(index_bytes.data() + 16));
   out.final_size = static_cast<size_t>(read_u64_le(index_bytes.data() + 24));
   out.total_deleted = out.old_size - out.final_size;
+  out.num_splits = version >= 2 ? std::max<size_t>(1, read_u16_le(index_bytes.data() + 10)) : 1;
 
   const size_t expected_size =
       static_cast<size_t>(header_size) + static_cast<size_t>(record_count) * record_size;
@@ -535,6 +560,7 @@ ParsedIndex parse_binary_index(const std::vector<uint8_t>& index_bytes) {
     const EncodedWeightId weight_id{record_ptr[0], record_ptr[1], record_ptr[2]};
     out.records.push_back(RebuildRecord{
         weight_id,
+        static_cast<uint8_t>(version >= 2 ? record_ptr[3] : 0),
         static_cast<int>(read_u32_le(record_ptr + 4)),
         static_cast<int64_t>(read_u64_le(record_ptr + 8)),
         static_cast<int64_t>(read_u32_le(record_ptr + 16)),
@@ -1392,6 +1418,7 @@ void write_int4_block_from_tmac_i2(
 
 bool try_build_specialized_fastpath_plan(
     const ParsedIndex& parsed_index,
+    const std::vector<const RebuildRecord*>& selected_records,
     const SafeTensorsView& checkpoint,
     int bits_hint,
     int group_size,
@@ -1402,8 +1429,8 @@ bool try_build_specialized_fastpath_plan(
   (void)qweight_mode;
 
   bool has_output_conv = false;
-  for (const auto& rec : parsed_index.records) {
-    if (rec.weight_id.kind == kWeightKindOutputConv) {
+  for (const auto* rec : selected_records) {
+    if (rec->weight_id.kind == kWeightKindOutputConv) {
       has_output_conv = true;
       break;
     }
@@ -1412,7 +1439,7 @@ bool try_build_specialized_fastpath_plan(
   plan->tensor_contexts.clear();
   plan->records.clear();
   plan->tensor_contexts.reserve((has_output_conv ? 1 : 0) + 28 * kForwardTargetOps.size());
-  plan->records.reserve(parsed_index.records.size());
+  plan->records.reserve(selected_records.size());
 
   size_t output_ctx_index = 0;
   if (has_output_conv) {
@@ -1440,16 +1467,16 @@ bool try_build_specialized_fastpath_plan(
     }
   }
 
-  for (const auto& rec : parsed_index.records) {
-    if (rec.weight_id.kind == kWeightKindOutputConv) {
+  for (const auto* rec : selected_records) {
+    if (rec->weight_id.kind == kWeightKindOutputConv) {
       const auto& ctx = plan->tensor_contexts[output_ctx_index];
-      plan->records.push_back(SpecializedFastPathRecord{&ctx, true, rec.block_id});
+      plan->records.push_back(SpecializedFastPathRecord{&ctx, true, rec->block_id});
       continue;
     }
     const size_t ctx_index = (has_output_conv ? 1 : 0) +
-        static_cast<size_t>(rec.weight_id.layer_id) * kForwardTargetOps.size() + rec.weight_id.op_id;
+        static_cast<size_t>(rec->weight_id.layer_id) * kForwardTargetOps.size() + rec->weight_id.op_id;
     const auto& ctx = plan->tensor_contexts[ctx_index];
-    plan->records.push_back(SpecializedFastPathRecord{&ctx, false, rec.block_id});
+    plan->records.push_back(SpecializedFastPathRecord{&ctx, false, rec->block_id});
   }
   return true;
 }
@@ -1470,7 +1497,8 @@ PteRebuildResult rebuild_pte_from_index(
     const std::vector<uint8_t>& checkpoint_bytes,
     int bits_hint,
     int group_size,
-    const std::string& qweight_mode) {
+    const std::string& qweight_mode,
+    int split_id) {
   /* if (parsed_index.old_size < parsed_index.final_size ||
       parsed_index.old_size - parsed_index.final_size != parsed_index.total_deleted) {
     throw std::runtime_error("index.bin size consistency failed");
@@ -1480,6 +1508,7 @@ PteRebuildResult rebuild_pte_from_index(
   } */
 
   const auto checkpoint = parse_safetensors(checkpoint_bytes);
+  const auto selected_records = select_records_for_split(parsed_index, split_id);
   SpecializedFastPathPlan specialized_plan;
   /* if (!try_build_specialized_fastpath_plan(
           parsed_index,
@@ -1492,6 +1521,7 @@ PteRebuildResult rebuild_pte_from_index(
   } */
   try_build_specialized_fastpath_plan(
       parsed_index,
+      selected_records,
       checkpoint,
       bits_hint,
       group_size,
@@ -1501,8 +1531,8 @@ PteRebuildResult rebuild_pte_from_index(
 
   size_t src_ptr = 0;
   size_t dst_cursor = 0;
-  for (size_t record_index = 0; record_index < parsed_index.records.size(); ++record_index) {
-    const auto& rec = parsed_index.records[record_index];
+  for (size_t record_index = 0; record_index < selected_records.size(); ++record_index) {
+    const auto& rec = *selected_records[record_index];
     /* if (rec.source_offset < 0 || rec.length <= 0) {
       throw std::runtime_error("Invalid record offset or length");
     } */
@@ -1540,15 +1570,18 @@ PteRebuildResult rebuild_pte_from_index(
   return PteRebuildResult{
       rebuilt,
       0.0,
-      parsed_index.records.size(),
+      selected_records.size(),
+      total_materialized_weight_bytes(selected_records),
       true};
 }
 
 PteRebuildResult rebuild_pte_from_tmac_gguf_index(
     const std::vector<uint8_t>& stripped_pte,
     const ParsedIndex& parsed_index,
-    const std::vector<uint8_t>& gguf_bytes) {
+    const std::vector<uint8_t>& gguf_bytes,
+    int split_id) {
   const auto gguf = parse_gguf(gguf_bytes);
+  const auto selected_records = select_records_for_split(parsed_index, split_id);
   auto rebuilt = std::make_shared<std::vector<uint8_t>>(parsed_index.old_size);
 
   std::string current_tensor_name;
@@ -1557,7 +1590,8 @@ PteRebuildResult rebuild_pte_from_tmac_gguf_index(
 
   size_t src_ptr = 0;
   size_t dst_cursor = 0;
-  for (const auto& rec : parsed_index.records) {
+  for (const auto* rec_ptr : selected_records) {
+    const auto& rec = *rec_ptr;
     const size_t insert_at = static_cast<size_t>(rec.source_offset);
     const size_t rec_len = static_cast<size_t>(rec.length);
     const size_t keep_len = insert_at - dst_cursor;
@@ -1596,15 +1630,18 @@ PteRebuildResult rebuild_pte_from_tmac_gguf_index(
   return PteRebuildResult{
       rebuilt,
       0.0,
-      parsed_index.records.size(),
+      selected_records.size(),
+      total_materialized_weight_bytes(selected_records),
       true};
 }
 
 PteRebuildResult rebuild_pte_from_gguf_index(
     const std::vector<uint8_t>& stripped_pte,
     const ParsedIndex& parsed_index,
-    const std::vector<uint8_t>& gguf_bytes) {
+    const std::vector<uint8_t>& gguf_bytes,
+    int split_id) {
   const auto gguf = parse_gguf(gguf_bytes);
+  const auto selected_records = select_records_for_split(parsed_index, split_id);
   auto rebuilt = std::make_shared<std::vector<uint8_t>>(parsed_index.old_size);
 
   std::string current_tensor_name;
@@ -1613,7 +1650,8 @@ PteRebuildResult rebuild_pte_from_gguf_index(
 
   size_t src_ptr = 0;
   size_t dst_cursor = 0;
-  for (const auto& rec : parsed_index.records) {
+  for (const auto* rec_ptr : selected_records) {
+    const auto& rec = *rec_ptr;
     const size_t insert_at = static_cast<size_t>(rec.source_offset);
     const size_t rec_len = static_cast<size_t>(rec.length);
     const size_t keep_len = insert_at - dst_cursor;
@@ -1650,7 +1688,8 @@ PteRebuildResult rebuild_pte_from_gguf_index(
   return PteRebuildResult{
       rebuilt,
       0.0,
-      parsed_index.records.size(),
+      selected_records.size(),
+      total_materialized_weight_bytes(selected_records),
       true};
 }
 
@@ -1671,7 +1710,8 @@ PteRebuildResult rebuild_pte_from_stripped_checkpoint(
       checkpoint_bytes,
       bits_hint,
       group_size,
-      qweight_mode);
+      qweight_mode,
+      -1);
   const auto end = std::chrono::steady_clock::now();
   result.rebuild_time_ms =
       std::chrono::duration<double, std::milli>(end - start).count();
@@ -1685,7 +1725,7 @@ PteRebuildResult rebuild_pte_from_stripped_tmac_gguf(
   const auto start = std::chrono::steady_clock::now();
   const ParsedIndex parsed_index = parse_binary_index(index_bytes);
   auto result =
-      rebuild_pte_from_tmac_gguf_index(stripped_pte, parsed_index, gguf_bytes);
+      rebuild_pte_from_tmac_gguf_index(stripped_pte, parsed_index, gguf_bytes, -1);
   const auto end = std::chrono::steady_clock::now();
   result.rebuild_time_ms =
       std::chrono::duration<double, std::milli>(end - start).count();
@@ -1699,11 +1739,88 @@ PteRebuildResult rebuild_pte_from_stripped_gguf(
   const auto start = std::chrono::steady_clock::now();
   const ParsedIndex parsed_index = parse_binary_index(index_bytes);
   auto result =
-      rebuild_pte_from_gguf_index(stripped_pte, parsed_index, gguf_bytes);
+      rebuild_pte_from_gguf_index(stripped_pte, parsed_index, gguf_bytes, -1);
   const auto end = std::chrono::steady_clock::now();
   result.rebuild_time_ms =
       std::chrono::duration<double, std::milli>(end - start).count();
   return result;
+}
+
+PteRebuildResult rebuild_pte_split_from_stripped_checkpoint(
+    const std::vector<uint8_t>& stripped_pte,
+    const std::vector<uint8_t>& index_bytes,
+    const std::vector<uint8_t>& checkpoint_bytes,
+    int bits_hint,
+    int group_size,
+    const std::string& qweight_mode,
+    int split_id) {
+  const auto start = std::chrono::steady_clock::now();
+  const ParsedIndex parsed_index = parse_binary_index(index_bytes);
+  auto result = rebuild_pte_from_index(
+      stripped_pte,
+      parsed_index,
+      checkpoint_bytes,
+      bits_hint,
+      group_size,
+      qweight_mode,
+      split_id);
+  const auto end = std::chrono::steady_clock::now();
+  result.rebuild_time_ms =
+      std::chrono::duration<double, std::milli>(end - start).count();
+  return result;
+}
+
+PteRebuildResult rebuild_pte_split_from_stripped_tmac_gguf(
+    const std::vector<uint8_t>& stripped_pte,
+    const std::vector<uint8_t>& index_bytes,
+    const std::vector<uint8_t>& gguf_bytes,
+    int split_id) {
+  const auto start = std::chrono::steady_clock::now();
+  const ParsedIndex parsed_index = parse_binary_index(index_bytes);
+  auto result =
+      rebuild_pte_from_tmac_gguf_index(stripped_pte, parsed_index, gguf_bytes, split_id);
+  const auto end = std::chrono::steady_clock::now();
+  result.rebuild_time_ms =
+      std::chrono::duration<double, std::milli>(end - start).count();
+  return result;
+}
+
+PteRebuildResult rebuild_pte_split_from_stripped_gguf(
+    const std::vector<uint8_t>& stripped_pte,
+    const std::vector<uint8_t>& index_bytes,
+    const std::vector<uint8_t>& gguf_bytes,
+    int split_id) {
+  const auto start = std::chrono::steady_clock::now();
+  const ParsedIndex parsed_index = parse_binary_index(index_bytes);
+  auto result =
+      rebuild_pte_from_gguf_index(stripped_pte, parsed_index, gguf_bytes, split_id);
+  const auto end = std::chrono::steady_clock::now();
+  result.rebuild_time_ms =
+      std::chrono::duration<double, std::milli>(end - start).count();
+  return result;
+}
+
+PteSplitMaterializationStats analyze_split_materialization(
+    const std::vector<uint8_t>& index_bytes) {
+  const ParsedIndex parsed_index = parse_binary_index(index_bytes);
+  PteSplitMaterializationStats stats;
+  stats.num_splits = parsed_index.num_splits;
+  stats.full_materialized_weight_bytes = parsed_index.total_deleted;
+  stats.split_materialized_weight_bytes.assign(parsed_index.num_splits, 0);
+  stats.split_record_counts.assign(parsed_index.num_splits, 0);
+
+  for (const auto& rec : parsed_index.records) {
+    const size_t split_id = std::min<size_t>(rec.split_id, parsed_index.num_splits - 1);
+    stats.split_materialized_weight_bytes[split_id] += static_cast<size_t>(rec.length);
+    stats.split_record_counts[split_id] += 1;
+  }
+
+  for (size_t bytes : stats.split_materialized_weight_bytes) {
+    stats.peak_split_materialized_weight_bytes =
+        std::max(stats.peak_split_materialized_weight_bytes, bytes);
+  }
+
+  return stats;
 }
 
 } // namespace example

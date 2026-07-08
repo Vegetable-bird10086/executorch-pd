@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import types
+import gc
 
 from collections import deque
 from functools import partial
@@ -86,6 +87,8 @@ from executorch.examples.qualcomm.utils import make_quantizer
 from executorch.exir.backend.compile_spec_schema import CompileSpec
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.dialects._ops import ops as exir_ops
+from executorch.exir._serialize import _PTEFile, _serialize_pte_binary
+from executorch.exir.lowered_backend_module import get_lowered_submodules
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.extension.llm.custom_ops import model_sharding
 from executorch.extension.llm.export.builder import DType
@@ -144,6 +147,146 @@ class TextDecoder(Component):
             self.passes_job[SplitGraph] = setting
             self.dep_table[SplitGraph] = [FoldQDQ]
             self.dep_table[TagQuantIO] = [SplitGraph]
+
+    def _export_sharded_decoder_ptes(
+        self,
+        edge_prog_mgr,
+        graph_names: List[str],
+        artifact_dir: str,
+        base_name: str,
+    ) -> Dict[str, Any]:
+        def _node_shape(node):
+            val = node.meta.get("val") if hasattr(node, "meta") else None
+            shape = getattr(val, "shape", None)
+            return list(shape) if shape is not None else None
+
+        def _node_record(node) -> Dict[str, Any]:
+            return {
+                "name": str(getattr(node, "name", "")),
+                "op": str(getattr(node, "op", "")),
+                "target": str(getattr(node, "target", "")),
+                "shape": _node_shape(node),
+                "stack_trace": str(getattr(node, "meta", {}).get("stack_trace", "")),
+                "source_fn_stack": str(
+                    getattr(node, "meta", {}).get("source_fn_stack", "")
+                ),
+                "nn_module_stack": str(
+                    getattr(node, "meta", {}).get("nn_module_stack", "")
+                ),
+            }
+
+        def _flatten_output_nodes(output_node):
+            outputs = output_node.args[0]
+            if isinstance(outputs, (tuple, list)) and len(outputs) == 1:
+                inner = outputs[0]
+                if isinstance(inner, (tuple, list)):
+                    outputs = inner
+            return list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
+
+        shard_manifest = {
+            "combined_pte": os.path.join(artifact_dir, f"{base_name}.pte"),
+            "num_shards": 0,
+            "graphs": {},
+        }
+        for graph_name in graph_names:
+            exported_program = edge_prog_mgr.exported_program(graph_name)
+            graph_code_path = os.path.join(
+                artifact_dir,
+                f"{base_name}.{graph_name}.lowered_graph.py",
+            )
+            with open(graph_code_path, "w", encoding="utf-8") as file:
+                file.write(exported_program.graph_module.code)
+            lowered_submodules = get_lowered_submodules(exported_program.graph_module)
+            if not lowered_submodules:
+                raise RuntimeError(
+                    f"no lowered submodules found for sharded graph {graph_name}"
+                )
+            shard_manifest["num_shards"] = max(
+                shard_manifest["num_shards"], len(lowered_submodules)
+            )
+            graph_manifest = {
+                "pte_paths": [],
+                "delegate_names": [name for name, _, _ in lowered_submodules],
+                "lowered_graph_code": graph_code_path,
+                "shards": [],
+            }
+            for shard_idx, (delegate_name, lowered_module, _) in enumerate(
+                lowered_submodules
+            ):
+                shard_pte_path = os.path.join(
+                    artifact_dir,
+                    f"{base_name}.{graph_name}.shard{shard_idx}.pte",
+                )
+                shard_program = lowered_module.program(
+                    memory_planning=MemoryPlanningPass(
+                        alloc_graph_input=False,
+                        alloc_graph_output=False,
+                    )
+                )
+                if shard_program.execution_plan:
+                    shard_program.execution_plan[0].name = graph_name
+                with open(shard_pte_path, "wb") as file:
+                    file.write(
+                        bytes(
+                            _serialize_pte_binary(
+                                pte_file=_PTEFile(program=shard_program),
+                            )
+                        )
+                    )
+                graph_manifest["pte_paths"].append(shard_pte_path)
+                original_graph = lowered_module.original_module.graph
+                input_nodes = [
+                    node
+                    for node in original_graph.nodes
+                    if node.op == "placeholder"
+                    and node.name
+                    not in lowered_module.original_module.graph_signature.inputs_to_buffers
+                    and node.name
+                    not in lowered_module.original_module.graph_signature.inputs_to_parameters
+                ]
+                output_nodes = _flatten_output_nodes(original_graph.output_node())
+                original_code_path = os.path.join(
+                    artifact_dir,
+                    f"{base_name}.{graph_name}.shard{shard_idx}.original_graph.py",
+                )
+                with open(original_code_path, "w", encoding="utf-8") as file:
+                    file.write(lowered_module.original_module.graph_module.code)
+                graph_manifest["shards"].append(
+                    {
+                        "index": shard_idx,
+                        "delegate_name": delegate_name,
+                        "pte_path": shard_pte_path,
+                        "original_graph_code": original_code_path,
+                        "inputs": [_node_record(node) for node in input_nodes],
+                        "outputs": [_node_record(node) for node in output_nodes],
+                    }
+                )
+                logging.info(
+                    "exported shard pte graph=%s shard=%d delegate=%s path=%s",
+                    graph_name,
+                    shard_idx,
+                    delegate_name,
+                    shard_pte_path,
+                )
+                gc.collect()
+            shard_manifest["graphs"][graph_name] = graph_manifest
+
+        shard_manifest_path = os.path.join(
+            artifact_dir,
+            f"{base_name}.shards.json",
+        )
+        with open(shard_manifest_path, "w") as file:
+            json.dump(shard_manifest, file, indent=2)
+
+        logging.info(
+            "exported decoder shard ptes: manifest=%s graphs=%s",
+            shard_manifest_path,
+            {
+                graph_name: len(graph_manifest["pte_paths"])
+                for graph_name, graph_manifest in shard_manifest["graphs"].items()
+            },
+        )
+        return shard_manifest
 
     def _prepare_model(self):  # noqa: C901
         if (instance := self._get_model_instance()) is None:
@@ -3893,10 +4036,16 @@ class HybridTextDecoder(Component):
         )
         exec_prog_mgr = edge_prog_mgr.to_executorch(executorch_config)
         data = request.method_data[TEXT_DECODER]
-        with open(
-            f"{self.control_args.artifact}/{data.pte_filename}.pte", "wb"
-        ) as file:
+        combined_pte_path = f"{self.control_args.artifact}/{data.pte_filename}.pte"
+        with open(combined_pte_path, "wb") as file:
             exec_prog_mgr.write_to_file(file)
+        if self.config.num_sharding > 1:
+            self.decode._export_sharded_decoder_ptes(
+                edge_prog_mgr=edge_prog_mgr,
+                graph_names=graph_names,
+                artifact_dir=self.control_args.artifact,
+                base_name=data.pte_filename,
+            )
 
 
 class Modality(Component):

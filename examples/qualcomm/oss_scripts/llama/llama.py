@@ -823,6 +823,14 @@ def export_llama(args) -> None:
         tokenizer,
         calibration_data,
     )
+    shard_manifest_path = (
+        f"{args.artifact}/{pte_filenames[TEXT_DECODER]}.shards.json"
+    )
+    if (
+        decoder_model_config.num_sharding > 1
+        and os.path.exists(shard_manifest_path)
+    ):
+        logging.info("decoder shard manifest exported at %s", shard_manifest_path)
     if args.use_attention_sink:
         compile_attention_sink_evictor(
             args,
@@ -839,6 +847,26 @@ def export_llama(args) -> None:
             validation_results = {
                 "pte_size": text_decoder_pte_path,
             }
+            if (
+                decoder_model_config.num_sharding > 1
+                and os.path.exists(shard_manifest_path)
+            ):
+                with open(shard_manifest_path) as file:
+                    shard_manifest = json.load(file)
+                validation_results.update(
+                    {
+                        "decoder_shard_count": shard_manifest["num_shards"],
+                        "decoder_shard_pte_size": {
+                            graph_name: [
+                                os.path.getsize(path)
+                                for path in graph_info["pte_paths"]
+                            ]
+                            for graph_name, graph_info in shard_manifest[
+                                "graphs"
+                            ].items()
+                        },
+                    }
+                )
             if any(
                 [
                     hasattr(decoder_model_config, VISION_ENCODER),

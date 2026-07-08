@@ -10,15 +10,57 @@
 
 #include <executorch/extension/llm/sampler/sampler.h>
 #include <executorch/extension/module/module.h>
+#include <executorch/extension/tensor/tensor_ptr.h>
 #include <executorch/extension/tensor/tensor.h>
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace example {
 class DecoderRunner {
  public:
+  struct PrefillShardRebuildConfig {
+    enum class SourceKind {
+      None,
+      QatCheckpoint,
+      TmacGguf,
+      Gguf,
+    };
+    SourceKind source_kind{SourceKind::None};
+    std::shared_ptr<std::vector<uint8_t>> source_bytes;
+    int bits_hint{2};
+    int group_size{32};
+    std::string qweight_mode{"qweight_minus_qzeros"};
+  };
   DecoderRunner(
       executorch::extension::Module* module,
       int32_t vocab_size,
       float temperature);
+  DecoderRunner(
+      executorch::extension::Module* module,
+      int32_t vocab_size,
+      float temperature,
+      std::vector<std::string> prefill_shard_paths);
+  DecoderRunner(
+      executorch::extension::Module* module,
+      int32_t vocab_size,
+      float temperature,
+      std::vector<std::string> prefill_shard_paths,
+      std::vector<std::string> prefill_shard_index_paths,
+      PrefillShardRebuildConfig prefill_shard_rebuild);
+
+  void use_qwen3_prefill_static_plan(
+      bool enabled,
+      int32_t aux_size = 64,
+      int32_t hidden_size = 2048);
+  void configure_prefill_shards(
+      int64_t num_layers,
+      int32_t context_len,
+      int32_t prompt_ar_len,
+      int32_t vocab_size,
+      bool has_window_attention_mask);
   /**
    * Run LLM text decoder with inputs to generate next token.
    * @param inputs The inputs to the LLM Module.
@@ -97,7 +139,70 @@ class DecoderRunner {
     return logits_last;
   }
 
+  struct PrefillShardPlan {
+    enum class InputKind {
+      Tokens,
+      AttentionMask,
+      WindowAttentionMask,
+      Position,
+      KCache,
+      VCache,
+      PreviousAux,
+      PreviousHidden,
+    };
+    enum class OutputKind {
+      FinalLogits,
+      FinalKCache,
+      FinalVCache,
+      IntermediateAux,
+      IntermediateHidden,
+    };
+    struct InputBinding {
+      InputKind kind;
+      size_t index;
+    };
+    struct OutputBinding {
+      OutputKind kind;
+      size_t index;
+      size_t owned_index;
+    };
+    std::unique_ptr<executorch::extension::Module> module;
+    std::shared_ptr<std::vector<uint8_t>> rebuilt_pte_bytes;
+    std::string pte_path;
+    std::string index_path;
+    std::string method_name;
+    bool rebuild_on_execute{false};
+    size_t layer_offset{0};
+    size_t layer_count{0};
+    std::vector<InputBinding> input_bindings;
+    std::vector<OutputBinding> output_bindings;
+    std::vector<executorch::extension::TensorPtr> owned_outputs;
+    std::vector<executorch::aten::Tensor> output_tensors;
+  };
+
+  void materialize_prefill_shard(PrefillShardPlan& shard);
+  void release_prefill_shard(PrefillShardPlan& shard);
+  void configure_qwen3_static_prefill_shards();
+  executorch::runtime::Result<executorch::aten::Tensor> step_prefill_shards(
+      std::vector<executorch::runtime::EValue>& inputs);
+  executorch::runtime::Error set_outputs_prefill_shards(
+      std::vector<executorch::aten::Tensor> output_values);
+  bool uses_prefill_shards() const;
+
   executorch::extension::Module* module_;
   std::unique_ptr<executorch::extension::llm::Sampler> sampler_;
+  std::vector<std::string> prefill_shard_paths_;
+  std::vector<std::string> prefill_shard_index_paths_;
+  PrefillShardRebuildConfig prefill_shard_rebuild_;
+  std::vector<PrefillShardPlan> prefill_shards_;
+  std::vector<executorch::aten::Tensor> prefill_output_values_;
+  int64_t prefill_num_layers_{0};
+  int32_t prefill_context_len_{0};
+  int32_t prefill_prompt_ar_len_{0};
+  int32_t prefill_vocab_size_{0};
+  bool prefill_has_window_attention_mask_{false};
+  bool prefill_qwen3_static_plan_{false};
+  int32_t prefill_static_aux_size_{64};
+  int32_t prefill_static_hidden_size_{2048};
 };
 } // namespace example

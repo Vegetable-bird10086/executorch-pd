@@ -8,6 +8,7 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
 #include <numeric>
+#include <type_traits>
 using executorch::aten::TensorImpl;
 using executorch::runtime::EValue;
 using executorch::runtime::MethodMeta;
@@ -194,6 +195,153 @@ void PromptProcessor<T>::init_io(
     }
   }
   // Prepare the vector of EValue to run inference
+  inputs_.reserve(input_tensors_.size());
+  for (auto& input_tensor : input_tensors_) {
+    inputs_.emplace_back(std::move(input_tensor));
+  }
+}
+
+template <typename T>
+void PromptProcessor<T>::init_io_from_metadata(IMemAlloc* buffer_manager) {
+  using ScalarType = executorch::aten::ScalarType;
+  using SizesType = TensorImpl::SizesType;
+  using DimOrderType = TensorImpl::DimOrderType;
+
+  const int32_t cache_len = metadata_.ar_len == metadata_.context_len
+      ? metadata_.context_len
+      : metadata_.context_len - metadata_.ar_len;
+  const ScalarType token_type =
+      metadata_.use_int64_token ? ScalarType::Long : ScalarType::Int;
+  const ScalarType mask_type = ScalarType::Half;
+  const ScalarType pos_type = ScalarType::Int;
+  const ScalarType logits_type = ScalarType::Half;
+  const ScalarType kv_type =
+      std::is_same_v<T, uint8_t> ? ScalarType::Byte : ScalarType::Half;
+
+  const size_t num_inputs = 3 + static_cast<size_t>(metadata_.num_layers) * 2;
+  const size_t num_outputs = 1 + static_cast<size_t>(metadata_.num_layers) * 2;
+  input_tensors_.reserve(num_inputs);
+  output_tensors_.reserve(num_outputs);
+  synthetic_sizes_.reserve(num_inputs + num_outputs);
+  synthetic_dim_orders_.reserve(num_inputs + num_outputs);
+
+  auto make_tensor = [&](ScalarType scalar_type,
+                         std::vector<SizesType> sizes,
+                         void* data) {
+    std::vector<DimOrderType> dim_order;
+    dim_order.reserve(sizes.size());
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      dim_order.push_back(static_cast<DimOrderType>(i));
+    }
+    synthetic_sizes_.push_back(std::move(sizes));
+    synthetic_dim_orders_.push_back(std::move(dim_order));
+    return std::make_unique<TensorImpl>(
+        scalar_type,
+        synthetic_sizes_.back().size(),
+        synthetic_sizes_.back().data(),
+        data,
+        synthetic_dim_orders_.back().data());
+  };
+
+  input_toks_.data =
+      reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
+  input_toks_.tensor = make_tensor(
+      token_type, {1, static_cast<SizesType>(metadata_.ar_len)}, input_toks_.data);
+  input_tensors_.emplace_back(input_toks_.tensor.get());
+
+  attention_mask_.data = reinterpret_cast<uint16_t*>(
+      buffer_manager->allocate(attention_mask_.size));
+  attention_mask_.tensor = make_tensor(
+      mask_type,
+      {1,
+       static_cast<SizesType>(metadata_.ar_len),
+       static_cast<SizesType>(metadata_.context_len)},
+      attention_mask_.data);
+  input_tensors_.emplace_back(attention_mask_.tensor.get());
+
+  if (metadata_.cache_mode == CacheMode::HybridCache) {
+    window_attention_mask_.data = reinterpret_cast<uint16_t*>(
+        buffer_manager->allocate(window_attention_mask_.size));
+    window_attention_mask_.tensor = make_tensor(
+        mask_type,
+        {1,
+         static_cast<SizesType>(metadata_.ar_len),
+         static_cast<SizesType>(metadata_.context_len)},
+        window_attention_mask_.data);
+    input_tensors_.emplace_back(window_attention_mask_.tensor.get());
+  }
+
+  if (!is_bert()) {
+    input_pos_.data =
+        reinterpret_cast<int32_t*>(buffer_manager->allocate(input_pos_.size));
+    input_pos_.tensor = make_tensor(
+        pos_type, {1, static_cast<SizesType>(metadata_.ar_len)}, input_pos_.data);
+    input_tensors_.emplace_back(input_pos_.tensor.get());
+
+    cache_inputs_.reserve(2 * metadata_.num_layers);
+    auto k_cache_ptrs = kv_manager_->get_k_cache_();
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      T* cache_ptr = k_cache_ptrs[layer].buffer;
+      k_cache_in_[layer] = make_tensor(
+          kv_type,
+          {1,
+           static_cast<SizesType>(metadata_.num_heads),
+           static_cast<SizesType>(kv_manager_->get_head_dim()),
+           static_cast<SizesType>(cache_len)},
+          cache_ptr);
+      input_tensors_.emplace_back(k_cache_in_[layer].get());
+      cache_inputs_.emplace_back(input_tensors_.back());
+    }
+    auto v_cache_ptrs = kv_manager_->get_v_cache_();
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      T* cache_ptr = v_cache_ptrs[layer].buffer;
+      v_cache_in_[layer] = make_tensor(
+          kv_type,
+          {1,
+           static_cast<SizesType>(metadata_.num_heads),
+           static_cast<SizesType>(cache_len),
+           static_cast<SizesType>(kv_manager_->get_head_dim())},
+          cache_ptr);
+      input_tensors_.emplace_back(v_cache_in_[layer].get());
+      cache_inputs_.emplace_back(input_tensors_.back());
+    }
+  }
+
+  logits_.data =
+      reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
+  logits_.tensor = make_tensor(
+      logits_type,
+      {1,
+       static_cast<SizesType>(metadata_.ar_len),
+       static_cast<SizesType>(metadata_.vocab_size)},
+      logits_.data);
+  output_tensors_.emplace_back(logits_.tensor.get());
+
+  auto k_cache_ptrs = kv_manager_->get_k_cache_();
+  for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    T* cache_ptr = k_cache_ptrs[layer].output_buffer;
+    k_cache_out_[layer] = make_tensor(
+        kv_type,
+        {1,
+         static_cast<SizesType>(metadata_.num_heads),
+         static_cast<SizesType>(kv_manager_->get_head_dim()),
+         static_cast<SizesType>(metadata_.ar_len)},
+        cache_ptr);
+    output_tensors_.emplace_back(k_cache_out_[layer].get());
+  }
+  auto v_cache_ptrs = kv_manager_->get_v_cache_();
+  for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    T* cache_ptr = v_cache_ptrs[layer].output_buffer;
+    v_cache_out_[layer] = make_tensor(
+        kv_type,
+        {1,
+         static_cast<SizesType>(metadata_.num_heads),
+         static_cast<SizesType>(metadata_.ar_len),
+         static_cast<SizesType>(kv_manager_->get_head_dim())},
+        cache_ptr);
+    output_tensors_.emplace_back(v_cache_out_[layer].get());
+  }
+
   inputs_.reserve(input_tensors_.size());
   for (auto& input_tensor : input_tensors_) {
     inputs_.emplace_back(std::move(input_tensor));

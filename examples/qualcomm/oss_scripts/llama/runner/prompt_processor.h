@@ -15,6 +15,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace example {
 /**
@@ -49,6 +50,7 @@ class PromptProcessor {
   void init_io(
       IMemAlloc* buffer_manager,
       executorch::runtime::Result<executorch::runtime::MethodMeta> method_meta);
+  void init_io_from_metadata(IMemAlloc* buffer_manager);
 
   /**
    * @brief Get the all logits generated
@@ -133,6 +135,8 @@ class PromptProcessor {
   std::vector<executorch::aten::Tensor> output_tensors_;
   // Used for attention sink to evict KV cache.
   std::vector<executorch::runtime::EValue> cache_inputs_;
+  std::vector<std::vector<executorch::aten::TensorImpl::SizesType>> synthetic_sizes_;
+  std::vector<std::vector<executorch::aten::TensorImpl::DimOrderType>> synthetic_dim_orders_;
 
   // Unused by default, only used when dump_logits_path is provided.
   std::vector<uint16_t> prompt_all_logits_;

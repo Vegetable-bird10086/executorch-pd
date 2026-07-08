@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <fstream>
 #include <memory>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -55,6 +57,10 @@ DEFINE_string(
     gguf_model_path,
     "",
     "Path to the llama.cpp GPTQ2_32 GGUF model used to rebuild stripped decoder blocks in memory.");
+DEFINE_string(
+    prefill_shard_manifest_path,
+    "",
+    "Path to the shard manifest JSON. When provided, prefill_forward is executed by loading the listed prefill shard PTEs sequentially while kv_forward still uses the combined model.");
 DEFINE_int32(
     qat_bits_hint,
     2,
@@ -141,8 +147,10 @@ struct ModuleBundle {
   std::shared_ptr<std::vector<uint8_t>> rebuilt_pte;
   double rebuild_time_ms{0.0};
   size_t rebuilt_records{0};
+  size_t materialized_weight_bytes{0};
   bool rebuilt_from_stripped{false};
   bool specialized_fast_path_used{false};
+  example::PteSplitMaterializationStats split_stats;
 };
 
 struct ModuleMetaInfo {
@@ -167,6 +175,52 @@ std::vector<uint8_t> read_binary_file(const std::string& path) {
   ET_CHECK_MSG(input.is_open(), "Unable to read file: %s", path.c_str());
   return std::vector<uint8_t>(
       std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+std::string read_text_file(const std::string& path) {
+  std::ifstream input(path);
+  ET_CHECK_MSG(input.is_open(), "Unable to read file: %s", path.c_str());
+  std::stringstream buffer;
+  buffer << input.rdbuf();
+  return buffer.str();
+}
+
+std::vector<std::string> read_prefill_shard_paths(const std::string& manifest_path) {
+  if (manifest_path.empty()) {
+    return {};
+  }
+  const std::string manifest = read_text_file(manifest_path);
+  const size_t graph_pos = manifest.find("\"prefill_forward\"");
+  ET_CHECK_MSG(
+      graph_pos != std::string::npos,
+      "prefill_forward graph is missing from shard manifest: %s",
+      manifest_path.c_str());
+  const size_t pte_paths_pos = manifest.find("\"pte_paths\"", graph_pos);
+  ET_CHECK_MSG(
+      pte_paths_pos != std::string::npos,
+      "pte_paths is missing for prefill_forward in shard manifest: %s",
+      manifest_path.c_str());
+  const size_t array_start = manifest.find('[', pte_paths_pos);
+  const size_t array_end = manifest.find(']', array_start);
+  ET_CHECK_MSG(
+      array_start != std::string::npos && array_end != std::string::npos,
+      "Invalid pte_paths array in shard manifest: %s",
+      manifest_path.c_str());
+  const std::string array_body =
+      manifest.substr(array_start, array_end - array_start + 1);
+  std::regex path_regex("\"([^\"]+\\.pte)\"");
+  std::sregex_iterator begin(array_body.begin(), array_body.end(), path_regex);
+  std::sregex_iterator end;
+  std::vector<std::string> paths;
+  for (auto it = begin; it != end; ++it) {
+    paths.push_back((*it)[1].str());
+    ET_LOG(Info, "prefill shard manifest path: %s", paths.back().c_str());
+  }
+  ET_CHECK_MSG(
+      !paths.empty(),
+      "No prefill shard paths found in shard manifest: %s",
+      manifest_path.c_str());
+  return paths;
 }
 
 bool should_rebuild_from_stripped() {
@@ -201,6 +255,7 @@ ModuleBundle load_module_from_file_or_rebuild() {
 
   const std::vector<uint8_t> stripped_pte = read_binary_file(FLAGS_stripped_model_path);
   const std::vector<uint8_t> index_bytes = read_binary_file(FLAGS_index_bin_path);
+  bundle.split_stats = example::analyze_split_materialization(index_bytes);
   example::PteRebuildResult rebuild_result;
   if (!FLAGS_gguf_model_path.empty()) {
     const std::vector<uint8_t> gguf_bytes = read_binary_file(FLAGS_gguf_model_path);
@@ -225,6 +280,7 @@ ModuleBundle load_module_from_file_or_rebuild() {
   bundle.rebuilt_pte = rebuild_result.rebuilt_pte;
   bundle.rebuild_time_ms = rebuild_result.rebuild_time_ms;
   bundle.rebuilt_records = rebuild_result.rebuilt_records;
+  bundle.materialized_weight_bytes = rebuild_result.materialized_weight_bytes;
   bundle.specialized_fast_path_used = rebuild_result.specialized_fast_path_used;
   bundle.rebuilt_from_stripped = true;
 
@@ -386,8 +442,11 @@ void start_runner(
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
+  std::vector<std::string> prefill_shard_paths =
+      read_prefill_shard_paths(FLAGS_prefill_shard_manifest_path);
   example::Runner<T> runner(
       std::move(module_bundle.module),
+      std::move(prefill_shard_paths),
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
       FLAGS_tokenizer_path.c_str(),
@@ -405,9 +464,12 @@ void start_runner(
   if (module_bundle.rebuilt_from_stripped) {
     ET_LOG(
         Info,
-        "pte_rebuild_time_ms=%.3f rebuilt_records=%zu specialized_fast_path=%s",
+        "pte_rebuild_time_ms=%.3f rebuilt_records=%zu materialized_weight_bytes=%zu split_peak_weight_bytes=%zu num_splits=%zu specialized_fast_path=%s",
         module_bundle.rebuild_time_ms,
         module_bundle.rebuilt_records,
+        module_bundle.materialized_weight_bytes,
+        module_bundle.split_stats.peak_split_materialized_weight_bytes,
+        module_bundle.split_stats.num_splits,
         module_bundle.specialized_fast_path_used ? "true" : "false");
   }
 

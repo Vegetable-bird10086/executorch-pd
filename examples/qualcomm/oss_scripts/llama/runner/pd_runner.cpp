@@ -661,6 +661,13 @@ void write_binary(
 template <typename T>
 PDPrefillRunner<T>::PDPrefillRunner(
     std::unique_ptr<executorch::extension::Module> module,
+    std::vector<std::string> prefill_shard_paths,
+    std::vector<std::string> prefill_shard_index_paths,
+    DecoderRunner::PrefillShardRebuildConfig prefill_shard_rebuild,
+    bool prefill_qwen3_static_plan,
+    int32_t prefill_static_aux_size,
+    int32_t prefill_static_hidden_size,
+    StaticMetadata static_metadata,
     const std::string& decoder_model_version,
     const std::string& model_path,
     const std::string& tokenizer_path,
@@ -670,6 +677,13 @@ PDPrefillRunner<T>::PDPrefillRunner(
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
     : module_(std::move(module)),
+      prefill_shard_paths_(std::move(prefill_shard_paths)),
+      prefill_shard_index_paths_(std::move(prefill_shard_index_paths)),
+      prefill_shard_rebuild_(std::move(prefill_shard_rebuild)),
+      prefill_qwen3_static_plan_(prefill_qwen3_static_plan),
+      prefill_static_aux_size_(prefill_static_aux_size),
+      prefill_static_hidden_size_(prefill_static_hidden_size),
+      static_metadata_(static_metadata),
       model_path_(model_path),
       tokenizer_path_(tokenizer_path),
       pte_bytes_(std::move(pte_bytes)),
@@ -712,7 +726,9 @@ PDPrefillRunner<T>::PDPrefillRunner(
 
 template <typename T>
 bool PDPrefillRunner<T>::is_loaded() const {
-  return module_->is_loaded() && tokenizer_ && decoder_runner_ && prompt_processor_ &&
+  const bool module_ready =
+      static_metadata_.enabled || (module_ != nullptr && module_->is_loaded());
+  return module_ready && tokenizer_ && decoder_runner_ && prompt_processor_ &&
       kv_manager_ && buffer_manager_;
 }
 
@@ -741,30 +757,77 @@ Error PDPrefillRunner<T>::load() {
     }
   }
 
-  Result<MethodMeta> method_meta = module_->method_meta(prompt_processor_method_name);
-  vocab_size_ = method_meta->output_tensor_meta(0)->sizes()[2];
-  decoder_runner_ =
-      std::make_unique<DecoderRunner>(module_.get(), vocab_size_, 0.0f);
-  ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load({prompt_processor_method_name}));
+  bool use_int64_token = false;
+  int32_t sliding_window = 0;
+  if (static_metadata_.enabled) {
+    ET_CHECK_MSG(
+        !prefill_shard_paths_.empty(),
+        "Manifest-only PD prefill requires prefill shard paths");
+    ET_CHECK_MSG(
+        !shared_buffer_,
+        "Manifest-only PD prefill currently requires --shared_buffer=false");
+    vocab_size_ = static_metadata_.vocab_size;
+    num_layers_ = static_metadata_.num_layers;
+    num_heads_ = static_metadata_.num_heads;
+    head_dim_ = static_metadata_.head_dim;
+    context_len_ = static_metadata_.context_len;
+    prompt_processor_ar_len_ = static_metadata_.prompt_ar_len;
+    token_generator_ar_len_ = static_metadata_.token_generator_ar_len;
+    use_int64_token = static_metadata_.use_int64_token;
+    cache_mode_ = static_metadata_.cache_mode;
+    sliding_window = static_metadata_.sliding_window > 0
+        ? static_metadata_.sliding_window
+        : context_len_;
+    ET_CHECK_MSG(
+        vocab_size_ > 0 && num_layers_ > 0 && num_heads_ > 0 && head_dim_ > 0 &&
+            context_len_ > 0 && prompt_processor_ar_len_ > 0,
+        "Invalid manifest-only PD metadata");
+    ET_LOG(
+        Info,
+        "using manifest-only PD prefill metadata: layers=%lld ctx=%d ar=%d heads=%lld head_dim=%lld vocab=%d",
+        static_cast<long long>(num_layers_),
+        context_len_,
+        prompt_processor_ar_len_,
+        static_cast<long long>(num_heads_),
+        static_cast<long long>(head_dim_),
+        vocab_size_);
+  } else {
+    ET_CHECK_MSG(module_ != nullptr, "PDPrefillRunner requires a module without static metadata");
+    Result<MethodMeta> method_meta = module_->method_meta(prompt_processor_method_name);
+    vocab_size_ = method_meta->output_tensor_meta(0)->sizes()[2];
 
-  num_layers_ = ET_UNWRAP(module_->get("get_n_layers")).toScalar().to<int64_t>();
-  ET_CHECK_MSG(num_layers_ != -1, "Could not retrieve num layers");
+    num_layers_ = ET_UNWRAP(module_->get("get_n_layers")).toScalar().to<int64_t>();
+    ET_CHECK_MSG(num_layers_ != -1, "Could not retrieve num layers");
 
-  auto k_cache_shape = method_meta->output_tensor_meta(1)->sizes();
-  num_heads_ = k_cache_shape[1];
-  head_dim_ = k_cache_shape[2];
-  bool use_int64_token = method_meta->input_tensor_meta(0)->scalar_type() ==
-      executorch::aten::ScalarType::Long;
+    auto k_cache_shape = method_meta->output_tensor_meta(1)->sizes();
+    num_heads_ = k_cache_shape[1];
+    head_dim_ = k_cache_shape[2];
+    use_int64_token = method_meta->input_tensor_meta(0)->scalar_type() ==
+        executorch::aten::ScalarType::Long;
 
-  auto atten_mask_meta_prompt = method_meta->input_tensor_meta(1);
-  prompt_processor_ar_len_ = atten_mask_meta_prompt->sizes()[1];
-  context_len_ = atten_mask_meta_prompt->sizes()[2];
+    auto atten_mask_meta_prompt = method_meta->input_tensor_meta(1);
+    prompt_processor_ar_len_ = atten_mask_meta_prompt->sizes()[1];
+    context_len_ = atten_mask_meta_prompt->sizes()[2];
 
-  token_generator_ar_len_ = prompt_processor_ar_len_;
-  if (module_->method_names()->count("kv_forward") > 0) {
-    auto atten_mask_meta_token = module_->method_meta("kv_forward")->input_tensor_meta(1);
-    token_generator_ar_len_ = atten_mask_meta_token->sizes()[1];
+    token_generator_ar_len_ = prompt_processor_ar_len_;
+    if (module_->method_names()->count("kv_forward") > 0) {
+      auto atten_mask_meta_token =
+          module_->method_meta("kv_forward")->input_tensor_meta(1);
+      token_generator_ar_len_ = atten_mask_meta_token->sizes()[1];
+    }
   }
+
+  decoder_runner_ = std::make_unique<DecoderRunner>(
+      module_.get(),
+      vocab_size_,
+      0.0f,
+      prefill_shard_paths_,
+      prefill_shard_index_paths_,
+      prefill_shard_rebuild_);
+  decoder_runner_->use_qwen3_prefill_static_plan(
+      prefill_qwen3_static_plan_,
+      prefill_static_aux_size_,
+      prefill_static_hidden_size_);
 
   int32_t max_cache_len = prompt_processor_ar_len_ == context_len_
       ? context_len_
@@ -775,9 +838,19 @@ Error PDPrefillRunner<T>::load() {
       ? context_len_
       : context_len_ - prompt_processor_ar_len_;
 
-  int32_t sliding_window = context_len_;
-  if (module_->method_names()->count("get_sliding_window") > 0) {
-    sliding_window = ET_UNWRAP(module_->get("get_sliding_window")).toInt();
+  decoder_runner_->configure_prefill_shards(
+      num_layers_,
+      context_len_,
+      prompt_processor_ar_len_,
+      vocab_size_,
+      cache_mode_ == CacheMode::HybridCache);
+  ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load({prompt_processor_method_name}));
+
+  if (!static_metadata_.enabled) {
+    sliding_window = context_len_;
+    if (module_->method_names()->count("get_sliding_window") > 0) {
+      sliding_window = ET_UNWRAP(module_->get("get_sliding_window")).toInt();
+    }
   }
 
   kv_manager_ = std::make_unique<KVManager<T>>(typename KVManager<T>::Metadata{
@@ -818,8 +891,12 @@ Error PDPrefillRunner<T>::load() {
   }
 
   kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len_);
-  prompt_processor_->init_io(
-      buffer_manager_.get(), module_->method_meta(prompt_processor_method_name));
+  if (static_metadata_.enabled) {
+    prompt_processor_->init_io_from_metadata(buffer_manager_.get());
+  } else {
+    prompt_processor_->init_io(
+        buffer_manager_.get(), module_->method_meta(prompt_processor_method_name));
+  }
   return Error::Ok;
 }
 

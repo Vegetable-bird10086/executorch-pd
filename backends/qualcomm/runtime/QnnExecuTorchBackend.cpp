@@ -14,6 +14,8 @@
 #include <executorch/backends/qualcomm/runtime/backends/QnnCustomProtocol.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/backend/options.h>
+
+#include <cstdlib>
 namespace executorch {
 namespace backends {
 namespace qnn {
@@ -29,6 +31,30 @@ using executorch::runtime::FreeableBuffer;
 using executorch::runtime::MemoryAllocator;
 using executorch::runtime::Result;
 using executorch::runtime::Span;
+
+namespace {
+
+int ParseIndexedQnnTensorName(const std::string& name, const char* prefix) {
+  const std::string prefix_str(prefix);
+  if (name.rfind(prefix_str, 0) != 0) {
+    return -1;
+  }
+  size_t pos = prefix_str.size();
+  if (pos >= name.size() || name[pos] < '0' || name[pos] > '9') {
+    return -1;
+  }
+  int value = 0;
+  while (pos < name.size() && name[pos] >= '0' && name[pos] <= '9') {
+    value = value * 10 + static_cast<int>(name[pos] - '0');
+    ++pos;
+  }
+  if (pos >= name.size() || name[pos] != '_') {
+    return -1;
+  }
+  return value;
+}
+
+} // namespace
 
 // ========== Public method implementations =========================
 constexpr const char* QNN_COMPILE_SPEC = "qnn_compile_spec";
@@ -132,27 +158,78 @@ Error QnnExecuTorchBackend::execute(
   QnnManager* qnn_manager = static_cast<QnnManager*>(handle);
 
   std::string method_name = context.get_method_name();
+  const std::vector<std::string> graph_names = qnn_manager->GetGraphNames();
+  bool graph_name_exists = false;
+  for (const std::string& graph_name : graph_names) {
+    if (graph_name == method_name) {
+      graph_name_exists = true;
+      break;
+    }
+  }
+  if (!graph_name_exists && graph_names.size() == 1) {
+    QNN_EXECUTORCH_LOG_WARN(
+        "method name %s does not match QNN graph name %s; using graph name",
+        method_name.c_str(),
+        graph_names[0].c_str());
+    method_name = graph_names[0];
+  }
   std::vector<std::shared_ptr<TensorWrapper>> input_tensors =
       qnn_manager->GetGraphInputs(method_name);
   std::vector<std::shared_ptr<TensorWrapper>> output_tensors =
       qnn_manager->GetGraphOutputs(method_name);
   std::vector<Qnn_Tensor_t> input_tensor_structs;
   std::vector<Qnn_Tensor_t> output_tensor_structs;
+  const bool binding_log_enabled =
+      std::getenv("EXECUTORCH_QNN_BINDING_LOG") != nullptr;
 
   int args_index = 0;
   input_tensor_structs.reserve(input_tensors.size());
   for (const auto& input_tensor : input_tensors) {
     if (input_tensor->GetName().find("mutbuf_") == std::string::npos) {
+      int matched_args_index = args_index;
+      const int indexed_args_index =
+          ParseIndexedQnnTensorName(input_tensor->GetName(), "input_");
+      if (indexed_args_index >= 0 &&
+          indexed_args_index < static_cast<int>(args.size())) {
+        matched_args_index = indexed_args_index;
+      } else if (indexed_args_index >= 0) {
+        QNN_EXECUTORCH_LOG_WARN(
+            "falling back to sequential input binding for graph %s tensor %s parsed_index=%d args=%zu",
+            method_name.c_str(),
+            input_tensor->GetName().c_str(),
+            indexed_args_index,
+            args.size());
+      }
+      if (binding_log_enabled && method_name == "prefill_forward") {
+        const auto& arg_tensor = args[matched_args_index]->toTensor();
+        QNN_EXECUTORCH_LOG_INFO(
+            "qnn bind input graph=%s tensor=%s qnn_seq=%d parsed=%d arg=%d arg_rank=%d arg_dims=%d,%d,%d,%d qnn_rank=%u qnn_dims=%u,%u,%u,%u",
+            method_name.c_str(),
+            input_tensor->GetName().c_str(),
+            args_index,
+            indexed_args_index,
+            matched_args_index,
+            arg_tensor.dim(),
+            arg_tensor.dim() > 0 ? static_cast<int>(arg_tensor.size(0)) : -1,
+            arg_tensor.dim() > 1 ? static_cast<int>(arg_tensor.size(1)) : -1,
+            arg_tensor.dim() > 2 ? static_cast<int>(arg_tensor.size(2)) : -1,
+            arg_tensor.dim() > 3 ? static_cast<int>(arg_tensor.size(3)) : -1,
+            input_tensor->GetRank(),
+            input_tensor->GetRank() > 0 ? input_tensor->GetDims()[0] : 0,
+            input_tensor->GetRank() > 1 ? input_tensor->GetDims()[1] : 0,
+            input_tensor->GetRank() > 2 ? input_tensor->GetDims()[2] : 0,
+            input_tensor->GetRank() > 3 ? input_tensor->GetDims()[3] : 0);
+      }
       if (qnn_manager->RegisterMem(
-              args[args_index]->toTensor().mutable_data_ptr(), input_tensor) !=
+              args[matched_args_index]->toTensor().mutable_data_ptr(), input_tensor) !=
           Error::Ok) {
         // update data ptr only should be fine
         input_tensor->FillDataBuffer(
-            args[args_index]->toTensor().const_data_ptr(),
+            args[matched_args_index]->toTensor().const_data_ptr(),
             false /* copy_data */);
         // use the real input shape instead of nominal one to make sure
         // dynamic shape is functional
-        auto dims = args[args_index]->toTensor().sizes();
+        auto dims = args[matched_args_index]->toTensor().sizes();
         input_tensor->SetDims(dims.data(), dims.size());
       }
       args_index++;
@@ -160,16 +237,71 @@ Error QnnExecuTorchBackend::execute(
     input_tensor_structs.emplace_back(input_tensor->CloneTensorStruct());
   }
 
+  const int output_args_base = args_index;
+  std::vector<bool> output_arg_used(args.size(), false);
+  auto tensor_shape_matches = [](const EValue* value,
+                                 const std::shared_ptr<TensorWrapper>& tensor) {
+    const auto& et_tensor = value->toTensor();
+    if (static_cast<std::uint32_t>(et_tensor.dim()) != tensor->GetRank()) {
+      return false;
+    }
+    const std::uint32_t* qnn_dims = tensor->GetDims();
+    for (int i = 0; i < et_tensor.dim(); ++i) {
+      if (static_cast<std::uint32_t>(et_tensor.size(i)) != qnn_dims[i]) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  int output_value_index = 0;
   for (const auto& output_tensor : output_tensors) {
     // pos=0 limits the search to the prefix
     if (output_tensor->GetName().rfind("output_", 0) == 0 &&
         output_tensor->GetName().find("mutbuf_") == std::string::npos) {
-      void* mutable_data_ptr = args[args_index]->toTensor().mutable_data_ptr();
+      int matched_args_index = -1;
+      for (int i = output_args_base; matched_args_index < 0 &&
+           i < static_cast<int>(args.size()); ++i) {
+        if (!output_arg_used[i] && tensor_shape_matches(args[i], output_tensor)) {
+          matched_args_index = i;
+          break;
+        }
+      }
+      if (matched_args_index < 0) {
+        matched_args_index = args_index;
+        QNN_EXECUTORCH_LOG_WARN(
+            "falling back to sequential output binding for graph %s tensor %s",
+            method_name.c_str(),
+            output_tensor->GetName().c_str());
+      }
+      output_arg_used[matched_args_index] = true;
+      if (binding_log_enabled && method_name == "prefill_forward") {
+        const auto& arg_tensor = args[matched_args_index]->toTensor();
+        QNN_EXECUTORCH_LOG_INFO(
+            "qnn bind output graph=%s tensor=%s qnn_seq=%d arg=%d arg_rank=%d arg_dims=%d,%d,%d,%d qnn_rank=%u qnn_dims=%u,%u,%u,%u",
+            method_name.c_str(),
+            output_tensor->GetName().c_str(),
+            output_value_index,
+            matched_args_index,
+            arg_tensor.dim(),
+            arg_tensor.dim() > 0 ? static_cast<int>(arg_tensor.size(0)) : -1,
+            arg_tensor.dim() > 1 ? static_cast<int>(arg_tensor.size(1)) : -1,
+            arg_tensor.dim() > 2 ? static_cast<int>(arg_tensor.size(2)) : -1,
+            arg_tensor.dim() > 3 ? static_cast<int>(arg_tensor.size(3)) : -1,
+            output_tensor->GetRank(),
+            output_tensor->GetRank() > 0 ? output_tensor->GetDims()[0] : 0,
+            output_tensor->GetRank() > 1 ? output_tensor->GetDims()[1] : 0,
+            output_tensor->GetRank() > 2 ? output_tensor->GetDims()[2] : 0,
+            output_tensor->GetRank() > 3 ? output_tensor->GetDims()[3] : 0);
+      }
+      void* mutable_data_ptr =
+          args[matched_args_index]->toTensor().mutable_data_ptr();
       if (qnn_manager->RegisterMem(mutable_data_ptr, output_tensor) !=
           Error::Ok) {
         output_tensor->FillDataBuffer(mutable_data_ptr, false /* copy_data */);
       }
       args_index++;
+      output_value_index++;
     }
     output_tensor_structs.push_back(output_tensor->CloneTensorStruct());
   }

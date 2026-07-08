@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -44,6 +46,10 @@ DEFINE_string(
     gguf_model_path,
     "",
     "Path to the llama.cpp GPTQ2_32 GGUF model used to rebuild stripped decoder blocks in memory.");
+DEFINE_string(
+    prefill_shard_manifest_path,
+    "",
+    "Path to the shard manifest JSON. When provided, prefill_forward is executed by loading the listed prefill shard PTEs sequentially while decode still uses llama-pd-cli.");
 DEFINE_int32(
     qat_bits_hint,
     2,
@@ -156,12 +162,31 @@ namespace {
 struct ModuleBundle {
   std::unique_ptr<executorch::extension::Module> module;
   std::shared_ptr<std::vector<uint8_t>> pte_bytes;
+  size_t materialized_weight_bytes{0};
+  example::PteSplitMaterializationStats split_stats;
 };
 
 struct ModuleMetaInfo {
   example::KvBitWidth kv_bitwidth{example::KvBitWidth::kWidth8};
   float logits_scale{1.0f};
   int32_t logits_zero_point{0};
+};
+
+struct PrefillShardFiles {
+  std::vector<std::string> pte_paths;
+  std::vector<std::string> index_bin_paths;
+  bool qwen3_static_plan{false};
+  int32_t static_aux_size{64};
+  int32_t static_hidden_size{2048};
+  int32_t context_len{0};
+  int32_t prefill_ar_len{0};
+  int32_t token_generator_ar_len{1};
+  int32_t vocab_size{0};
+  int32_t kv_bitwidth{8};
+  int64_t num_layers{0};
+  int64_t num_heads{0};
+  int64_t head_dim{0};
+  bool use_int64_token{false};
 };
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
@@ -180,6 +205,177 @@ std::vector<uint8_t> read_binary_file(const std::string& path) {
   ET_CHECK_MSG(input.is_open(), "Unable to read file: %s", path.c_str());
   return std::vector<uint8_t>(
       std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+std::string read_text_file(const std::string& path) {
+  std::ifstream input(path);
+  ET_CHECK_MSG(input.is_open(), "Unable to read file: %s", path.c_str());
+  std::stringstream buffer;
+  buffer << input.rdbuf();
+  return buffer.str();
+}
+
+std::vector<std::string> read_string_array_field(
+    const std::string& manifest,
+    size_t graph_pos,
+    const std::string& field_name) {
+  const size_t field_pos = manifest.find("\"" + field_name + "\"", graph_pos);
+  if (field_pos == std::string::npos) {
+    return {};
+  }
+  const size_t array_start = manifest.find('[', field_pos);
+  const size_t array_end = manifest.find(']', array_start);
+  ET_CHECK_MSG(
+      array_start != std::string::npos && array_end != std::string::npos,
+      "Invalid %s array in shard manifest",
+      field_name.c_str());
+  const std::string array_body =
+      manifest.substr(array_start, array_end - array_start + 1);
+  std::regex path_regex("\"([^\"]+)\"");
+  std::sregex_iterator begin(array_body.begin(), array_body.end(), path_regex);
+  std::sregex_iterator end;
+  std::vector<std::string> paths;
+  for (auto it = begin; it != end; ++it) {
+    paths.push_back((*it)[1].str());
+  }
+  return paths;
+}
+
+std::string read_string_field(
+    const std::string& manifest,
+    size_t start_pos,
+    const std::string& field_name) {
+  const size_t field_pos = manifest.find("\"" + field_name + "\"", start_pos);
+  if (field_pos == std::string::npos) {
+    return "";
+  }
+  const size_t colon_pos = manifest.find(':', field_pos);
+  const size_t value_start = manifest.find('"', colon_pos);
+  const size_t value_end = manifest.find('"', value_start + 1);
+  ET_CHECK_MSG(
+      colon_pos != std::string::npos && value_start != std::string::npos &&
+          value_end != std::string::npos,
+      "Invalid %s string in shard manifest",
+      field_name.c_str());
+  return manifest.substr(value_start + 1, value_end - value_start - 1);
+}
+
+int32_t read_int_field_or(
+    const std::string& manifest,
+    size_t start_pos,
+    const std::string& field_name,
+    int32_t default_value) {
+  const size_t field_pos = manifest.find("\"" + field_name + "\"", start_pos);
+  if (field_pos == std::string::npos) {
+    return default_value;
+  }
+  const size_t colon_pos = manifest.find(':', field_pos);
+  ET_CHECK_MSG(colon_pos != std::string::npos, "Invalid %s integer in shard manifest", field_name.c_str());
+  size_t value_start = manifest.find_first_of("-0123456789", colon_pos + 1);
+  ET_CHECK_MSG(value_start != std::string::npos, "Invalid %s integer in shard manifest", field_name.c_str());
+  size_t value_end = value_start;
+  while (value_end < manifest.size() &&
+         (manifest[value_end] == '-' ||
+          (manifest[value_end] >= '0' && manifest[value_end] <= '9'))) {
+    ++value_end;
+  }
+  return static_cast<int32_t>(std::stol(manifest.substr(value_start, value_end - value_start)));
+}
+
+bool read_bool_field_or(
+    const std::string& manifest,
+    size_t start_pos,
+    const std::string& field_name,
+    bool default_value) {
+  const size_t field_pos = manifest.find("\"" + field_name + "\"", start_pos);
+  if (field_pos == std::string::npos) {
+    return default_value;
+  }
+  const size_t colon_pos = manifest.find(':', field_pos);
+  ET_CHECK_MSG(colon_pos != std::string::npos, "Invalid %s bool in shard manifest", field_name.c_str());
+  const size_t value_start = manifest.find_first_not_of(" \t\r\n", colon_pos + 1);
+  ET_CHECK_MSG(value_start != std::string::npos, "Invalid %s bool in shard manifest", field_name.c_str());
+  if (manifest.compare(value_start, 4, "true") == 0) {
+    return true;
+  }
+  if (manifest.compare(value_start, 5, "false") == 0) {
+    return false;
+  }
+  ET_CHECK_MSG(false, "Invalid %s bool in shard manifest", field_name.c_str());
+  return default_value;
+}
+
+PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
+  PrefillShardFiles files;
+  if (manifest_path.empty()) {
+    return files;
+  }
+  const std::string manifest = read_text_file(manifest_path);
+  const size_t graph_pos = manifest.find("\"prefill_forward\"");
+  ET_CHECK_MSG(
+      graph_pos != std::string::npos,
+      "prefill_forward graph is missing from shard manifest: %s",
+      manifest_path.c_str());
+
+  files.pte_paths = read_string_array_field(manifest, graph_pos, "stripped_pte_paths");
+  files.index_bin_paths = read_string_array_field(manifest, graph_pos, "index_bin_paths");
+  const std::string plan_type = read_string_field(manifest, graph_pos, "prefill_plan_type");
+  files.qwen3_static_plan = plan_type == "qwen3_4x7_static";
+  const size_t metadata_pos = manifest.find("\"prefill_metadata\"");
+  if (metadata_pos != std::string::npos) {
+    files.static_aux_size = read_int_field_or(manifest, metadata_pos, "aux_size", files.static_aux_size);
+    files.static_hidden_size = read_int_field_or(manifest, metadata_pos, "hidden_size", files.static_hidden_size);
+    files.context_len = read_int_field_or(manifest, metadata_pos, "context_len", files.context_len);
+    files.prefill_ar_len = read_int_field_or(manifest, metadata_pos, "prefill_ar_len", files.prefill_ar_len);
+    files.token_generator_ar_len = read_int_field_or(
+        manifest, metadata_pos, "token_generator_ar_len", files.token_generator_ar_len);
+    files.vocab_size = read_int_field_or(manifest, metadata_pos, "vocab_size", files.vocab_size);
+    files.kv_bitwidth = read_int_field_or(manifest, metadata_pos, "kv_bitwidth", files.kv_bitwidth);
+    files.num_layers = read_int_field_or(manifest, metadata_pos, "num_layers", files.num_layers);
+    files.num_heads = read_int_field_or(manifest, metadata_pos, "num_heads", files.num_heads);
+    files.head_dim = read_int_field_or(manifest, metadata_pos, "head_dim", files.head_dim);
+    files.use_int64_token = read_bool_field_or(
+        manifest, metadata_pos, "use_int64_token", files.use_int64_token);
+  }
+  if (files.qwen3_static_plan) {
+    ET_LOG(
+        Info,
+        "prefill shard static plan: %s layers=%lld ctx=%d ar=%d heads=%lld head_dim=%lld vocab=%d aux_size=%d hidden_size=%d",
+        plan_type.c_str(),
+        static_cast<long long>(files.num_layers),
+        files.context_len,
+        files.prefill_ar_len,
+        static_cast<long long>(files.num_heads),
+        static_cast<long long>(files.head_dim),
+        files.vocab_size,
+        files.static_aux_size,
+        files.static_hidden_size);
+  }
+  if (files.pte_paths.empty()) {
+    files.pte_paths = read_string_array_field(manifest, graph_pos, "pte_paths");
+  }
+  ET_CHECK_MSG(
+      !files.pte_paths.empty(),
+      "No prefill shard paths found in shard manifest: %s",
+      manifest_path.c_str());
+  if (!files.index_bin_paths.empty()) {
+    ET_CHECK_MSG(
+        files.index_bin_paths.size() == files.pte_paths.size(),
+        "prefill shard stripped_pte_paths/index_bin_paths size mismatch: %zu vs %zu",
+        files.pte_paths.size(),
+        files.index_bin_paths.size());
+  }
+  for (size_t i = 0; i < files.pte_paths.size(); ++i) {
+    ET_LOG(Info, "prefill shard manifest path: %s", files.pte_paths[i].c_str());
+    if (!files.index_bin_paths.empty()) {
+      ET_LOG(Info, "prefill shard index path: %s", files.index_bin_paths[i].c_str());
+    }
+  }
+  return files;
+}
+
+std::vector<std::string> read_prefill_shard_paths(const std::string& manifest_path) {
+  return read_prefill_shard_files(manifest_path).pte_paths;
 }
 
 bool should_rebuild_from_stripped() {
@@ -218,6 +414,7 @@ ModuleBundle load_module_from_file_or_rebuild() {
   const std::vector<uint8_t> stripped_pte =
       read_binary_file(FLAGS_stripped_model_path);
   const std::vector<uint8_t> index_bytes = read_binary_file(FLAGS_index_bin_path);
+  bundle.split_stats = example::analyze_split_materialization(index_bytes);
   example::PteRebuildResult rebuild_result;
   if (!FLAGS_gguf_model_path.empty()) {
     const std::vector<uint8_t> gguf_bytes = read_binary_file(FLAGS_gguf_model_path);
@@ -239,6 +436,7 @@ ModuleBundle load_module_from_file_or_rebuild() {
         FLAGS_qat_qweight_mode);
   }
   bundle.pte_bytes = rebuild_result.rebuilt_pte;
+  bundle.materialized_weight_bytes = rebuild_result.materialized_weight_bytes;
   auto data_loader = std::make_unique<executorch::extension::BufferDataLoader>(
       bundle.pte_bytes->data(), bundle.pte_bytes->size());
   bundle.module =
@@ -401,6 +599,44 @@ std::string resolve_decode_gguf_path() {
   return FLAGS_tmac_model_path;
 }
 
+example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_config(
+    const PrefillShardFiles& files) {
+  example::DecoderRunner::PrefillShardRebuildConfig config;
+  if (files.index_bin_paths.empty()) {
+    return config;
+  }
+
+  const bool has_checkpoint = !FLAGS_qat_checkpoint_path.empty();
+  const bool has_tmac_gguf = !FLAGS_tmac_model_path.empty();
+  const bool has_gguf = !FLAGS_gguf_model_path.empty();
+  const int rebuild_source_count = static_cast<int>(has_checkpoint) +
+      static_cast<int>(has_tmac_gguf) + static_cast<int>(has_gguf);
+  ET_CHECK_MSG(
+      rebuild_source_count == 1,
+      "Prefill stripped shards require exactly one rebuild source: qat_checkpoint_path, tmac_model_path, or gguf_model_path");
+
+  if (has_gguf) {
+    config.source_kind =
+        example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::Gguf;
+    config.source_bytes =
+        std::make_shared<std::vector<uint8_t>>(read_binary_file(FLAGS_gguf_model_path));
+  } else if (has_tmac_gguf) {
+    config.source_kind =
+        example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::TmacGguf;
+    config.source_bytes =
+        std::make_shared<std::vector<uint8_t>>(read_binary_file(FLAGS_tmac_model_path));
+  } else {
+    config.source_kind =
+        example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::QatCheckpoint;
+    config.source_bytes = std::make_shared<std::vector<uint8_t>>(
+        read_binary_file(FLAGS_qat_checkpoint_path));
+  }
+  config.bits_hint = FLAGS_qat_bits_hint;
+  config.group_size = FLAGS_qat_group_size;
+  config.qweight_mode = FLAGS_qat_qweight_mode;
+  return config;
+}
+
 int run_decode_process(const std::string& handoff_dir) {
   ET_CHECK_MSG(
       !FLAGS_llama_pd_cli_path.empty(),
@@ -481,6 +717,7 @@ void run_wikitext_ppl(
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
   example::Runner<T> runner(
       std::move(module_bundle.module),
+      read_prefill_shard_paths(FLAGS_prefill_shard_manifest_path),
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
       FLAGS_tokenizer_path.c_str(),
@@ -521,9 +758,33 @@ void run_pd_e2e(
     const std::string& prompt_input,
     bool tokenized_prompt,
     const std::string& handoff_dir,
+    PrefillShardFiles prefill_shard_files,
+    example::DecoderRunner::PrefillShardRebuildConfig prefill_shard_rebuild,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
+  typename example::PDPrefillRunner<T>::StaticMetadata static_metadata;
+  if (prefill_shard_files.qwen3_static_plan) {
+    static_metadata.enabled = true;
+    static_metadata.context_len = prefill_shard_files.context_len;
+    static_metadata.prompt_ar_len = prefill_shard_files.prefill_ar_len;
+    static_metadata.token_generator_ar_len = prefill_shard_files.token_generator_ar_len;
+    static_metadata.vocab_size = prefill_shard_files.vocab_size;
+    static_metadata.sliding_window = prefill_shard_files.context_len;
+    static_metadata.num_layers = prefill_shard_files.num_layers;
+    static_metadata.num_heads = prefill_shard_files.num_heads;
+    static_metadata.head_dim = prefill_shard_files.head_dim;
+    static_metadata.use_int64_token = prefill_shard_files.use_int64_token;
+    static_metadata.cache_mode = CacheMode::StaticCahce;
+  }
+
   example::PDPrefillRunner<T> runner(
       std::move(module_bundle.module),
+      std::move(prefill_shard_files.pte_paths),
+      std::move(prefill_shard_files.index_bin_paths),
+      std::move(prefill_shard_rebuild),
+      prefill_shard_files.qwen3_static_plan,
+      prefill_shard_files.static_aux_size,
+      prefill_shard_files.static_hidden_size,
+      static_metadata,
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
       FLAGS_tokenizer_path.c_str(),
@@ -582,8 +843,34 @@ int main(int argc, char** argv) {
         "tokenized_prompt mode does not support system_prompt reformatting");
   }
 
-  ModuleBundle module_bundle = load_module_from_file_or_rebuild();
-  ModuleMetaInfo module_meta = read_module_meta(module_bundle.module.get());
+  PrefillShardFiles prefill_shard_files =
+      read_prefill_shard_files(FLAGS_prefill_shard_manifest_path);
+  const bool manifest_only_prefill = prefill_shard_files.qwen3_static_plan &&
+      !FLAGS_prefill_shard_manifest_path.empty();
+  ET_CHECK_MSG(
+      !manifest_only_prefill || FLAGS_wikitext_path.empty(),
+      "WikiText PPL mode still requires a main PTE; manifest-only is PD handoff only");
+
+  ModuleBundle module_bundle;
+  ModuleMetaInfo module_meta;
+  if (manifest_only_prefill) {
+    module_meta.kv_bitwidth =
+        static_cast<example::KvBitWidth>(prefill_shard_files.kv_bitwidth);
+    ET_LOG(Info, "skipping main PTE load; using manifest-only prefill metadata");
+  } else {
+    module_bundle = load_module_from_file_or_rebuild();
+    if (should_rebuild_from_stripped()) {
+      ET_LOG(
+          Info,
+          "pte_materialized_weight_bytes=%zu split_peak_weight_bytes=%zu num_splits=%zu",
+          module_bundle.materialized_weight_bytes,
+          module_bundle.split_stats.peak_split_materialized_weight_bytes,
+          module_bundle.split_stats.num_splits);
+    }
+    module_meta = read_module_meta(module_bundle.module.get());
+  }
+  auto prefill_shard_rebuild =
+      make_prefill_shard_rebuild_config(prefill_shard_files);
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module;
 
   if (!FLAGS_wikitext_path.empty()) {
@@ -620,6 +907,8 @@ int main(int argc, char** argv) {
         prompt_input,
         use_tokenized_prompt,
         handoff_dir,
+        prefill_shard_files,
+        prefill_shard_rebuild,
         std::move(attention_sink_rope_module));
   } else if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth16) {
     run_pd_e2e<uint16_t>(
@@ -627,6 +916,8 @@ int main(int argc, char** argv) {
         prompt_input,
         use_tokenized_prompt,
         handoff_dir,
+        prefill_shard_files,
+        prefill_shard_rebuild,
         std::move(attention_sink_rope_module));
   } else {
     ET_CHECK_MSG(

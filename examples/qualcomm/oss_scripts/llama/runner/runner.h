@@ -56,6 +56,7 @@ class Runner : public executorch::extension::llm::IRunner {
  public:
   explicit Runner(
       std::unique_ptr<executorch::extension::Module> module,
+      std::vector<std::string> prefill_shard_paths,
       const std::string& decoder_model,
       const std::string& model_path,
       const std::string& tokenizer_path,
@@ -106,6 +107,7 @@ class Runner : public executorch::extension::llm::IRunner {
   };
 
   std::unique_ptr<executorch::extension::Module> module_;
+  std::vector<std::string> prefill_shard_paths_;
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module_;
   int32_t context_len_{0};
   int32_t prompt_processor_ar_len_{0};
