@@ -12,14 +12,17 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/pte_rebuilder.h>
 #include <executorch/extension/data_loader/buffer_data_loader.h>
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
+#include <executorch/runtime/core/portable_type/half.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iterator>
 #include <numeric>
+#include <limits>
 using executorch::aten::Tensor;
 using executorch::extension::Module;
 using executorch::extension::llm::Sampler;
@@ -130,6 +133,51 @@ bool prefill_shards_disabled() {
 
 bool prefill_shard_swap_aux() {
   return std::getenv("EXECUTORCH_PREFILL_SHARD_SWAP_AUX") != nullptr;
+}
+
+void log_raw_fp16_carrier_stats(
+    size_t shard_offset,
+    const char* kind,
+    const Tensor& carrier,
+    size_t logical_numel) {
+  ET_CHECK_MSG(
+      carrier.nbytes() >= logical_numel * sizeof(uint16_t),
+      "Raw FP16 carrier is too small: kind=%s carrier_bytes=%zu required=%zu",
+      kind,
+      carrier.nbytes(),
+      logical_numel * sizeof(uint16_t));
+  const uint16_t* values = carrier.const_data_ptr<uint16_t>();
+  size_t nan_count = 0;
+  size_t inf_count = 0;
+  size_t zero_count = 0;
+  float max_abs = 0.0f;
+  for (size_t i = 0; i < logical_numel; ++i) {
+    executorch::aten::Half fp16;
+    std::memcpy(&fp16, &values[i], sizeof(values[i]));
+    const float value = static_cast<float>(fp16);
+    if (std::isnan(value)) {
+      ++nan_count;
+      continue;
+    }
+    if (std::isinf(value)) {
+      ++inf_count;
+      continue;
+    }
+    if (value == 0.0f) {
+      ++zero_count;
+    }
+    max_abs = std::max(max_abs, std::fabs(value));
+  }
+  ET_LOG(
+      Info,
+      "prefill raw fp16 carrier stats: shard_offset=%zu kind=%s numel=%zu nan=%zu inf=%zu zero=%zu max_abs=%g",
+      shard_offset,
+      kind,
+      logical_numel,
+      nan_count,
+      inf_count,
+      zero_count,
+      max_abs);
 }
 
 std::vector<uint8_t> read_binary_file(const std::string& path) {
@@ -397,7 +445,7 @@ void DecoderRunner::configure_prefill_shards(
         }
       } else if (is_logits_tensor(*output_meta, vocab_size)) {
         shard.output_bindings.push_back(
-            {PrefillShardPlan::OutputKind::FinalLogits, 0, 0});
+            {PrefillShardPlan::OutputKind::FinalLogits, 0, static_cast<size_t>(-1)});
       } else if (is_rank2_tensor(*output_meta)) {
         shard.owned_outputs.push_back(make_tensor_ptr_from_meta(*output_meta));
         shard.output_bindings.push_back(
@@ -505,13 +553,13 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
     }
     for (size_t local_layer = 0; local_layer < shard.layer_count; ++local_layer) {
       shard.output_bindings.push_back(
-          {PrefillShardPlan::OutputKind::FinalVCache, local_layer, 0});
+          {PrefillShardPlan::OutputKind::FinalVCache, local_layer, static_cast<size_t>(-1)});
       shard.output_bindings.push_back(
-          {PrefillShardPlan::OutputKind::FinalKCache, local_layer, 0});
+          {PrefillShardPlan::OutputKind::FinalKCache, local_layer, static_cast<size_t>(-1)});
     }
     if (shard_index + 1 == prefill_shard_paths_.size()) {
       shard.output_bindings.push_back(
-          {PrefillShardPlan::OutputKind::FinalLogits, 0, 0});
+          {PrefillShardPlan::OutputKind::FinalLogits, 0, static_cast<size_t>(-1)});
     } else {
       shard.owned_outputs.push_back(make_tensor_ptr_from_sizes(
           {1, prefill_prompt_ar_len_, prefill_static_hidden_size_}, activation_type));
@@ -667,7 +715,19 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
 
   std::vector<Tensor> previous_aux;
   Tensor* previous_hidden = nullptr;
+  if (prefill_qwen3_static_plan_) {
+    ET_LOG(
+        Info,
+        "qwen3 static prefill shard IO mode=float_tensor_metadata_raw_fp16_storage");
+  }
   for (auto& shard : prefill_shards_) {
+    materialize_prefill_shard(shard);
+    ET_CHECK_OK_OR_RETURN_ERROR(shard.module->load_method(shard.method_name));
+
+    // PromptProcessor provides Float tensor metadata backed by the native FP16
+    // QNN buffers, matching the non-PD runner. No conversion bridge is needed.
+
+    // Populate shard inputs (after owned inputs have been set up).
     std::vector<EValue> shard_inputs;
     shard_inputs.reserve(shard.input_bindings.size());
     for (const auto& binding : shard.input_bindings) {
@@ -676,28 +736,86 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
           shard_inputs.emplace_back(inputs[0]);
           break;
         case PrefillShardPlan::InputKind::AttentionMask:
-          shard_inputs.emplace_back(inputs[full_mask_index]);
+          if (binding.owned_index != static_cast<size_t>(-1)) {
+            const Tensor& src = inputs[full_mask_index].toTensor();
+            Tensor& dst = *shard.owned_inputs[binding.owned_index];
+            const uint16_t* sd = src.const_data_ptr<uint16_t>();
+            float* dd = dst.mutable_data_ptr<float>();
+            for (size_t j = 0; j < static_cast<size_t>(src.numel()); ++j)
+              dd[j] = sd[j] == 0 ? -100.0f : 0.0f;
+            shard_inputs.emplace_back(dst);
+          } else {
+            shard_inputs.emplace_back(inputs[full_mask_index]);
+          }
           break;
         case PrefillShardPlan::InputKind::WindowAttentionMask:
-          ET_CHECK_MSG(
-              prefill_has_window_attention_mask_,
-              "Shard requested window attention mask but runner does not have one");
-          shard_inputs.emplace_back(inputs[full_window_mask_index]);
+          if (binding.owned_index != static_cast<size_t>(-1)) {
+            const Tensor& src = inputs[full_window_mask_index].toTensor();
+            Tensor& dst = *shard.owned_inputs[binding.owned_index];
+            const uint16_t* sd = src.const_data_ptr<uint16_t>();
+            float* dd = dst.mutable_data_ptr<float>();
+            for (size_t j = 0; j < static_cast<size_t>(src.numel()); ++j)
+              dd[j] = sd[j] == 0 ? -100.0f : 0.0f;
+            shard_inputs.emplace_back(dst);
+          } else {
+            shard_inputs.emplace_back(inputs[full_window_mask_index]);
+          }
           break;
         case PrefillShardPlan::InputKind::Position:
           shard_inputs.emplace_back(inputs[full_pos_index]);
           break;
         case PrefillShardPlan::InputKind::KCache:
-          shard_inputs.emplace_back(inputs[full_k_base + shard.layer_offset + binding.index]);
+          if (binding.owned_index != static_cast<size_t>(-1)) {
+            const Tensor& src =
+                inputs[full_k_base + shard.layer_offset + binding.index].toTensor();
+            Tensor& dst = *shard.owned_inputs[binding.owned_index];
+            float* dd = dst.mutable_data_ptr<float>();
+            const uint16_t* sd = src.const_data_ptr<uint16_t>();
+            for (size_t j = 0; j < static_cast<size_t>(dst.numel()); ++j) {
+              uint16_t b = sd[j];
+              uint32_t sign = (b & 0x8000u) << 16;
+              uint32_t e = (b >> 10) & 0x1Fu;
+              uint32_t m = b & 0x3FFu;
+              uint32_t v;
+              if (e == 0) v = sign;
+              else if (e == 0x1F) v = sign | 0x7F800000u | (m << 13);
+              else v = sign | ((e - 15 + 127) << 23) | (m << 13);
+              std::memcpy(&dd[j], &v, 4);
+            }
+            shard_inputs.emplace_back(dst);
+          } else {
+            shard_inputs.emplace_back(
+                inputs[full_k_base + shard.layer_offset + binding.index]);
+          }
           break;
         case PrefillShardPlan::InputKind::VCache:
-          shard_inputs.emplace_back(inputs[full_v_base + shard.layer_offset + binding.index]);
+          if (binding.owned_index != static_cast<size_t>(-1)) {
+            const Tensor& src =
+                inputs[full_v_base + shard.layer_offset + binding.index].toTensor();
+            Tensor& dst = *shard.owned_inputs[binding.owned_index];
+            float* dd = dst.mutable_data_ptr<float>();
+            const uint16_t* sd = src.const_data_ptr<uint16_t>();
+            for (size_t j = 0; j < static_cast<size_t>(dst.numel()); ++j) {
+              uint16_t b = sd[j];
+              uint32_t sign = (b & 0x8000u) << 16;
+              uint32_t e = (b >> 10) & 0x1Fu;
+              uint32_t m = b & 0x3FFu;
+              uint32_t v;
+              if (e == 0) v = sign;
+              else if (e == 0x1F) v = sign | 0x7F800000u | (m << 13);
+              else v = sign | ((e - 15 + 127) << 23) | (m << 13);
+              std::memcpy(&dd[j], &v, 4);
+            }
+            shard_inputs.emplace_back(dst);
+          } else {
+            shard_inputs.emplace_back(
+                inputs[full_v_base + shard.layer_offset + binding.index]);
+          }
           break;
         case PrefillShardPlan::InputKind::PreviousAux:
           ET_CHECK_MSG(
               binding.index < previous_aux.size(),
-              "Missing previous shard aux tensor %zu",
-              binding.index);
+              "Missing previous shard aux tensor %zu", binding.index);
           shard_inputs.emplace_back(previous_aux[binding.index]);
           break;
         case PrefillShardPlan::InputKind::PreviousHidden:
@@ -707,8 +825,6 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
       }
     }
 
-    materialize_prefill_shard(shard);
-    ET_CHECK_OK_OR_RETURN_ERROR(shard.module->load_method(shard.method_name));
     for (size_t i = 0; i < shard.output_tensors.size(); ++i) {
       ET_CHECK_OK_OR_RETURN_ERROR(
           shard.module->set_output(shard.method_name, shard.output_tensors[i], i));
@@ -726,6 +842,36 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
           outputs_res.get()[i].isTensor(),
           "Non Tensor Output returned from prefill shard");
       copy_tensor_data(outputs_res.get()[i].toTensor(), shard.output_tensors[i]);
+    }
+
+    if (std::getenv("ET_SHARD_OUTPUT_DIAG") != nullptr) {
+
+      for (size_t oi = 0; oi < shard.output_bindings.size(); ++oi) {
+        const auto& b = shard.output_bindings[oi];
+        if (b.kind != PrefillShardPlan::OutputKind::FinalKCache &&
+            b.kind != PrefillShardPlan::OutputKind::FinalVCache)
+          continue;
+        const Tensor& t = shard.output_tensors[oi];
+        const size_t n = std::min<size_t>(8, static_cast<size_t>(t.numel()));
+        std::ostringstream oss;
+        if (t.scalar_type() == executorch::aten::ScalarType::Float ||
+            t.scalar_type() == executorch::aten::ScalarType::Half) {
+          const uint16_t* p = t.const_data_ptr<uint16_t>();
+          for (size_t v = 0; v < n; ++v) {
+            if (v) oss << " ";
+            executorch::aten::Half fp16;
+            std::memcpy(&fp16, &p[v], sizeof(p[v]));
+            oss << static_cast<float>(fp16);
+          }
+        } else {
+          oss << "(scalar=" << static_cast<int>(t.scalar_type()) << ")";
+        }
+        ET_LOG(Info,
+            "shard_output_diag layer_offset=%zu kind=%s sample=[%s]",
+            shard.layer_offset,
+            b.kind == PrefillShardPlan::OutputKind::FinalKCache ? "K" : "V",
+            oss.str().c_str());
+      }
     }
 
     std::vector<Tensor> next_aux;

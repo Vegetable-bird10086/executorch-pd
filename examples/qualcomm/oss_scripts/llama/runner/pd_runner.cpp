@@ -974,8 +974,7 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       prompt_tokens,
       cur_pos_,
       false,
-      attention_sink_rope_runner_.get(),
-      true);
+      attention_sink_rope_runner_.get());
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
   const uint64_t first_token = prefill_res.get();
   cur_pos_ += num_prompt_tokens;

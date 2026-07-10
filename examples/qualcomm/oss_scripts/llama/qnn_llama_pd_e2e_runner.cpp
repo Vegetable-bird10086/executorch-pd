@@ -154,6 +154,10 @@ DEFINE_bool(
     decode_native_compare,
     false,
     "Ask llama-pd-cli to compare imported-KV resume logits against a native GGUF prefill resume on the same prompt tokens.");
+DEFINE_bool(
+    decode_native_first_token,
+    false,
+    "Ask llama-pd-cli to choose the first continuation token from a native GGUF prompt prefill instead of the QNN prefill logits.");
 
 namespace fs = std::filesystem;
 
@@ -213,6 +217,28 @@ std::string read_text_file(const std::string& path) {
   std::stringstream buffer;
   buffer << input.rdbuf();
   return buffer.str();
+}
+
+std::string resolve_manifest_path(
+    const fs::path& manifest_dir,
+    const std::string& path) {
+  if (path.empty()) {
+    return path;
+  }
+  fs::path p(path);
+  if (p.is_absolute()) {
+    return p.string();
+  }
+  return (manifest_dir / p).lexically_normal().string();
+}
+
+std::vector<std::string> resolve_manifest_paths(
+    const fs::path& manifest_dir,
+    std::vector<std::string> paths) {
+  for (auto& path : paths) {
+    path = resolve_manifest_path(manifest_dir, path);
+  }
+  return paths;
 }
 
 std::vector<std::string> read_string_array_field(
@@ -311,14 +337,19 @@ PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
     return files;
   }
   const std::string manifest = read_text_file(manifest_path);
+  const fs::path manifest_dir = fs::absolute(fs::path(manifest_path)).parent_path();
   const size_t graph_pos = manifest.find("\"prefill_forward\"");
   ET_CHECK_MSG(
       graph_pos != std::string::npos,
       "prefill_forward graph is missing from shard manifest: %s",
       manifest_path.c_str());
 
-  files.pte_paths = read_string_array_field(manifest, graph_pos, "stripped_pte_paths");
-  files.index_bin_paths = read_string_array_field(manifest, graph_pos, "index_bin_paths");
+  files.pte_paths = resolve_manifest_paths(
+      manifest_dir,
+      read_string_array_field(manifest, graph_pos, "stripped_pte_paths"));
+  files.index_bin_paths = resolve_manifest_paths(
+      manifest_dir,
+      read_string_array_field(manifest, graph_pos, "index_bin_paths"));
   const std::string plan_type = read_string_field(manifest, graph_pos, "prefill_plan_type");
   files.qwen3_static_plan = plan_type == "qwen3_4x7_static";
   const size_t metadata_pos = manifest.find("\"prefill_metadata\"");
@@ -352,7 +383,8 @@ PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
         files.static_hidden_size);
   }
   if (files.pte_paths.empty()) {
-    files.pte_paths = read_string_array_field(manifest, graph_pos, "pte_paths");
+    files.pte_paths = resolve_manifest_paths(
+        manifest_dir, read_string_array_field(manifest, graph_pos, "pte_paths"));
   }
   ET_CHECK_MSG(
       !files.pte_paths.empty(),
@@ -674,6 +706,9 @@ int run_decode_process(const std::string& handoff_dir) {
   if (FLAGS_decode_native_compare) {
     args.push_back("--pd-native-compare");
   }
+  if (FLAGS_decode_native_first_token) {
+    args.push_back("--pd-native-first-token");
+  }
 
   ET_LOG(Info, "Launching decode via llama-pd-cli");
   for (const auto& arg : args) {
@@ -854,9 +889,20 @@ int main(int argc, char** argv) {
   ModuleBundle module_bundle;
   ModuleMetaInfo module_meta;
   if (manifest_only_prefill) {
-    module_meta.kv_bitwidth =
-        static_cast<example::KvBitWidth>(prefill_shard_files.kv_bitwidth);
-    ET_LOG(Info, "skipping main PTE load; using manifest-only prefill metadata");
+    ET_CHECK_MSG(
+        prefill_shard_files.kv_bitwidth == 8 ||
+            prefill_shard_files.kv_bitwidth == 16,
+        "Unsupported static prefill KV bitwidth in manifest: %d",
+        prefill_shard_files.kv_bitwidth);
+    // The Float MethodMeta on static QNN shards is an ABI carrier type. The
+    // underlying KV storage width is specified by the prefill manifest and
+    // must match the normal QNN runner's KVManager instantiation.
+    module_meta.kv_bitwidth = static_cast<example::KvBitWidth>(
+        prefill_shard_files.kv_bitwidth);
+    ET_LOG(
+        Info,
+        "skipping main PTE load; using manifest-only prefill metadata with %d-bit KV storage",
+        prefill_shard_files.kv_bitwidth);
   } else {
     module_bundle = load_module_from_file_or_rebuild();
     if (should_rebuild_from_stripped()) {

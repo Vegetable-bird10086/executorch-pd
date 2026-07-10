@@ -30,7 +30,7 @@ class HtpContext : public QnnContext {
     htp_context_custom_config_ =
         std::make_unique<HtpContextCustomConfig>(this, htp_options);
   }
-  ~HtpContext() {}
+  ~HtpContext() override;
 
   Qnn_ContextHandle_t GetSpillFillHandle() const {
     return sf_handle_;

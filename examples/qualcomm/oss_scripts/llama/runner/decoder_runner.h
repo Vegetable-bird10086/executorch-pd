@@ -12,8 +12,12 @@
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor_ptr.h>
 #include <executorch/extension/tensor/tensor.h>
+#include <executorch/runtime/core/portable_type/half.h>
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -115,10 +119,29 @@ class DecoderRunner {
     auto* logits_last = logits_ptr_for_pos(logits_tensor, pos);
     const auto vocab_size = logits_tensor.size(2);
     int32_t best_token = 0;
-    uint16_t best_logit = logits_last[0];
+    float best_logit = -std::numeric_limits<float>::infinity();
+    bool found_finite_logit = false;
+    for (int32_t token = 0; token < vocab_size; ++token) {
+      executorch::aten::Half fp16;
+      std::memcpy(&fp16, &logits_last[token], sizeof(logits_last[token]));
+      const float logit = static_cast<float>(fp16);
+      if (!std::isnan(logit) &&
+          (!found_finite_logit || logit > best_logit)) {
+        best_logit = logit;
+        best_token = token;
+        found_finite_logit = true;
+      }
+    }
+    if (found_finite_logit) {
+      return best_token;
+    }
+
+    // Keep the legacy ordering as a last-resort fallback for unsupported
+    // logit payloads, but never let a NaN at token zero force token zero.
+    uint16_t best_raw = logits_last[0];
     for (int32_t token = 1; token < vocab_size; ++token) {
-      if (logits_last[token] > best_logit) {
-        best_logit = logits_last[token];
+      if (logits_last[token] > best_raw) {
+        best_raw = logits_last[token];
         best_token = token;
       }
     }
@@ -160,6 +183,7 @@ class DecoderRunner {
     struct InputBinding {
       InputKind kind;
       size_t index;
+      size_t owned_index{static_cast<size_t>(-1)};
     };
     struct OutputBinding {
       OutputKind kind;
@@ -176,6 +200,7 @@ class DecoderRunner {
     size_t layer_count{0};
     std::vector<InputBinding> input_bindings;
     std::vector<OutputBinding> output_bindings;
+    std::vector<executorch::extension::TensorPtr> owned_inputs;
     std::vector<executorch::extension::TensorPtr> owned_outputs;
     std::vector<executorch::aten::Tensor> output_tensors;
   };

@@ -212,11 +212,16 @@ void PromptProcessor<T>::init_io_from_metadata(IMemAlloc* buffer_manager) {
       : metadata_.context_len - metadata_.ar_len;
   const ScalarType token_type =
       metadata_.use_int64_token ? ScalarType::Long : ScalarType::Int;
-  const ScalarType mask_type = ScalarType::Half;
+  // The Qwen3 static shard MethodMeta declares Float tensors, while the QNN
+  // backend consumes and produces its native quantized payload through these
+  // buffers.
+  // This mirrors init_io(), which adopts MethodMeta scalar types without
+  // resizing the existing native client allocations.
+  const ScalarType qnn_io_type = ScalarType::Float;
+  const ScalarType mask_type = qnn_io_type;
   const ScalarType pos_type = ScalarType::Int;
-  const ScalarType logits_type = ScalarType::Half;
-  const ScalarType kv_type =
-      std::is_same_v<T, uint8_t> ? ScalarType::Byte : ScalarType::Half;
+  const ScalarType logits_type = qnn_io_type;
+  const ScalarType kv_type = qnn_io_type;
 
   const size_t num_inputs = 3 + static_cast<size_t>(metadata_.num_layers) * 2;
   const size_t num_outputs = 1 + static_cast<size_t>(metadata_.num_layers) * 2;

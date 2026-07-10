@@ -212,6 +212,31 @@ set_target_properties(
   qnn_llama_pd_e2e_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
 )
 
+# build PTE rebuild comparison tool
+add_executable(
+  pte_rebuild_compare
+  ${CMAKE_CURRENT_LIST_DIR}/pte_rebuild_compare.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/pte_rebuilder.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/pte_rebuilder.h
+)
+target_include_directories(
+  pte_rebuild_compare PUBLIC ${_common_include_directories}
+)
+target_include_directories(
+  pte_rebuild_compare PUBLIC ${EXECUTORCH_ROOT}/third-party/flatbuffers/include
+)
+target_link_libraries(
+  pte_rebuild_compare
+  executorch_core
+  extension_data_loader
+  extension_module
+  extension_tensor
+)
+target_compile_options(pte_rebuild_compare PUBLIC ${_common_compile_options})
+set_target_properties(
+  pte_rebuild_compare PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+)
+
 # build qnn multimodal runner preprocess qnn runner src files for multimodal
 set(_multimodal_runner__srcs ${_llama_runner__srcs})
 list(FILTER _multimodal_runner__srcs EXCLUDE REGEX ".*qnn_llama_runner.*")

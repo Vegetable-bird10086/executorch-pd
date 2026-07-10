@@ -17,6 +17,14 @@ namespace qnn {
 
 using executorch::runtime::Error;
 
+HtpContext::~HtpContext() {
+  // A context group cannot outlive its first context. Clear the cached group
+  // handle when independent PTEs are loaded and unloaded sequentially.
+  if (sf_handle_ == GetHandle()) {
+    sf_handle_ = 0x0;
+  }
+}
+
 Error HtpContext::MakeConfig(std::vector<const QnnContext_Config_t*>& config) {
   const std::vector<QnnContext_CustomConfig_t>& context_custom_config =
       htp_context_custom_config_->CreateContextCustomConfig();
