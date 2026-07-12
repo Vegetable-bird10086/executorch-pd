@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import types
 import gc
 
@@ -183,9 +184,37 @@ class TextDecoder(Component):
                     outputs = inner
             return list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
 
+        layer_pattern = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+        def _decoder_layer_range(original_graph) -> Tuple[int, int]:
+            layer_ids = set()
+            for node in original_graph.nodes:
+                module_stack = getattr(node, "meta", {}).get("nn_module_stack", "")
+                layer_ids.update(
+                    int(layer_id) for layer_id in layer_pattern.findall(str(module_stack))
+                )
+
+            if not layer_ids:
+                raise RuntimeError(
+                    "unable to determine decoder layer range for exported shard "
+                    "from nn_module_stack metadata"
+                )
+
+            sorted_layer_ids = sorted(layer_ids)
+            layer_start = sorted_layer_ids[0]
+            layer_end_exclusive = sorted_layer_ids[-1] + 1
+            if sorted_layer_ids != list(range(layer_start, layer_end_exclusive)):
+                raise RuntimeError(
+                    "exported shard contains non-contiguous decoder layers: "
+                    f"{sorted_layer_ids}"
+                )
+            return layer_start, layer_end_exclusive
+
+        num_decoder_layers = int(self.meta["get_n_layers"])
         shard_manifest = {
             "combined_pte": os.path.join(artifact_dir, f"{base_name}.pte"),
             "num_shards": 0,
+            "num_decoder_layers": num_decoder_layers,
             "graphs": {},
         }
         for graph_name in graph_names:
@@ -208,8 +237,16 @@ class TextDecoder(Component):
                 "pte_paths": [],
                 "delegate_names": [name for name, _, _ in lowered_submodules],
                 "lowered_graph_code": graph_code_path,
+                "num_decoder_layers": num_decoder_layers,
                 "shards": [],
             }
+            shard_layer_ranges = [
+                _decoder_layer_range(lowered_module.original_module.graph)
+                for _, lowered_module, _ in lowered_submodules
+            ]
+            graph_manifest["shard_layer_starts"] = [
+                layer_start for layer_start, _ in shard_layer_ranges
+            ]
             for shard_idx, (delegate_name, lowered_module, _) in enumerate(
                 lowered_submodules
             ):
@@ -251,11 +288,14 @@ class TextDecoder(Component):
                 )
                 with open(original_code_path, "w", encoding="utf-8") as file:
                     file.write(lowered_module.original_module.graph_module.code)
+                layer_start, layer_end_exclusive = shard_layer_ranges[shard_idx]
                 graph_manifest["shards"].append(
                     {
                         "index": shard_idx,
                         "delegate_name": delegate_name,
                         "pte_path": shard_pte_path,
+                        "layer_start": layer_start,
+                        "layer_end_exclusive": layer_end_exclusive,
                         "original_graph_code": original_code_path,
                         "inputs": [_node_record(node) for node in input_nodes],
                         "outputs": [_node_record(node) for node in output_nodes],

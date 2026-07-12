@@ -68,6 +68,7 @@ WEIGHT_KIND_DECODER_LINEAR = 1
 INVALID_LAYER_ID = 0xFF
 INVALID_OP_ID = 0xFF
 DEFAULT_NUM_LAYERS = 28
+DEFAULT_OLD_PTE = "/root/autodl-tmp/executorch/llama_qnn/hybrid_llama_qnn.pte"
 
 
 @dataclass
@@ -479,8 +480,11 @@ def realtime_delete(
     show_progress: bool = True,
     search_direction: str = "reverse",
     num_splits: int = 1,
+    num_layers: int = DEFAULT_NUM_LAYERS,
     layer_start: int = 0,
     layer_end_exclusive: int = DEFAULT_NUM_LAYERS,
+    split_layer_starts: Optional[List[int]] = None,
+    shard_index: Optional[int] = None,
 ) -> Tuple[bytearray, Dict[str, Any], List[str]]:
     order = expected_reverse_names(
         include_output=include_output,
@@ -500,6 +504,11 @@ def realtime_delete(
     total_layers_to_process = len(available_names)
     layer_done = 0
     taken_intervals: List[Tuple[int, int]] = []
+
+    def record_split_id(layer_id: Optional[int]) -> int:
+        if shard_index is not None:
+            return shard_index
+        return split_id_for_record(layer_id, num_layers, num_splits)
 
     for name in order:
         if name not in specs_by_name:
@@ -557,9 +566,7 @@ def realtime_delete(
                         "weight_kind": None,
                         "layer_id": spec.layer_id,
                         "op_id": None,
-                        "split_id": split_id_for_record(
-                            spec.layer_id, DEFAULT_NUM_LAYERS, num_splits
-                        ),
+                        "split_id": record_split_id(spec.layer_id),
                         "block_id": block_id,
                         "quant_type": spec.quant_type,
                         "current_offset_before_delete": None,
@@ -583,9 +590,7 @@ def realtime_delete(
                     "weight_kind": weight_kind,
                     "layer_id": layer_id,
                     "op_id": op_id,
-                    "split_id": split_id_for_record(
-                        spec.layer_id, DEFAULT_NUM_LAYERS, num_splits
-                    ),
+                    "split_id": record_split_id(spec.layer_id),
                     "block_id": block_id,
                     "quant_type": spec.quant_type,
                     "current_offset_before_delete": int(hit),
@@ -647,9 +652,13 @@ def realtime_delete(
         "bits_hint": bits_hint,
         "group_size": group_size,
         "num_splits": num_splits,
+        "num_layers": num_layers,
         "layer_start": layer_start,
         "layer_end_exclusive": layer_end_exclusive,
-        "split_layer_starts": build_split_starts(DEFAULT_NUM_LAYERS, num_splits),
+        "split_layer_starts": split_layer_starts
+        if split_layer_starts is not None
+        else build_split_starts(num_layers, num_splits),
+        "shard_index": shard_index,
         "records": records,
     }
     return stripped_buf, index_payload, report_lines
@@ -723,6 +732,9 @@ def write_outputs(
         f"source_file_modified={index_payload.get('source_file_modified', False)}",
         f"working_buffer_mode={index_payload.get('working_buffer_mode', 'in_memory_copy')}",
         f"num_splits={index_payload.get('num_splits', 1)}",
+        f"num_layers={index_payload.get('num_layers', DEFAULT_NUM_LAYERS)}",
+        f"layer_range=[{index_payload.get('layer_start')}, {index_payload.get('layer_end_exclusive')})",
+        f"shard_index={index_payload.get('shard_index')}",
         f"consistency_ok={calc_deleted == index_payload['total_deleted_bytes']}",
         "",
     ]
@@ -736,8 +748,8 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--old-pte",
-        default="/root/autodl-tmp/executorch/llama_qnn/hybrid_llama_qnn.pte",
-        help="Path to old.pte",
+        default=None,
+        help="Path to old.pte. Defaults to the selected manifest shard when --shard-manifest is used.",
     )
     ap.add_argument(
         "--qat-checkpoint",
@@ -749,20 +761,42 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--num-splits",
         type=int,
-        default=1,
+        default=None,
         help="Logical shard count used to assign stripped decoder blocks to split-level rebuild groups.",
+    )
+    ap.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Decoder layer count. Defaults to manifest metadata, or 28 without a manifest.",
     )
     ap.add_argument(
         "--layer-start",
         type=int,
-        default=0,
+        default=None,
         help="First decoder layer id to strip, inclusive.",
     )
     ap.add_argument(
         "--layer-end-exclusive",
         type=int,
-        default=DEFAULT_NUM_LAYERS,
+        default=None,
         help="Last decoder layer id to strip, exclusive.",
+    )
+    ap.add_argument(
+        "--shard-manifest",
+        default=None,
+        help="Exported *.shards.json. Reads the selected shard PTE and layer range from this manifest.",
+    )
+    ap.add_argument(
+        "--shard-graph",
+        default="prefill_forward",
+        help="Manifest graph name to strip when --shard-manifest is used.",
+    )
+    ap.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="Manifest shard index to strip. Required with --shard-manifest.",
     )
     ap.add_argument(
         "--qweight-mode",
@@ -795,10 +829,96 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def read_manifest_shard(
+    manifest_path: Path, graph_name: str, shard_index: int
+) -> Dict[str, Any]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    graph = payload.get("graphs", {}).get(graph_name)
+    if not isinstance(graph, dict):
+        raise ValueError(
+            f"graph {graph_name!r} is missing from shard manifest: {manifest_path}"
+        )
+
+    shards = graph.get("shards")
+    if not isinstance(shards, list):
+        raise ValueError(
+            "manifest has no per-shard metadata; re-export it with the current "
+            "llm_wrappers.py before using --shard-manifest"
+        )
+
+    shard = next(
+        (entry for entry in shards if int(entry.get("index", -1)) == shard_index),
+        None,
+    )
+    if not isinstance(shard, dict):
+        raise ValueError(
+            f"shard index {shard_index} is missing from graph {graph_name!r}"
+        )
+
+    required_fields = ("pte_path", "layer_start", "layer_end_exclusive")
+    missing = [field for field in required_fields if field not in shard]
+    if missing:
+        raise ValueError(
+            f"manifest shard {shard_index} is missing required fields: {missing}"
+        )
+
+    num_layers = graph.get("num_decoder_layers", payload.get("num_decoder_layers"))
+    if num_layers is None:
+        raise ValueError("manifest is missing num_decoder_layers")
+
+    pte_path = Path(str(shard["pte_path"]))
+    if not pte_path.is_absolute():
+        pte_path = manifest_path.parent / pte_path
+
+    return {
+        "pte_path": pte_path,
+        "layer_start": int(shard["layer_start"]),
+        "layer_end_exclusive": int(shard["layer_end_exclusive"]),
+        "num_layers": int(num_layers),
+        "num_splits": int(payload.get("num_shards", len(shards))),
+        "split_layer_starts": [
+            int(entry["layer_start"])
+            for entry in sorted(shards, key=lambda entry: int(entry["index"]))
+        ],
+        "shard_index": shard_index,
+    }
+
+
 def main() -> None:
     args = parse_args()
 
-    old_pte = Path(args.old_pte).expanduser().resolve()
+    manifest_shard = None
+    if args.shard_manifest is not None:
+        if args.shard_index is None:
+            raise ValueError("--shard-index is required with --shard-manifest")
+        manifest_path = Path(args.shard_manifest).expanduser().resolve()
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"shard manifest not found: {manifest_path}")
+        manifest_shard = read_manifest_shard(
+            manifest_path, args.shard_graph, args.shard_index
+        )
+
+    def manifest_or_arg(name: str, fallback: int) -> int:
+        arg_value = getattr(args, name)
+        manifest_value = None if manifest_shard is None else manifest_shard[name]
+        if arg_value is not None and manifest_value is not None and arg_value != manifest_value:
+            raise ValueError(
+                f"--{name.replace('_', '-')}={arg_value} conflicts with manifest value {manifest_value}"
+            )
+        return manifest_value if manifest_value is not None else (
+            arg_value if arg_value is not None else fallback
+        )
+
+    num_layers = manifest_or_arg("num_layers", DEFAULT_NUM_LAYERS)
+    layer_start = manifest_or_arg("layer_start", 0)
+    layer_end_exclusive = manifest_or_arg("layer_end_exclusive", num_layers)
+    num_splits = manifest_or_arg("num_splits", 1)
+    old_pte_value = args.old_pte or (
+        str(manifest_shard["pte_path"])
+        if manifest_shard is not None
+        else DEFAULT_OLD_PTE
+    )
+    old_pte = Path(old_pte_value).expanduser().resolve()
     if not old_pte.exists():
         raise FileNotFoundError(f"old pte not found: {old_pte}")
 
@@ -806,16 +926,21 @@ def main() -> None:
     if not qat_checkpoint.exists():
         raise FileNotFoundError(f"qat checkpoint not found: {qat_checkpoint}")
 
-    if args.layer_start < 0 or args.layer_end_exclusive > DEFAULT_NUM_LAYERS or args.layer_start >= args.layer_end_exclusive:
+    if (
+        num_layers <= 0
+        or layer_start < 0
+        or layer_end_exclusive > num_layers
+        or layer_start >= layer_end_exclusive
+    ):
         raise ValueError(
-            f"invalid layer range: [{args.layer_start}, {args.layer_end_exclusive})"
+            f"invalid layer range: [{layer_start}, {layer_end_exclusive}) for num_layers={num_layers}"
         )
 
     qat_sd = load_file(str(qat_checkpoint))
     specs_by_name = build_qat_specs(
         include_output=not args.keep_output,
-        layer_start=args.layer_start,
-        layer_end_exclusive=args.layer_end_exclusive,
+        layer_start=layer_start,
+        layer_end_exclusive=layer_end_exclusive,
     )
     strict = not args.no_strict
 
@@ -830,10 +955,20 @@ def main() -> None:
         strict=strict,
         show_progress=not args.no_progress,
         search_direction=args.search_direction,
-        num_splits=args.num_splits,
-        layer_start=args.layer_start,
-        layer_end_exclusive=args.layer_end_exclusive,
+        num_splits=num_splits,
+        num_layers=num_layers,
+        layer_start=layer_start,
+        layer_end_exclusive=layer_end_exclusive,
+        split_layer_starts=(
+            manifest_shard["split_layer_starts"] if manifest_shard is not None else None
+        ),
+        shard_index=(
+            manifest_shard["shard_index"] if manifest_shard is not None else None
+        ),
     )
+    if manifest_shard is not None:
+        index_payload["shard_manifest"] = str(manifest_path)
+        index_payload["shard_graph"] = args.shard_graph
 
     out_dir = Path(args.out_dir).expanduser().resolve()
     stripped_pte, index_json, index_bin, report_txt = write_outputs(
