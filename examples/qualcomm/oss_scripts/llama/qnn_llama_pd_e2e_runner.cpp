@@ -6,7 +6,10 @@
 #include <executorch/runtime/platform/log.h>
 #include <gflags/gflags.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -163,6 +166,149 @@ namespace fs = std::filesystem;
 
 namespace {
 
+using SteadyClock = std::chrono::steady_clock;
+
+double elapsed_ms(
+    SteadyClock::time_point start,
+    SteadyClock::time_point end = SteadyClock::now()) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+struct ProcessMemorySnapshot {
+  uint64_t rss_bytes{0};
+  uint64_t hwm_bytes{0};
+};
+
+uint64_t read_proc_status_bytes(const char* field) {
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind(field, 0) != 0) {
+      continue;
+    }
+    std::istringstream value(line.substr(std::strlen(field)));
+    uint64_t kib = 0;
+    value >> kib;
+    return kib * 1024;
+  }
+  return 0;
+}
+
+ProcessMemorySnapshot process_memory_snapshot() {
+  return {
+      read_proc_status_bytes("VmRSS:"),
+      read_proc_status_bytes("VmHWM:"),
+  };
+}
+
+double bytes_to_mib(uint64_t bytes) {
+  return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+struct PdE2ERuntimeStats {
+  int32_t prompt_tokens{0};
+  double runner_setup_ms{0.0};
+  double qnn_export_total_ms{0.0};
+  example::PDPrefillRunner<uint16_t>::RuntimeStats prefill{};
+  std::vector<example::DecoderRunner::PrefillShardRuntimeStats> shard_stats;
+  ProcessMemorySnapshot before_runner;
+  ProcessMemorySnapshot after_runner;
+  ProcessMemorySnapshot after_export;
+};
+
+struct DecodeProcessResult {
+  int exit_code{1};
+  double wall_ms{0.0};
+  ProcessMemorySnapshot before;
+  ProcessMemorySnapshot after;
+};
+
+void log_pd_e2e_runtime_summary(
+    const PdE2ERuntimeStats& prefill,
+    const DecodeProcessResult& decode,
+    double total_ms) {
+  ET_LOG(
+      Info,
+      "PD E2E runtime summary: prompt_tokens=%d shards=%zu decode_n_predict=%d",
+      prefill.prompt_tokens,
+      prefill.shard_stats.size(),
+      FLAGS_decode_n_predict);
+  ET_LOG(
+      Info,
+      "PD E2E timing: runner_setup_ms=%.3f tokenize_ms=%.3f qnn_prefill_ms=%.3f "
+      "handoff_ms=%.3f qnn_export_total_ms=%.3f decode_process_ms=%.3f e2e_total_ms=%.3f",
+      prefill.runner_setup_ms,
+      prefill.prefill.tokenize_ms,
+      prefill.prefill.prefill_ms,
+      prefill.prefill.handoff_total_ms,
+      prefill.qnn_export_total_ms,
+      decode.wall_ms,
+      total_ms);
+  ET_LOG(
+      Info,
+      "PD E2E handoff detail: kv_layout_ms=%.3f kv_write_ms=%.3f fingerprint_ms=%.3f",
+      prefill.prefill.kv_layout_ms,
+      prefill.prefill.kv_write_ms,
+      prefill.prefill.fingerprint_ms);
+  ET_LOG(
+      Info,
+      "PD E2E parent memory MiB: before_runner_rss=%.2f after_runner_rss=%.2f "
+      "after_export_rss=%.2f after_decode_rss=%.2f hwm=%.2f",
+      bytes_to_mib(prefill.before_runner.rss_bytes),
+      bytes_to_mib(prefill.after_runner.rss_bytes),
+      bytes_to_mib(prefill.after_export.rss_bytes),
+      bytes_to_mib(decode.after.rss_bytes),
+      bytes_to_mib(std::max(prefill.after_export.hwm_bytes, decode.after.hwm_bytes)));
+  for (size_t i = 0; i < prefill.shard_stats.size(); ++i) {
+    const auto& shard = prefill.shard_stats[i];
+    ET_LOG(
+        Info,
+        "PD E2E shard summary: index=%zu layers=[%zu,%zu) runs=%zu "
+        "materialize_ms=%.3f rebuild_ms=%.3f execute_ms=%.3f total_ms=%.3f",
+        i,
+        shard.layer_offset,
+        shard.layer_offset + shard.layer_count,
+        shard.execution_count,
+        shard.materialize_ms,
+        shard.rebuild_ms,
+        shard.execute_ms,
+        shard.total_ms);
+
+    const uint64_t peak_sample_rss = std::max(
+        std::max(shard.rss_after_materialize_bytes, shard.rss_after_load_bytes),
+        std::max(shard.rss_after_execute_bytes, shard.rss_after_release_bytes));
+    const uint64_t peak_hwm = std::max(
+        std::max(shard.hwm_after_materialize_bytes, shard.hwm_after_load_bytes),
+        std::max(shard.hwm_after_execute_bytes, shard.hwm_after_release_bytes));
+    const uint64_t baseline_rss = prefill.after_runner.rss_bytes;
+    const uint64_t baseline_hwm = prefill.after_runner.hwm_bytes;
+    ET_LOG(
+        Info,
+        "PD E2E shard memory MiB: index=%zu baseline_rss=%.2f "
+        "peak_sample_rss=%.2f peak_sample_delta=%.2f "
+        "hwm_before=%.2f hwm_peak=%.2f hwm_delta=%.2f",
+        i,
+        bytes_to_mib(baseline_rss),
+        bytes_to_mib(peak_sample_rss),
+        bytes_to_mib(
+            peak_sample_rss > baseline_rss ? peak_sample_rss - baseline_rss : 0),
+        bytes_to_mib(shard.hwm_before_bytes),
+        bytes_to_mib(peak_hwm),
+        bytes_to_mib(
+            peak_hwm > baseline_hwm ? peak_hwm - baseline_hwm : 0));
+    ET_LOG(
+        Info,
+        "PD E2E shard RSS MiB: index=%zu before=%.2f materialize=%.2f "
+        "load=%.2f execute=%.2f release=%.2f",
+        i,
+        bytes_to_mib(shard.rss_before_bytes),
+        bytes_to_mib(shard.rss_after_materialize_bytes),
+        bytes_to_mib(shard.rss_after_load_bytes),
+        bytes_to_mib(shard.rss_after_execute_bytes),
+        bytes_to_mib(shard.rss_after_release_bytes));
+  }
+}
+
 struct ModuleBundle {
   std::unique_ptr<executorch::extension::Module> module;
   std::shared_ptr<std::vector<uint8_t>> pte_bytes;
@@ -205,10 +351,27 @@ std::vector<std::string> CollectPrompts(int argc, char** argv) {
 }
 
 std::vector<uint8_t> read_binary_file(const std::string& path) {
-  std::ifstream input(path, std::ios::binary);
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
   ET_CHECK_MSG(input.is_open(), "Unable to read file: %s", path.c_str());
-  return std::vector<uint8_t>(
-      std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  const std::streampos end = input.tellg();
+  ET_CHECK_MSG(end >= 0, "Unable to determine file size: %s", path.c_str());
+  const size_t size_bytes = static_cast<size_t>(end);
+  input.seekg(0, std::ios::beg);
+  std::vector<uint8_t> bytes(size_bytes);
+  if (size_bytes != 0) {
+    input.read(
+        reinterpret_cast<char*>(bytes.data()),
+        static_cast<std::streamsize>(size_bytes));
+    ET_CHECK_MSG(
+        input.good() || input.eof(),
+        "Unable to read file: %s",
+        path.c_str());
+    ET_CHECK_MSG(
+        static_cast<size_t>(input.gcount()) == size_bytes,
+        "Short read from file: %s",
+        path.c_str());
+  }
+  return bytes;
 }
 
 std::string read_text_file(const std::string& path) {
@@ -666,10 +829,16 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   config.bits_hint = FLAGS_qat_bits_hint;
   config.group_size = FLAGS_qat_group_size;
   config.qweight_mode = FLAGS_qat_qweight_mode;
+  ET_LOG(
+      Info,
+      "PD shard rebuild source: kind=%d size_bytes=%zu capacity_bytes=%zu",
+      static_cast<int>(config.source_kind),
+      config.source_bytes->size(),
+      config.source_bytes->capacity());
   return config;
 }
 
-int run_decode_process(const std::string& handoff_dir) {
+DecodeProcessResult run_decode_process(const std::string& handoff_dir) {
   ET_CHECK_MSG(
       !FLAGS_llama_pd_cli_path.empty(),
       "--llama_pd_cli_path is required unless --prefill_only=true");
@@ -722,6 +891,9 @@ int run_decode_process(const std::string& handoff_dir) {
   }
   argv.push_back(nullptr);
 
+  DecodeProcessResult result;
+  result.before = process_memory_snapshot();
+  const auto decode_start = SteadyClock::now();
   const pid_t pid = fork();
   ET_CHECK_MSG(pid >= 0, "fork failed: %s", std::strerror(errno));
   if (pid == 0) {
@@ -736,13 +908,14 @@ int run_decode_process(const std::string& handoff_dir) {
 
   int status = 0;
   ET_CHECK_MSG(waitpid(pid, &status, 0) == pid, "waitpid failed: %s", std::strerror(errno));
+  result.wall_ms = elapsed_ms(decode_start);
+  result.after = process_memory_snapshot();
   if (WIFEXITED(status)) {
-    return WEXITSTATUS(status);
+    result.exit_code = WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    result.exit_code = 128 + WTERMSIG(status);
   }
-  if (WIFSIGNALED(status)) {
-    return 128 + WTERMSIG(status);
-  }
-  return 1;
+  return result;
 }
 
 template <typename T>
@@ -788,7 +961,7 @@ void run_wikitext_ppl(
 }
 
 template <typename T>
-void run_pd_e2e(
+PdE2ERuntimeStats run_pd_e2e(
     ModuleBundle module_bundle,
     const std::string& prompt_input,
     bool tokenized_prompt,
@@ -811,6 +984,9 @@ void run_pd_e2e(
     static_metadata.cache_mode = CacheMode::StaticCahce;
   }
 
+  PdE2ERuntimeStats stats;
+  stats.before_runner = process_memory_snapshot();
+  const auto runner_setup_start = SteadyClock::now();
   example::PDPrefillRunner<T> runner(
       std::move(module_bundle.module),
       std::move(prefill_shard_files.pte_paths),
@@ -828,11 +1004,14 @@ void run_pd_e2e(
       FLAGS_shared_buffer,
       nullptr,
       std::move(attention_sink_rope_module));
+  stats.runner_setup_ms = elapsed_ms(runner_setup_start);
+  stats.after_runner = process_memory_snapshot();
 
   const auto decoder_version = runner.get_decoder_model_version().get();
   const std::string formatted_prompt = tokenized_prompt
       ? prompt_input
       : get_formatted_prompt(prompt_input, FLAGS_system_prompt, decoder_version);
+  const auto qnn_export_start = SteadyClock::now();
   ET_CHECK_MSG(
       runner.export_prefill_handoff(
           formatted_prompt,
@@ -841,6 +1020,19 @@ void run_pd_e2e(
           handoff_dir,
           FLAGS_kv_quant_attrs_path) == executorch::runtime::Error::Ok,
       "PD prefill export failed");
+  stats.qnn_export_total_ms = elapsed_ms(qnn_export_start);
+  const auto runner_stats = runner.last_runtime_stats();
+  stats.prompt_tokens = runner_stats.prompt_tokens;
+  stats.prefill.prompt_tokens = runner_stats.prompt_tokens;
+  stats.prefill.tokenize_ms = runner_stats.tokenize_ms;
+  stats.prefill.prefill_ms = runner_stats.prefill_ms;
+  stats.prefill.handoff_total_ms = runner_stats.handoff_total_ms;
+  stats.prefill.kv_layout_ms = runner_stats.kv_layout_ms;
+  stats.prefill.kv_write_ms = runner_stats.kv_write_ms;
+  stats.prefill.fingerprint_ms = runner_stats.fingerprint_ms;
+  stats.shard_stats = runner.prefill_shard_runtime_stats();
+  stats.after_export = process_memory_snapshot();
+  return stats;
 }
 
 } // namespace
@@ -939,6 +1131,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  const auto e2e_start = SteadyClock::now();
   const std::string handoff_dir = FLAGS_prefill_export_dir.empty()
       ? create_temp_handoff_dir()
       : FLAGS_prefill_export_dir;
@@ -947,8 +1140,9 @@ int main(int argc, char** argv) {
 
   const std::string prompt_input =
       use_tokenized_prompt ? FLAGS_tokenized_prompt : prompts.front();
+  PdE2ERuntimeStats prefill_runtime;
   if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth8) {
-    run_pd_e2e<uint8_t>(
+    prefill_runtime = run_pd_e2e<uint8_t>(
         std::move(module_bundle),
         prompt_input,
         use_tokenized_prompt,
@@ -957,7 +1151,7 @@ int main(int argc, char** argv) {
         prefill_shard_rebuild,
         std::move(attention_sink_rope_module));
   } else if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth16) {
-    run_pd_e2e<uint16_t>(
+    prefill_runtime = run_pd_e2e<uint16_t>(
         std::move(module_bundle),
         prompt_input,
         use_tokenized_prompt,
@@ -973,11 +1167,25 @@ int main(int argc, char** argv) {
   }
 
   if (FLAGS_prefill_only) {
+    DecodeProcessResult no_decode;
+    no_decode.before = process_memory_snapshot();
+    no_decode.after = no_decode.before;
+    log_pd_e2e_runtime_summary(
+        prefill_runtime,
+        no_decode,
+        elapsed_ms(e2e_start));
     ET_LOG(Info, "Prefill completed; handoff is ready at %s", handoff_dir.c_str());
     return 0;
   }
 
-  const int decode_rc = run_decode_process(handoff_dir);
-  ET_CHECK_MSG(decode_rc == 0, "llama-pd-cli exited with code %d", decode_rc);
+  const DecodeProcessResult decode = run_decode_process(handoff_dir);
+  ET_CHECK_MSG(
+      decode.exit_code == 0,
+      "llama-pd-cli exited with code %d",
+      decode.exit_code);
+  log_pd_e2e_runtime_summary(
+      prefill_runtime,
+      decode,
+      elapsed_ms(e2e_start));
   return 0;
 }

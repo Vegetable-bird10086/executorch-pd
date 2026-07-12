@@ -15,6 +15,7 @@
 #include <executorch/runtime/core/portable_type/half.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include <iterator>
 #include <numeric>
 #include <limits>
+#include <sstream>
 using executorch::aten::Tensor;
 using executorch::extension::Module;
 using executorch::extension::llm::Sampler;
@@ -34,6 +36,45 @@ using executorch::runtime::Result;
 
 namespace example {
 namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+double elapsed_ms(
+    SteadyClock::time_point start,
+    SteadyClock::time_point end = SteadyClock::now()) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+struct ProcessMemorySnapshot {
+  uint64_t rss_bytes{0};
+  uint64_t hwm_bytes{0};
+};
+
+uint64_t read_proc_status_bytes(const char* field) {
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind(field, 0) != 0) {
+      continue;
+    }
+    std::istringstream value(line.substr(std::strlen(field)));
+    uint64_t kib = 0;
+    value >> kib;
+    return kib * 1024;
+  }
+  return 0;
+}
+
+ProcessMemorySnapshot process_memory_snapshot() {
+  return {
+      read_proc_status_bytes("VmRSS:"),
+      read_proc_status_bytes("VmHWM:"),
+  };
+}
+
+void record_memory_peak(uint64_t* destination, uint64_t value) {
+  *destination = std::max(*destination, value);
+}
 
 TensorPtr make_tensor_ptr_from_meta(const executorch::runtime::TensorInfo& meta) {
   std::vector<executorch::aten::SizesType> sizes(
@@ -250,6 +291,7 @@ void DecoderRunner::materialize_prefill_shard(PrefillShardPlan& shard) {
     return;
   }
 
+  const auto materialize_start = SteadyClock::now();
   if (shard.rebuild_on_execute) {
     ET_CHECK_MSG(
         prefill_shard_rebuild_.source_kind !=
@@ -285,6 +327,7 @@ void DecoderRunner::materialize_prefill_shard(PrefillShardPlan& shard) {
         break;
     }
     shard.rebuilt_pte_bytes = rebuild_result.rebuilt_pte;
+    shard.runtime_stats.rebuild_ms += rebuild_result.rebuild_time_ms;
     auto data_loader = std::make_unique<executorch::extension::BufferDataLoader>(
         shard.rebuilt_pte_bytes->data(), shard.rebuilt_pte_bytes->size());
     shard.module = std::make_unique<Module>(std::move(data_loader));
@@ -300,6 +343,7 @@ void DecoderRunner::materialize_prefill_shard(PrefillShardPlan& shard) {
     shard.module = std::make_unique<Module>(
         shard.pte_path.c_str(), Module::LoadMode::MmapUseMlockIgnoreErrors);
   }
+  shard.runtime_stats.materialize_ms += elapsed_ms(materialize_start);
 }
 
 void DecoderRunner::release_prefill_shard(PrefillShardPlan& shard) {
@@ -579,6 +623,8 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
         shard.output_bindings.size(),
         shard.owned_outputs.size(),
         static_cast<int>(shard.rebuild_on_execute));
+    shard.runtime_stats.layer_offset = shard.layer_offset;
+    shard.runtime_stats.layer_count = shard.layer_count;
     prefill_shards_.push_back(std::move(shard));
     layer_offset += layers_per_shard;
   }
@@ -721,8 +767,29 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
         "qwen3 static prefill shard IO mode=float_tensor_metadata_raw_fp16_storage");
   }
   for (auto& shard : prefill_shards_) {
+    const auto shard_total_start = SteadyClock::now();
+    ++shard.runtime_stats.execution_count;
+    const auto memory_before = process_memory_snapshot();
+    if (shard.runtime_stats.execution_count == 1) {
+      shard.runtime_stats.rss_before_bytes = memory_before.rss_bytes;
+      shard.runtime_stats.hwm_before_bytes = memory_before.hwm_bytes;
+    }
     materialize_prefill_shard(shard);
+    const auto memory_after_materialize = process_memory_snapshot();
+    record_memory_peak(
+        &shard.runtime_stats.rss_after_materialize_bytes,
+        memory_after_materialize.rss_bytes);
+    record_memory_peak(
+        &shard.runtime_stats.hwm_after_materialize_bytes,
+        memory_after_materialize.hwm_bytes);
     ET_CHECK_OK_OR_RETURN_ERROR(shard.module->load_method(shard.method_name));
+    const auto memory_after_load = process_memory_snapshot();
+    record_memory_peak(
+        &shard.runtime_stats.rss_after_load_bytes,
+        memory_after_load.rss_bytes);
+    record_memory_peak(
+        &shard.runtime_stats.hwm_after_load_bytes,
+        memory_after_load.hwm_bytes);
 
     // PromptProcessor provides Float tensor metadata backed by the native FP16
     // QNN buffers, matching the non-PD runner. No conversion bridge is needed.
@@ -830,7 +897,17 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
           shard.module->set_output(shard.method_name, shard.output_tensors[i], i));
     }
 
+    const auto shard_execute_start = SteadyClock::now();
     auto outputs_res = shard.module->execute(shard.method_name, shard_inputs);
+    const double shard_execute_ms = elapsed_ms(shard_execute_start);
+    shard.runtime_stats.execute_ms += shard_execute_ms;
+    const auto memory_after_execute = process_memory_snapshot();
+    record_memory_peak(
+        &shard.runtime_stats.rss_after_execute_bytes,
+        memory_after_execute.rss_bytes);
+    record_memory_peak(
+        &shard.runtime_stats.hwm_after_execute_bytes,
+        memory_after_execute.hwm_bytes);
     ET_CHECK_OK_OR_RETURN_ERROR(outputs_res.error());
     ET_CHECK_MSG(
         outputs_res->size() == shard.output_tensors.size(),
@@ -891,8 +968,26 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
       previous_aux = std::move(next_aux);
     }
     release_prefill_shard(shard);
+    const auto memory_after_release = process_memory_snapshot();
+    record_memory_peak(
+        &shard.runtime_stats.rss_after_release_bytes,
+        memory_after_release.rss_bytes);
+    record_memory_peak(
+        &shard.runtime_stats.hwm_after_release_bytes,
+        memory_after_release.hwm_bytes);
+    shard.runtime_stats.total_ms += elapsed_ms(shard_total_start);
   }
   return prefill_output_values_[0];
+}
+
+std::vector<DecoderRunner::PrefillShardRuntimeStats>
+DecoderRunner::prefill_shard_runtime_stats() const {
+  std::vector<PrefillShardRuntimeStats> stats;
+  stats.reserve(prefill_shards_.size());
+  for (const auto& shard : prefill_shards_) {
+    stats.push_back(shard.runtime_stats);
+  }
+  return stats;
 }
 
 bool DecoderRunner::uses_prefill_shards() const {

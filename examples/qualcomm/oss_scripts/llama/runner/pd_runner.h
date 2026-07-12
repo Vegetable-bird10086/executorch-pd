@@ -34,6 +34,16 @@ class PDPrefillRunner {
     CacheMode cache_mode{CacheMode::StaticCahce};
   };
 
+  struct RuntimeStats {
+    int32_t prompt_tokens{0};
+    double tokenize_ms{0.0};
+    double prefill_ms{0.0};
+    double handoff_total_ms{0.0};
+    double kv_layout_ms{0.0};
+    double kv_write_ms{0.0};
+    double fingerprint_ms{0.0};
+  };
+
   explicit PDPrefillRunner(
       std::unique_ptr<executorch::extension::Module> module,
       std::vector<std::string> prefill_shard_paths,
@@ -58,6 +68,9 @@ class PDPrefillRunner {
   void reset();
 
   executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version();
+  const RuntimeStats& last_runtime_stats() const;
+  std::vector<DecoderRunner::PrefillShardRuntimeStats>
+  prefill_shard_runtime_stats() const;
 
   executorch::runtime::Error export_prefill_handoff(
       const std::string& prompt,
@@ -108,6 +121,7 @@ class PDPrefillRunner {
   std::unique_ptr<DecoderRunner> decoder_runner_;
   std::unique_ptr<AttentionSinkRopeRunner> attention_sink_rope_runner_;
   std::unique_ptr<PromptProcessor<T>> prompt_processor_;
+  RuntimeStats last_runtime_stats_;
 };
 
 } // namespace example

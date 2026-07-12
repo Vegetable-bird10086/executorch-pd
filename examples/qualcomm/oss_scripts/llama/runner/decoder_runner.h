@@ -38,6 +38,26 @@ class DecoderRunner {
     int group_size{32};
     std::string qweight_mode{"qweight_minus_qzeros"};
   };
+  struct PrefillShardRuntimeStats {
+    size_t layer_offset{0};
+    size_t layer_count{0};
+    size_t execution_count{0};
+    double materialize_ms{0.0};
+    double rebuild_ms{0.0};
+    double execute_ms{0.0};
+    double total_ms{0.0};
+    uint64_t rss_before_bytes{0};
+    uint64_t rss_after_materialize_bytes{0};
+    uint64_t rss_after_load_bytes{0};
+    uint64_t rss_after_execute_bytes{0};
+    uint64_t rss_after_release_bytes{0};
+    uint64_t hwm_before_bytes{0};
+    uint64_t hwm_after_materialize_bytes{0};
+    uint64_t hwm_after_load_bytes{0};
+    uint64_t hwm_after_execute_bytes{0};
+    uint64_t hwm_after_release_bytes{0};
+  };
+
   DecoderRunner(
       executorch::extension::Module* module,
       int32_t vocab_size,
@@ -65,6 +85,7 @@ class DecoderRunner {
       int32_t prompt_ar_len,
       int32_t vocab_size,
       bool has_window_attention_mask);
+  std::vector<PrefillShardRuntimeStats> prefill_shard_runtime_stats() const;
   /**
    * Run LLM text decoder with inputs to generate next token.
    * @param inputs The inputs to the LLM Module.
@@ -198,6 +219,7 @@ class DecoderRunner {
     bool rebuild_on_execute{false};
     size_t layer_offset{0};
     size_t layer_count{0};
+    PrefillShardRuntimeStats runtime_stats;
     std::vector<InputBinding> input_bindings;
     std::vector<OutputBinding> output_bindings;
     std::vector<executorch::extension::TensorPtr> owned_inputs;

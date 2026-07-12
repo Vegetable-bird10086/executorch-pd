@@ -12,6 +12,7 @@
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,14 @@ struct KvQuantAttr {
   std::string dtype;
   bool valid{false};
 };
+
+using SteadyClock = std::chrono::steady_clock;
+
+double elapsed_ms(
+    SteadyClock::time_point start,
+    SteadyClock::time_point end = SteadyClock::now()) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 bool pd_debug_kv_enabled() {
   const char* value = std::getenv("ET_PD_DEBUG_KV");
@@ -142,8 +151,15 @@ json make_file_fingerprint(const std::string& path) {
   out["exists"] = true;
   out["basename"] = fs::path(path).filename().string();
   out["size_bytes"] = static_cast<uint64_t>(fs::file_size(path));
-  const auto bytes = read_binary_file(path);
-  out["fnv1a64"] = hex_u64(fnv1a64(bytes));
+
+  const char* full_hash = std::getenv("ET_PD_FULL_FILE_FINGERPRINT");
+  const bool hash_contents = full_hash != nullptr && full_hash[0] != '\0' &&
+      std::string(full_hash) != "0";
+  out["fingerprint_mode"] = hash_contents ? "full_fnv1a64" : "metadata_only";
+  if (hash_contents) {
+    const auto bytes = read_binary_file(path);
+    out["fnv1a64"] = hex_u64(fnv1a64(bytes));
+  }
   return out;
 }
 
@@ -478,7 +494,7 @@ std::vector<KvQuantAttr> read_kv_quant_attrs_from_json(
 }
 
 template <typename T>
-void append_canonical_k_layer(
+void write_canonical_k_layer(
     const KVCache<T>& cache,
     int64_t num_heads,
     int64_t head_dim,
@@ -486,8 +502,8 @@ void append_canonical_k_layer(
     int32_t prompt_len,
     const KvQuantAttr* quant_attr,
     bool undo_r3,
-    std::vector<uint16_t>* out) {
-  out->reserve(out->size() + static_cast<size_t>(num_heads) * head_dim * prompt_len);
+    uint16_t* out) {
+  ET_CHECK_MSG(out != nullptr, "Canonical K output cannot be null");
   std::vector<float> head_values;
   if (undo_r3) {
     ET_CHECK_MSG(
@@ -496,36 +512,43 @@ void append_canonical_k_layer(
         static_cast<long>(head_dim));
     head_values.resize(static_cast<size_t>(head_dim));
   }
+
   for (int64_t head = 0; head < num_heads; ++head) {
     for (int32_t seq = 0; seq < prompt_len; ++seq) {
+      const size_t dst_base =
+          (static_cast<size_t>(head) * prompt_len + seq) * head_dim;
       if (undo_r3) {
         for (int64_t dim = 0; dim < head_dim; ++dim) {
-          const size_t src_index = (head * head_dim + dim) * max_cache_len + seq;
+          const size_t src_index =
+              (static_cast<size_t>(head) * head_dim + dim) * max_cache_len + seq;
           if constexpr (std::is_same_v<T, uint16_t>) {
             head_values[static_cast<size_t>(dim)] =
                 fp16_bits_to_float(cache.buffer[src_index]);
           } else {
-            ET_CHECK_MSG(quant_attr != nullptr && quant_attr->valid, "Missing K quant attr");
+            ET_CHECK_MSG(
+                quant_attr != nullptr && quant_attr->valid,
+                "Missing K quant attr");
             head_values[static_cast<size_t>(dim)] =
-                (static_cast<int32_t>(cache.buffer[src_index]) - quant_attr->zero_point) *
-                static_cast<float>(quant_attr->scale);
+                dequantize_u8_value(cache.buffer[src_index], *quant_attr);
           }
         }
         apply_normalized_hadamard_inplace(&head_values);
-        for (float value : head_values) {
-          out->push_back(fp16_bits_from_float(value));
+        for (int64_t dim = 0; dim < head_dim; ++dim) {
+          out[dst_base + dim] =
+              fp16_bits_from_float(head_values[static_cast<size_t>(dim)]);
         }
       } else {
         for (int64_t dim = 0; dim < head_dim; ++dim) {
-          const size_t src_index = (head * head_dim + dim) * max_cache_len + seq;
+          const size_t src_index =
+              (static_cast<size_t>(head) * head_dim + dim) * max_cache_len + seq;
           if constexpr (std::is_same_v<T, uint16_t>) {
-            out->push_back(cache.buffer[src_index]);
+            out[dst_base + dim] = cache.buffer[src_index];
           } else {
-            ET_CHECK_MSG(quant_attr != nullptr && quant_attr->valid, "Missing K quant attr");
-            const float dequantized =
-                (static_cast<int32_t>(cache.buffer[src_index]) - quant_attr->zero_point) *
-                static_cast<float>(quant_attr->scale);
-            out->push_back(fp16_bits_from_float(dequantized));
+            ET_CHECK_MSG(
+                quant_attr != nullptr && quant_attr->valid,
+                "Missing K quant attr");
+            out[dst_base + dim] = fp16_bits_from_float(
+                dequantize_u8_value(cache.buffer[src_index], *quant_attr));
           }
         }
       }
@@ -534,30 +557,35 @@ void append_canonical_k_layer(
 }
 
 template <typename T>
-void append_canonical_v_layer(
+void write_canonical_v_layer(
     const KVCache<T>& cache,
     int64_t num_heads,
     int64_t head_dim,
     int32_t max_cache_len,
     int32_t prompt_len,
     const KvQuantAttr* quant_attr,
-    std::vector<uint16_t>* out) {
-  out->reserve(out->size() + static_cast<size_t>(num_heads) * head_dim * prompt_len);
+    uint16_t* out) {
+  ET_CHECK_MSG(out != nullptr, "Canonical V output cannot be null");
+  const size_t prompt_head_values =
+      static_cast<size_t>(prompt_len) * head_dim;
+  const size_t cache_head_values =
+      static_cast<size_t>(max_cache_len) * head_dim;
+
   for (int64_t head = 0; head < num_heads; ++head) {
-    for (int32_t seq = 0; seq < prompt_len; ++seq) {
-      for (int64_t dim = 0; dim < head_dim; ++dim) {
-        const size_t src_index =
-            head * static_cast<size_t>(max_cache_len) * head_dim +
-            static_cast<size_t>(seq) * head_dim + dim;
-        if constexpr (std::is_same_v<T, uint16_t>) {
-          out->push_back(cache.buffer[src_index]);
-        } else {
-          ET_CHECK_MSG(quant_attr != nullptr && quant_attr->valid, "Missing V quant attr");
-          const float dequantized =
-              (static_cast<int32_t>(cache.buffer[src_index]) - quant_attr->zero_point) *
-              static_cast<float>(quant_attr->scale);
-          out->push_back(fp16_bits_from_float(dequantized));
-        }
+    const size_t dst_base = static_cast<size_t>(head) * prompt_head_values;
+    const size_t src_base = static_cast<size_t>(head) * cache_head_values;
+    if constexpr (std::is_same_v<T, uint16_t>) {
+      std::memcpy(
+          out + dst_base,
+          cache.buffer + src_base,
+          prompt_head_values * sizeof(uint16_t));
+    } else {
+      ET_CHECK_MSG(
+          quant_attr != nullptr && quant_attr->valid,
+          "Missing V quant attr");
+      for (size_t i = 0; i < prompt_head_values; ++i) {
+        out[dst_base + i] = fp16_bits_from_float(
+            dequantize_u8_value(cache.buffer[src_base + i], *quant_attr));
       }
     }
   }
@@ -574,7 +602,6 @@ std::vector<uint16_t> build_canonical_kv(
     int32_t prompt_len,
     int32_t max_cache_len,
     const std::vector<KvQuantAttr>& quant_attrs) {
-  std::vector<uint16_t> canonical;
   const auto& k_cache = kv_manager->get_k_cache_();
   const auto& v_cache = kv_manager->get_v_cache_();
   const bool undo_r3 =
@@ -584,9 +611,12 @@ std::vector<uint16_t> build_canonical_kv(
         Info,
         "PD export will undo SpinQuant R3 on K cache before writing canonical KV");
   }
-  const size_t per_kind_count =
-      static_cast<size_t>(num_layers) * num_heads * head_dim * prompt_len;
-  canonical.reserve(per_kind_count * 2);
+
+  const size_t per_layer_count =
+      static_cast<size_t>(num_heads) * head_dim * prompt_len;
+  const size_t per_kind_count = static_cast<size_t>(num_layers) * per_layer_count;
+  std::vector<uint16_t> canonical(per_kind_count * 2);
+
   for (int64_t layer = 0; layer < num_layers; ++layer) {
     const KvQuantAttr* attr = nullptr;
     if constexpr (std::is_same_v<T, uint8_t>) {
@@ -607,7 +637,7 @@ std::vector<uint16_t> build_canonical_kv(
           attr,
           true);
     }
-    append_canonical_k_layer(
+    write_canonical_k_layer(
         k_cache.at(static_cast<size_t>(layer)),
         num_heads,
         head_dim,
@@ -615,8 +645,9 @@ std::vector<uint16_t> build_canonical_kv(
         prompt_len,
         attr,
         undo_r3,
-        &canonical);
+        canonical.data() + static_cast<size_t>(layer) * per_layer_count);
   }
+
   for (int64_t layer = 0; layer < num_layers; ++layer) {
     const KvQuantAttr* attr = nullptr;
     if constexpr (std::is_same_v<T, uint8_t>) {
@@ -633,14 +664,15 @@ std::vector<uint16_t> build_canonical_kv(
           attr,
           false);
     }
-    append_canonical_v_layer(
+    write_canonical_v_layer(
         v_cache.at(static_cast<size_t>(layer)),
         num_heads,
         head_dim,
         max_cache_len,
         prompt_len,
         attr,
-        &canonical);
+        canonical.data() + per_kind_count +
+            static_cast<size_t>(layer) * per_layer_count);
   }
   log_canonical_sample(canonical, num_layers, num_heads, head_dim, prompt_len);
   return canonical;
@@ -927,6 +959,20 @@ Result<DecoderModelVersion> PDPrefillRunner<T>::get_decoder_model_version() {
 }
 
 template <typename T>
+const typename PDPrefillRunner<T>::RuntimeStats&
+PDPrefillRunner<T>::last_runtime_stats() const {
+  return last_runtime_stats_;
+}
+
+template <typename T>
+std::vector<DecoderRunner::PrefillShardRuntimeStats>
+PDPrefillRunner<T>::prefill_shard_runtime_stats() const {
+  return decoder_runner_ != nullptr
+      ? decoder_runner_->prefill_shard_runtime_stats()
+      : std::vector<DecoderRunner::PrefillShardRuntimeStats>{};
+}
+
+template <typename T>
 Error PDPrefillRunner<T>::export_prefill_handoff(
     const std::string& prompt,
     bool tokenized_prompt,
@@ -947,7 +993,9 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
     seq_len = context_len_;
   }
 
+  last_runtime_stats_ = {};
   int32_t n_bos = (cur_pos_ == 0) ? 1 : 0;
+  const auto tokenize_start = SteadyClock::now();
   std::vector<uint64_t> prompt_tokens;
   if (tokenized_prompt) {
     std::ifstream in_file(prompt, std::ios::binary);
@@ -965,11 +1013,14 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   }
 
   const int32_t num_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
+  last_runtime_stats_.prompt_tokens = num_prompt_tokens;
+  last_runtime_stats_.tokenize_ms = elapsed_ms(tokenize_start);
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
   ET_CHECK_MSG(
       cur_pos_ + num_prompt_tokens < seq_len,
       "sequence length exceeded - please increase seq_len");
 
+  const auto prefill_start = SteadyClock::now();
   auto prefill_res = prompt_processor_->prefill(
       prompt_tokens,
       cur_pos_,
@@ -977,8 +1028,11 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       attention_sink_rope_runner_.get());
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
   const uint64_t first_token = prefill_res.get();
+  last_runtime_stats_.prefill_ms = elapsed_ms(prefill_start);
   cur_pos_ += num_prompt_tokens;
 
+  const auto handoff_start = SteadyClock::now();
+  const auto quant_attrs_start = SteadyClock::now();
   std::vector<KvQuantAttr> quant_attrs;
   if constexpr (std::is_same_v<T, uint8_t>) {
     const size_t expected_attr_count = static_cast<size_t>(num_layers_) * 2;
@@ -990,7 +1044,9 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       ET_CHECK_MSG(quant_attrs.at(i).valid, "Missing kv quant attr %zu", i);
     }
   }
+  const double quant_attrs_ms = elapsed_ms(quant_attrs_start);
 
+  const auto kv_layout_start = SteadyClock::now();
   const std::vector<uint16_t> canonical_kv = build_canonical_kv(
       kv_manager_.get(),
       decoder_model_version_,
@@ -1001,11 +1057,14 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       num_prompt_tokens,
       prefill_cache_stride_,
       quant_attrs);
+  const double kv_layout_ms = elapsed_ms(kv_layout_start);
+  const size_t canonical_kv_bytes = canonical_kv.size() * sizeof(uint16_t);
   const bool export_undo_r3 = should_undo_r3_on_export(
       decoder_model_version_, model_path_, num_layers_, num_heads_, head_dim_);
 
   fs::create_directories(export_dir);
   const fs::path export_path(export_dir);
+  const auto metadata_files_start = SteadyClock::now();
   write_binary(
       export_path / "prompt_tokens.bin",
       prompt_tokens.data(),
@@ -1014,10 +1073,14 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       export_path / "first_token.bin",
       &first_token,
       sizeof(first_token));
+  const double metadata_files_ms = elapsed_ms(metadata_files_start);
+
+  const auto kv_write_start = SteadyClock::now();
   write_binary(
       export_path / "kv.bin",
       canonical_kv.data(),
-      canonical_kv.size() * sizeof(uint16_t));
+      canonical_kv_bytes);
+  const double kv_write_ms = elapsed_ms(kv_write_start);
 
   json manifest;
   manifest["format_version"] = "pd-handoff-v1";
@@ -1042,11 +1105,12 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   manifest["first_token_file"] = "first_token.bin";
   manifest["first_token_id"] = first_token;
   manifest["kv_file"] = "kv.bin";
-  manifest["kv_file_size_bytes"] =
-      static_cast<uint64_t>(canonical_kv.size() * sizeof(uint16_t));
+  manifest["kv_file_size_bytes"] = static_cast<uint64_t>(canonical_kv_bytes);
   manifest["first_token_owner"] = "executorch";
+  const auto fingerprint_start = SteadyClock::now();
   manifest["pte_fingerprint"] = make_file_fingerprint(model_path_);
   manifest["tokenizer_fingerprint"] = make_file_fingerprint(tokenizer_path_);
+  const double fingerprint_ms = elapsed_ms(fingerprint_start);
   manifest["rope"] = {
       {"freq_base", nullptr},
       {"freq_scale", nullptr},
@@ -1064,18 +1128,39 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
     manifest["source_kv_quant_attrs"] = quant_json;
   }
 
+  const auto manifest_write_start = SteadyClock::now();
   std::ofstream manifest_out(export_path / "manifest.json");
   ET_CHECK_MSG(
       manifest_out.is_open(),
       "Unable to write manifest: %s",
       (export_path / "manifest.json").c_str());
   manifest_out << manifest.dump(2) << "\n";
+  manifest_out.flush();
+  ET_CHECK_MSG(manifest_out.good(), "Failed to write PD manifest");
+  const double manifest_write_ms = elapsed_ms(manifest_write_start);
+  const double handoff_total_ms = elapsed_ms(handoff_start);
+  last_runtime_stats_.handoff_total_ms = handoff_total_ms;
+  last_runtime_stats_.kv_layout_ms = kv_layout_ms;
+  last_runtime_stats_.kv_write_ms = kv_write_ms;
+  last_runtime_stats_.fingerprint_ms = fingerprint_ms;
+  ET_LOG(
+      Info,
+      "PD handoff timing: quant_attrs_ms=%.3f kv_layout_ms=%.3f "
+      "metadata_files_ms=%.3f kv_write_ms=%.3f fingerprint_ms=%.3f "
+      "manifest_write_ms=%.3f total_ms=%.3f",
+      quant_attrs_ms,
+      kv_layout_ms,
+      metadata_files_ms,
+      kv_write_ms,
+      fingerprint_ms,
+      manifest_write_ms,
+      handoff_total_ms);
   ET_LOG(
       Info,
       "PD handoff exported: dir=%s prompt_len=%d kv_bytes=%zu first_token=%llu",
       export_dir.c_str(),
       num_prompt_tokens,
-      canonical_kv.size() * sizeof(uint16_t),
+      canonical_kv_bytes,
       static_cast<unsigned long long>(first_token));
   return Error::Ok;
 }
