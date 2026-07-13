@@ -461,6 +461,81 @@ Result<uint64_t> PromptProcessor<T>::prefill(
       "Failed to set output tensor for module %s",
       method_name_.c_str());
 
+
+  if (decoder_runner_->uses_prefill_shard_stage_major()) {
+    ET_CHECK_MSG(
+        !enable_attention_sink,
+        "Stage-major sharded prefill does not support attention-sink eviction");
+    const size_t shard_count = decoder_runner_->prefill_shard_count();
+    ET_CHECK_MSG(shard_count > 0, "Stage-major prefill has no shards");
+    std::vector<DecoderRunner::PrefillShardStageState> stage_states(
+        static_cast<size_t>(num_iters));
+    ET_LOG(
+        Info,
+        "Prompt Processor: stage-major sharded prefill shards=%zu iters=%d",
+        shard_count,
+        num_iters);
+
+    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index) {
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          decoder_runner_->begin_prefill_shard_stage(shard_index));
+      const int32_t layer_begin = static_cast<int32_t>(
+          decoder_runner_->prefill_shard_layer_offset(shard_index));
+      const int32_t layer_end_exclusive = layer_begin + static_cast<int32_t>(
+          decoder_runner_->prefill_shard_layer_count(shard_index));
+
+      for (int i = 0; i < num_iters; ++i) {
+        const int64_t stage_prompt_pos = static_cast<int64_t>(i) * metadata_.ar_len;
+        const int64_t stage_pos = shifted_pos + stage_prompt_pos;
+        kv_manager_->init_attention_mask(
+            attention_mask_.data, attention_map, metadata_.ar_len, stage_pos);
+        if (metadata_.cache_mode == CacheMode::HybridCache) {
+          kv_manager_->init_attention_mask(
+              window_attention_mask_.data,
+              attention_map,
+              metadata_.ar_len,
+              stage_pos,
+              metadata_.sliding_window);
+        }
+        prepare_io(prompt_tokens, stage_prompt_pos, stage_pos);
+
+        const DecoderRunner::PrefillShardStageState* previous_stage =
+            shard_index == 0 ? nullptr : &stage_states[static_cast<size_t>(i)];
+        auto stage_result = decoder_runner_->step_prefill_shard_stage(
+            shard_index, inputs_, previous_stage);
+        ET_CHECK_OK_OR_RETURN_ERROR(stage_result.error());
+        stage_states[static_cast<size_t>(i)] = stage_result.get();
+
+        const int32_t stage_n_update = i == num_iters - 1
+            ? 1 + ((num_prompt_tokens - 1) % metadata_.ar_len)
+            : metadata_.ar_len;
+        kv_manager_->update_cache_range(
+            metadata_.ar_len,
+            static_cast<int32_t>(stage_pos),
+            stage_n_update,
+            {},
+            layer_begin,
+            layer_end_exclusive);
+
+        if (dump_logits && shard_index + 1 == shard_count) {
+          prompt_all_logits_.insert(
+              prompt_all_logits_.end(),
+              logits_.data,
+              logits_.data + metadata_.ar_len * metadata_.vocab_size);
+        }
+      }
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          decoder_runner_->end_prefill_shard_stage(shard_index));
+    }
+
+    const int64_t logits_pos =
+        (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
+    cur_token = force_greedy_argmax
+        ? decoder_runner_->logits_to_argmax_token(output_tensors_[0], logits_pos)
+        : decoder_runner_->logits_to_token(output_tensors_[0], logits_pos);
+    return cur_token;
+  }
+
   for (int i = 0; i < num_iters; ++i) {
     // The current position plus the future generated cache exceeds the cache
     // size, which means we need to remove eviction_batch_size key-value cache

@@ -9,9 +9,19 @@
 #include <executorch/backends/qualcomm/runtime/backends/QnnContextCommon.h>
 #include <executorch/backends/qualcomm/runtime/backends/QnnDlcManager.h>
 
+#include <chrono>
+
 namespace executorch {
 namespace backends {
 namespace qnn {
+
+namespace {
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(const Clock::time_point& start) {
+  return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+} // namespace
 
 QnnContext::~QnnContext() {
   const QnnInterface& qnn_interface = implementation_->GetQnnInterface();
@@ -46,6 +56,7 @@ Error QnnContext::Configure() {
     const QnnExecuTorchContextBinary& qnn_context_blob =
         cache_->GetQnnContextBlob();
 
+    const auto context_restore_start = Clock::now();
     error = qnn_interface.qnn_context_create_from_binary(
         backend_->GetHandle(),
         device_->GetHandle(),
@@ -61,6 +72,9 @@ Error QnnContext::Configure() {
           QNN_GET_ERROR_CODE(error));
       return Error::Internal;
     }
+    QNN_EXECUTORCH_LOG_INFO(
+        "QNN context timing: context_create_from_binary_ms=%.3f",
+        elapsed_ms(context_restore_start));
   } else if (
       cache_->GetCacheState() == QnnBackendCache::SERIALIZE ||
       cache_->GetCacheState() == QnnBackendCache::ONLINE_PREPARE ||

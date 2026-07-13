@@ -14,6 +14,7 @@
 #include <executorch/backends/qualcomm/runtime/backends/QnnImplementation.h>
 #include <executorch/extension/tensor/tensor.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -25,6 +26,14 @@ namespace backends {
 namespace qnn {
 
 using executorch::runtime::Error;
+
+namespace {
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(const Clock::time_point& start) {
+  return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+} // namespace
 
 bool CompareExportedInput(
     const std::shared_ptr<TensorWrapper>& a,
@@ -238,12 +247,18 @@ Error QnnManager::InitBackend() {
 
 Error QnnManager::InitContext(
     std::optional<std::vector<std::string>> graph_names) {
+  const auto init_context_start = Clock::now();
+  double backend_factory_ms = 0.0;
+  double backend_cache_configure_ms = 0.0;
+  double context_configure_ms = 0.0;
+  double graph_configure_ms = 0.0;
   if (backend_params_ptr_->backend_init_state_ ==
       BackendInitializeState::UNINITIALIZED) {
     QNN_EXECUTORCH_LOG_INFO(
         "Initialize Qnn backend "
         "parameters for Qnn executorch backend type %d",
         options_->backend_options()->backend_type());
+    const auto backend_factory_start = Clock::now();
     backend_params_ptr_ = QnnBackendFactory().Create(
         backend_bundle_ptr_->implementation.get(),
         backend_bundle_ptr_->qnn_backend_ptr.get(),
@@ -251,28 +266,36 @@ Error QnnManager::InitContext(
         qnn_context_blob_,
         options_,
         qnn_dlc_manager_.get());
+    backend_factory_ms = elapsed_ms(backend_factory_start);
     ET_CHECK_OR_RETURN_ERROR(
         backend_params_ptr_ != nullptr,
         Internal,
         "Failed to load Qnn backend.");
     // Note: For online_prepare or deserialization, the graph name will be
     // obtained from the binary.
+    const auto backend_cache_configure_start = Clock::now();
     ET_CHECK_OR_RETURN_ERROR(
         backend_params_ptr_->qnn_backend_cache_ptr_->Configure(
             graph_names.value_or(std::vector<std::string>{})) == Error::Ok,
         Internal,
         "Fail to configure Qnn backend cache");
+    backend_cache_configure_ms =
+        elapsed_ms(backend_cache_configure_start);
+    const auto context_configure_start = Clock::now();
     ET_CHECK_OR_RETURN_ERROR(
         backend_params_ptr_->qnn_context_ptr_->Configure() == Error::Ok,
         Internal,
         "Fail to configure Qnn context");
+    context_configure_ms = elapsed_ms(context_configure_start);
     for (const std::string& graph_name :
          backend_params_ptr_->qnn_context_ptr_->GetGraphNames()) {
+      const auto graph_configure_start = Clock::now();
       ET_CHECK_OR_RETURN_ERROR(
           backend_params_ptr_->qnn_graph_ptr_->Configure(graph_name) ==
               Error::Ok,
           Internal,
           "Fail to configure Qnn graph");
+      graph_configure_ms += elapsed_ms(graph_configure_start);
     }
 
     backend_params_ptr_->backend_init_state_ =
@@ -292,6 +315,13 @@ Error QnnManager::InitContext(
         Internal,
         "Fail to setup Dlc environment");
   }
+  QNN_EXECUTORCH_LOG_INFO(
+      "QNN context init timing: backend_factory_ms=%.3f backend_cache_configure_ms=%.3f context_configure_ms=%.3f graph_configure_ms=%.3f total_ms=%.3f",
+      backend_factory_ms,
+      backend_cache_configure_ms,
+      context_configure_ms,
+      graph_configure_ms,
+      elapsed_ms(init_context_start));
   return Error::Ok;
 }
 

@@ -8,21 +8,25 @@
 
 #pragma once
 
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/pte_rebuilder.h>
 #include <executorch/extension/llm/sampler/sampler.h>
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor_ptr.h>
 #include <executorch/extension/tensor/tensor.h>
 #include <executorch/runtime/core/portable_type/half.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace example {
+
 class DecoderRunner {
  public:
   struct PrefillShardRebuildConfig {
@@ -37,14 +41,23 @@ class DecoderRunner {
     int bits_hint{2};
     int group_size{32};
     std::string qweight_mode{"qweight_minus_qzeros"};
+    bool pipeline_rebuild{false};
+    bool stage_major_execution{false};
   };
   struct PrefillShardRuntimeStats {
     size_t layer_offset{0};
     size_t layer_count{0};
     size_t execution_count{0};
+    double preload_ms{0.0};
     double materialize_ms{0.0};
     double rebuild_ms{0.0};
+    double pipeline_wait_ms{0.0};
+    double qnn_load_method_ms{0.0};
+    double input_binding_ms{0.0};
+    double output_binding_ms{0.0};
     double execute_ms{0.0};
+    double output_copy_ms{0.0};
+    double release_ms{0.0};
     double total_ms{0.0};
     uint64_t rss_before_bytes{0};
     uint64_t rss_after_materialize_bytes{0};
@@ -56,6 +69,10 @@ class DecoderRunner {
     uint64_t hwm_after_load_bytes{0};
     uint64_t hwm_after_execute_bytes{0};
     uint64_t hwm_after_release_bytes{0};
+  };
+  struct PrefillShardStageState {
+    std::vector<executorch::extension::TensorPtr> aux;
+    executorch::extension::TensorPtr hidden;
   };
 
   DecoderRunner(
@@ -86,6 +103,16 @@ class DecoderRunner {
       int32_t vocab_size,
       bool has_window_attention_mask);
   std::vector<PrefillShardRuntimeStats> prefill_shard_runtime_stats() const;
+  bool uses_prefill_shard_stage_major() const;
+  size_t prefill_shard_count() const;
+  size_t prefill_shard_layer_offset(size_t shard_index) const;
+  size_t prefill_shard_layer_count(size_t shard_index) const;
+  executorch::runtime::Error begin_prefill_shard_stage(size_t shard_index);
+  executorch::runtime::Result<PrefillShardStageState> step_prefill_shard_stage(
+      size_t shard_index,
+      std::vector<executorch::runtime::EValue>& inputs,
+      const PrefillShardStageState* previous_stage);
+  executorch::runtime::Error end_prefill_shard_stage(size_t shard_index);
   /**
    * Run LLM text decoder with inputs to generate next token.
    * @param inputs The inputs to the LLM Module.
@@ -213,6 +240,8 @@ class DecoderRunner {
     };
     std::unique_ptr<executorch::extension::Module> module;
     std::shared_ptr<std::vector<uint8_t>> rebuilt_pte_bytes;
+    std::shared_ptr<std::vector<uint8_t>> stripped_pte_bytes;
+    std::shared_ptr<std::vector<uint8_t>> index_bytes;
     std::string pte_path;
     std::string index_path;
     std::string method_name;
@@ -227,8 +256,17 @@ class DecoderRunner {
     std::vector<executorch::aten::Tensor> output_tensors;
   };
 
+  void preload_prefill_shard(PrefillShardPlan& shard);
+  PteRebuildResult rebuild_prefill_shard(const PrefillShardPlan& shard) const;
+  void attach_rebuilt_prefill_shard(
+      PrefillShardPlan& shard,
+      PteRebuildResult rebuild_result);
   void materialize_prefill_shard(PrefillShardPlan& shard);
   void release_prefill_shard(PrefillShardPlan& shard);
+  executorch::runtime::Result<PrefillShardStageState> execute_prefill_shard(
+      PrefillShardPlan& shard,
+      std::vector<executorch::runtime::EValue>& inputs,
+      const PrefillShardStageState* previous_stage);
   void configure_qwen3_static_prefill_shards();
   executorch::runtime::Result<executorch::aten::Tensor> step_prefill_shards(
       std::vector<executorch::runtime::EValue>& inputs);
@@ -251,5 +289,9 @@ class DecoderRunner {
   bool prefill_qwen3_static_plan_{false};
   int32_t prefill_static_aux_size_{64};
   int32_t prefill_static_hidden_size_{2048};
+  std::vector<std::chrono::steady_clock::time_point> prefill_shard_stage_starts_;
+  std::future<PteRebuildResult> prefill_shard_stage_pending_rebuild_;
+  size_t prefill_shard_stage_pending_rebuild_index_{
+      std::numeric_limits<size_t>::max()};
 };
 } // namespace example

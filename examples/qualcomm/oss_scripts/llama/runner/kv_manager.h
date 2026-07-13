@@ -151,6 +151,13 @@ class KVManager {
       int32_t n_past,
       int32_t n_update,
       const std::vector<bool>& selected);
+  void update_cache_range(
+      int32_t ar_len,
+      int32_t n_past,
+      int32_t n_update,
+      const std::vector<bool>& selected,
+      int32_t layer_begin,
+      int32_t layer_end_exclusive);
 
   const std::vector<KVCache<T>>& get_k_cache_() const {
     return k_cache_;

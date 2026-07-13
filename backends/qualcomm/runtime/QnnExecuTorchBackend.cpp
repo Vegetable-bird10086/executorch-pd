@@ -15,6 +15,7 @@
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/backend/options.h>
 
+#include <chrono>
 #include <cstdlib>
 namespace executorch {
 namespace backends {
@@ -33,6 +34,12 @@ using executorch::runtime::Result;
 using executorch::runtime::Span;
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(const Clock::time_point& start) {
+  return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
 
 int ParseIndexedQnnTensorName(const std::string& name, const char* prefix) {
   const std::string prefix_str(prefix);
@@ -62,12 +69,15 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
     BackendInitContext& context,
     FreeableBuffer* processed,
     ArrayRef<CompileSpec> compile_specs) const {
+  const auto init_start = Clock::now();
+  const auto protocol_start = Clock::now();
   // covert SizedBuffer to qnn ExecuTorch option
   QnnExecuTorchContextBinary qnn_context_blob;
   const qnn_delegate::QnnExecuTorchOptions* qnn_executorch_options = nullptr;
   auto [status, signature, ctx_size, ctx_bin] =
       QnnContextCustomProtocol().DeserializeContextCustomBuffer(
           const_cast<void*>(processed->data()));
+  const double protocol_ms = elapsed_ms(protocol_start);
   if (status == Error::Ok) {
     QNN_EXECUTORCH_LOG_INFO(
         "Deserializing processed data using QnnContextCustomProtocol");
@@ -115,15 +125,21 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
     return iter->second;
   }
 
+  const auto init_backend_start = Clock::now();
   ET_CHECK_OR_RETURN_ERROR(
       qnn_manager->InitBackend() == Error::Ok,
       Internal,
       "Fail to initialize Qnn Manager");
+  const double init_backend_ms = elapsed_ms(init_backend_start);
+
+  const auto init_context_start = Clock::now();
   ET_CHECK_OR_RETURN_ERROR(
       qnn_manager->InitContext() == Error::Ok,
       Internal,
       "Fail to initialize Qnn Manager");
+  const double init_context_ms = elapsed_ms(init_context_start);
 
+  const auto allocate_tensors_start = Clock::now();
   if (qnn_manager->IsOnlinePrepare()) {
     ET_CHECK_OR_RETURN_ERROR(
         qnn_manager->CompileDlc() == Error::Ok,
@@ -137,6 +153,7 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
           "Fail to allocate tensor");
     }
   }
+  const double allocate_tensors_ms = elapsed_ms(allocate_tensors_start);
   add_cached_delegate(signature, qnn_manager);
 
 #ifndef __hexagon__
@@ -144,6 +161,14 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
   processed->Free();
 #endif
 
+  QNN_EXECUTORCH_LOG_INFO(
+      "QNN init timing: method=%s protocol_ms=%.3f init_backend_ms=%.3f init_context_ms=%.3f allocate_tensor_ms=%.3f total_ms=%.3f",
+      context.get_method_name(),
+      protocol_ms,
+      init_backend_ms,
+      init_context_ms,
+      allocate_tensors_ms,
+      elapsed_ms(init_start));
   return qnn_manager;
 }
 

@@ -117,6 +117,14 @@ DEFINE_bool(
     prefill_only,
     false,
     "Only export the PD handoff and skip llama.cpp decode.");
+DEFINE_bool(
+    prefill_shard_pipeline,
+    false,
+    "Preload stripped shard inputs and rebuild one shard ahead on a CPU worker while QNN executes the current shard.");
+DEFINE_bool(
+    prefill_shard_stage_major,
+    false,
+    "For static Qwen3 shards, execute every AR block through one shard before advancing to the next shard.");
 DEFINE_string(
     llama_pd_cli_path,
     "",
@@ -233,6 +241,19 @@ void log_pd_e2e_runtime_summary(
       prefill.prompt_tokens,
       prefill.shard_stats.size(),
       FLAGS_decode_n_predict);
+  double shard_preload_total_ms = 0.0;
+  double pipeline_wait_total_ms = 0.0;
+  for (const auto& shard : prefill.shard_stats) {
+    shard_preload_total_ms += shard.preload_ms;
+    pipeline_wait_total_ms += shard.pipeline_wait_ms;
+  }
+  ET_LOG(
+      Info,
+      "PD E2E shard setup: preload_ms=%.3f pipeline_wait_ms=%.3f pipeline_enabled=%d stage_major_enabled=%d",
+      shard_preload_total_ms,
+      pipeline_wait_total_ms,
+      static_cast<int>(FLAGS_prefill_shard_pipeline),
+      static_cast<int>(FLAGS_prefill_shard_stage_major));
   ET_LOG(
       Info,
       "PD E2E timing: runner_setup_ms=%.3f tokenize_ms=%.3f qnn_prefill_ms=%.3f "
@@ -264,15 +285,38 @@ void log_pd_e2e_runtime_summary(
     ET_LOG(
         Info,
         "PD E2E shard summary: index=%zu layers=[%zu,%zu) runs=%zu "
-        "materialize_ms=%.3f rebuild_ms=%.3f execute_ms=%.3f total_ms=%.3f",
+        "preload_ms=%.3f materialize_ms=%.3f rebuild_ms=%.3f "
+        "pipeline_wait_ms=%.3f execute_ms=%.3f total_ms=%.3f",
         i,
         shard.layer_offset,
         shard.layer_offset + shard.layer_count,
         shard.execution_count,
+        shard.preload_ms,
         shard.materialize_ms,
         shard.rebuild_ms,
+        shard.pipeline_wait_ms,
         shard.execute_ms,
         shard.total_ms);
+
+    const double lifecycle_known_ms =
+        shard.materialize_ms + shard.pipeline_wait_ms +
+        shard.qnn_load_method_ms + shard.input_binding_ms +
+        shard.output_binding_ms + shard.execute_ms +
+        shard.output_copy_ms + shard.release_ms;
+    const double other_stage_ms =
+        std::max(0.0, shard.total_ms - lifecycle_known_ms);
+    ET_LOG(
+        Info,
+        "PD E2E shard lifecycle: index=%zu qnn_load_method_ms=%.3f "
+        "input_binding_ms=%.3f output_binding_ms=%.3f "
+        "output_copy_ms=%.3f release_ms=%.3f other_ms=%.3f",
+        i,
+        shard.qnn_load_method_ms,
+        shard.input_binding_ms,
+        shard.output_binding_ms,
+        shard.output_copy_ms,
+        shard.release_ms,
+        other_stage_ms);
 
     const uint64_t peak_sample_rss = std::max(
         std::max(shard.rss_after_materialize_bytes, shard.rss_after_load_bytes),
@@ -829,6 +873,8 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   config.bits_hint = FLAGS_qat_bits_hint;
   config.group_size = FLAGS_qat_group_size;
   config.qweight_mode = FLAGS_qat_qweight_mode;
+  config.stage_major_execution = FLAGS_prefill_shard_stage_major;
+  config.pipeline_rebuild = FLAGS_prefill_shard_pipeline;
   ET_LOG(
       Info,
       "PD shard rebuild source: kind=%d size_bytes=%zu capacity_bytes=%zu",

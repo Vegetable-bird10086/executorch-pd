@@ -31,9 +31,7 @@ QnnBackendUnifiedRegistry& QnnBackendUnifiedRegistry::GetInstance() {
 QnnBackendUnifiedRegistry::QnnBackendUnifiedRegistry() = default;
 
 // Destructor
-QnnBackendUnifiedRegistry::~QnnBackendUnifiedRegistry() {
-  CleanupExpired();
-}
+QnnBackendUnifiedRegistry::~QnnBackendUnifiedRegistry() = default;
 
 Error QnnBackendUnifiedRegistry::GetOrCreateBackendBundle(
     const QnnExecuTorchOptions* options,
@@ -69,18 +67,17 @@ Error QnnBackendUnifiedRegistry::GetOrCreateBackendBundle(
   // Check if resources already exist
   auto it = qnn_backend_bundles_map_.find(backend_type);
   if (it != qnn_backend_bundles_map_.end()) {
-    // Create new shared_ptr that shares ownership of the managed object.
-    if (auto existing_bundle = it->second.lock()) {
-      bundle = existing_bundle;
-      if (bundle->qnn_logger_ptr->GetLogLevel() != current_log_level) {
-        bundle->qnn_logger_ptr = std::make_unique<QnnLogger>(
-            bundle->implementation.get(), LoggingCallback, current_log_level);
-      }
-      QNN_EXECUTORCH_LOG_INFO(
-          "Use cached backend bundle for current backend: %s",
-          EnumNameQnnExecuTorchBackendType(backend_type));
-      return Error::Ok;
+    bundle = it->second;
+    if (bundle->qnn_logger_ptr->GetLogLevel() != current_log_level) {
+      QNN_EXECUTORCH_LOG_WARN(
+          "Keeping existing QNN logger level %d while reusing backend bundle; requested level is %d",
+          static_cast<int>(bundle->qnn_logger_ptr->GetLogLevel()),
+          static_cast<int>(current_log_level));
     }
+    QNN_EXECUTORCH_LOG_INFO(
+        "Use process-lifetime backend bundle for current backend: %s",
+        EnumNameQnnExecuTorchBackendType(backend_type));
+    return Error::Ok;
   }
 
   QNN_EXECUTORCH_LOG_INFO("Creating new backend bundle.");
@@ -140,23 +137,9 @@ Error QnnBackendUnifiedRegistry::GetOrCreateBackendBundle(
   bundle->qnn_logger_ptr = std::move(logger);
   bundle->qnn_backend_ptr = std::move(backend);
   bundle->qnn_device_ptr = std::move(device);
-  qnn_backend_bundles_map_.emplace(
-      backend_type, bundle); // Store weak_ptr to the bundle
+  qnn_backend_bundles_map_.emplace(backend_type, bundle);
 
   return Error::Ok;
-}
-
-void QnnBackendUnifiedRegistry::CleanupExpired() {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  for (auto it = qnn_backend_bundles_map_.begin();
-       it != qnn_backend_bundles_map_.end();) {
-    if (it->second.expired()) {
-      it = qnn_backend_bundles_map_.erase(it);
-    } else {
-      ++it;
-    }
-  }
 }
 
 } // namespace qnn

@@ -277,7 +277,31 @@ void KVManager<T>::update_cache(
       "Current AR length (%d) is not matched with target AR length (%d). Please rearrange cache first.",
       cur_ar_len_,
       ar_len);
-  for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+  update_cache_range(
+      ar_len, n_past, n_update, selected, 0, metadata_.num_layers);
+}
+
+template <typename T>
+void KVManager<T>::update_cache_range(
+    int32_t ar_len,
+    int32_t n_past,
+    int32_t n_update,
+    const std::vector<bool>& selected,
+    int32_t layer_begin,
+    int32_t layer_end_exclusive) {
+  ET_CHECK_MSG(
+      cur_ar_len_ == ar_len,
+      "Current AR length (%d) is not matched with target AR length (%d). Please rearrange cache first.",
+      cur_ar_len_,
+      ar_len);
+  ET_CHECK_MSG(
+      layer_begin >= 0 && layer_begin <= layer_end_exclusive &&
+          layer_end_exclusive <= metadata_.num_layers,
+      "Invalid KV layer range [%d, %d) for %lld layers",
+      layer_begin,
+      layer_end_exclusive,
+      static_cast<long long>(metadata_.num_layers));
+  for (int layer = layer_begin; layer < layer_end_exclusive; ++layer) {
     update_key(k_cache_[layer], n_past, n_update, selected);
     update_value(v_cache_[layer], n_past, n_update, selected);
   }

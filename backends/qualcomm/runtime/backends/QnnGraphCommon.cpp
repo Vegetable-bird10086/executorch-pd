@@ -6,11 +6,21 @@
  * LICENSE file in the root directory of this source tree.
  */
 #include <executorch/backends/qualcomm/runtime/backends/QnnGraphCommon.h>
+
+#include <chrono>
 namespace executorch {
 namespace backends {
 namespace qnn {
 
 using executorch::runtime::Error;
+
+namespace {
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(const Clock::time_point& start) {
+  return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+} // namespace
 
 Error QnnGraph::Configure(const std::string& graph_name) {
   // create qnn backend
@@ -31,6 +41,7 @@ Error QnnGraph::Configure(const std::string& graph_name) {
   Qnn_GraphHandle_t graph_handle = nullptr;
   if (context_->GetCacheState() == QnnBackendCache::DESERIALIZE) {
     // retrieve QNN Graph
+    const auto graph_retrieve_start = Clock::now();
     error = qnn_interface.qnn_graph_retrieve(
         context_->GetHandle(), graph_name.c_str(), &graph_handle);
     if (error != QNN_SUCCESS) {
@@ -41,6 +52,10 @@ Error QnnGraph::Configure(const std::string& graph_name) {
           QNN_GET_ERROR_CODE(error));
       return Error::Internal;
     }
+    QNN_EXECUTORCH_LOG_INFO(
+        "QNN graph timing: graph=%s graph_retrieve_ms=%.3f",
+        graph_name.c_str(),
+        elapsed_ms(graph_retrieve_start));
   } else if (
       context_->GetCacheState() == QnnBackendCache::SERIALIZE ||
       context_->GetCacheState() == QnnBackendCache::MULTI_GRAPH) {

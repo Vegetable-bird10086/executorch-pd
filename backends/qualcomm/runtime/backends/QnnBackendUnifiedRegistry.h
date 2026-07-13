@@ -51,16 +51,13 @@ class QnnBackendUnifiedRegistry {
   // backend_type. Each bundle contains QnnImplentation, QnnLogger, QnnBackend,
   // and QnnDevice objects for a specific backend type. The registry provides
   // methods to get or create backend bundles, ensuring that resources are
-  // properly managed and reused when possible. It also includes a cleanup
-  // mechanism to remove expired bundles.
+  // properly managed and reused for the process lifetime.
  public:
   static QnnBackendUnifiedRegistry& GetInstance();
 
   executorch::runtime::Error GetOrCreateBackendBundle(
       const QnnExecuTorchOptions* options,
       std::shared_ptr<QnnBackendBundle>& bundle);
-
-  void CleanupExpired();
 
  private:
   QnnBackendUnifiedRegistry();
@@ -97,9 +94,9 @@ class QnnBackendUnifiedRegistry {
     }
   }
 
-  // Stores the collection of shared resources, with backend_type being used as
-  // the key.
-  std::unordered_map<QnnExecuTorchBackendType, std::weak_ptr<QnnBackendBundle>>
+  // Keep backend/device/logger alive for the process lifetime. QnnManager owns
+  // contexts separately, so releasing one delegate never retains its context.
+  std::unordered_map<QnnExecuTorchBackendType, std::shared_ptr<QnnBackendBundle>>
       qnn_backend_bundles_map_;
 
   std::mutex mutex_; // Protects access to resources and ensures atomic
