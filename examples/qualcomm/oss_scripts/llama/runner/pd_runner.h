@@ -7,6 +7,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/separate_embed.h>
 #include <executorch/extension/module/module.h>
 #include <pytorch/tokenizers/tokenizer.h>
 
@@ -32,6 +33,10 @@ class PDPrefillRunner {
     int64_t head_dim{0};
     bool use_int64_token{false};
     CacheMode cache_mode{CacheMode::StaticCahce};
+    bool outputs_logits{true};
+    bool use_separate_embed{false};
+    std::string embedding_matrix_path;
+    bool resident_embedding{true};
   };
 
   struct RuntimeStats {
@@ -52,6 +57,10 @@ class PDPrefillRunner {
       bool prefill_qwen3_static_plan,
       int32_t prefill_static_aux_size,
       int32_t prefill_static_hidden_size,
+      bool prefill_outputs_logits,
+      bool separate_embed,
+      const std::string& embedding_matrix_path,
+      bool resident_embedding,
       StaticMetadata static_metadata,
       const std::string& decoder_model,
       const std::string& model_path,
@@ -71,6 +80,9 @@ class PDPrefillRunner {
   const RuntimeStats& last_runtime_stats() const;
   std::vector<DecoderRunner::PrefillShardRuntimeStats>
   prefill_shard_runtime_stats() const;
+  double prefill_qnn_backend_prewarm_ms() const;
+  bool prefill_qnn_backend_prewarmed() const;
+  void set_prefill_etdump_config(DecoderRunner::PrefillEtDumpConfig config);
 
   executorch::runtime::Error export_prefill_handoff(
       const std::string& prompt,
@@ -78,6 +90,15 @@ class PDPrefillRunner {
       int32_t seq_len,
       const std::string& export_dir,
       const std::string& kv_quant_attrs_path = "");
+
+  executorch::runtime::Error evaluate_wikitext_ppl(
+      const std::string& wikitext_path,
+      int32_t start_token,
+      int32_t max_eval_tokens,
+      float logits_scale,
+      int32_t logits_zero_point,
+      double* ppl_out,
+      int64_t* scored_tokens_out = nullptr);
 
  private:
   enum EvalMode {
@@ -92,9 +113,15 @@ class PDPrefillRunner {
   std::vector<std::string> prefill_shard_paths_;
   std::vector<std::string> prefill_shard_index_paths_;
   DecoderRunner::PrefillShardRebuildConfig prefill_shard_rebuild_;
+  DecoderRunner::PrefillEtDumpConfig prefill_etdump_config_;
   bool prefill_qwen3_static_plan_{false};
   int32_t prefill_static_aux_size_{64};
   int32_t prefill_static_hidden_size_{2048};
+  bool prefill_outputs_logits_{true};
+  bool separate_embed_{false};
+  std::string embedding_matrix_path_;
+  bool resident_embedding_{true};
+  SeparateEmbedding separate_embedding_;
   StaticMetadata static_metadata_;
   std::string model_path_;
   std::string tokenizer_path_;

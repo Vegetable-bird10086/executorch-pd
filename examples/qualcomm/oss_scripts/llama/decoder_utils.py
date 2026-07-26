@@ -114,6 +114,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         if self._use_kv_cache:
             kwargs["ar_len"] = self.ar_len
             kwargs["seq_mse_candidates"] = self.seq_mse_candidates
+            kwargs["generate_tokens"] = False
 
         all_logits = INFERENCE_REGISTRY[self._use_kv_cache](
             self.get_example_inputs,
@@ -675,6 +676,7 @@ def kv_inference(  # noqa: C901
     collect_logits=False,
     seq_mse_candidates=0,
     lookahead_config=None,
+    generate_tokens=True,
 ):
     is_multimodal = all(
         [
@@ -786,21 +788,21 @@ def kv_inference(  # noqa: C901
             total_token_list,
         )
 
-        # Phase 2: Generate tokens until the EOS token is generated or max_seq_len is reached.
-        # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
-        _generate(
-            inputs,
-            cur_pos,
-            module,
-            tokenizer,
-            tok_embedding,
-            ar_len,
-            max_seq_len,
-            k_caches,
-            v_caches,
-            total_token_list,
-            lookahead_config,
-        )
+        # Task calibration only needs logits for the supplied corpus tokens.
+        if generate_tokens:
+            _generate(
+                inputs,
+                cur_pos,
+                module,
+                tokenizer,
+                tok_embedding,
+                ar_len,
+                max_seq_len,
+                k_caches,
+                v_caches,
+                total_token_list,
+                lookahead_config,
+            )
 
     logging.info(f"kv inference result:\n{tokenizer.decode(total_token_list)}")
     if collect_logits:
@@ -907,6 +909,7 @@ def graph_module_inference(
     event_name: Optional[str] = None,
     seq_mse_candidates: int = 0,
     lookahead_config: Optional[Tuple[int]] = None,
+    generate_tokens: bool = True,
 ):
     """
     This function supports model execution from static nn.Module decoder model
@@ -922,6 +925,7 @@ def graph_module_inference(
         if use_kv_cache:
             kwargs["ar_len"] = ar_len
             kwargs["lookahead_config"] = lookahead_config
+            kwargs["generate_tokens"] = generate_tokens
 
         INFERENCE_REGISTRY[use_kv_cache](
             get_example_inputs,

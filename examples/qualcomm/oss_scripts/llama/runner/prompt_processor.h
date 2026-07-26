@@ -12,6 +12,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/separate_embed.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <memory>
 #include <string>
@@ -34,6 +35,12 @@ class PromptProcessor {
     bool use_int64_token;
     int sliding_window;
     CacheMode cache_mode;
+    bool outputs_logits{true};
+    bool use_separate_embed{false};
+    int32_t embedding_dim{0};
+    size_t embedding_row_bytes{0};
+    executorch::aten::ScalarType embedding_scalar_type{executorch::aten::ScalarType::Float};
+    const SeparateEmbedding* separate_embedding{nullptr};
   };
   PromptProcessor(
       DecoderRunner* decoder_runner,
@@ -65,6 +72,11 @@ class PromptProcessor {
   virtual void clear_all_logits();
 
   /**
+   * @brief Reserve storage before collecting logits from a long prompt.
+   */
+  virtual void reserve_all_logits(size_t elements);
+
+  /**
    * Prefill an LLM Module with the given text input.
    * @param prompt_tokens The text prompt tokens to the LLM Module. Encoded by
    * tokenizer.
@@ -86,11 +98,13 @@ class PromptProcessor {
    */
   inline const size_t total_prompt_processor_io_size_in_bytes() const {
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          window_attention_mask_.size + logits_.size;
+      return (metadata_.use_separate_embed ? input_embedding_.size : input_toks_.size) +
+          input_pos_.size + attention_mask_.size + window_attention_mask_.size +
+          (metadata_.outputs_logits ? logits_.size : 0);
     } else {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          logits_.size;
+      return (metadata_.use_separate_embed ? input_embedding_.size : input_toks_.size) +
+          input_pos_.size + attention_mask_.size +
+          (metadata_.outputs_logits ? logits_.size : 0);
     }
   }
 
@@ -119,6 +133,7 @@ class PromptProcessor {
 
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
+  TensorStruct<uint8_t> input_embedding_;
   TensorStruct<int32_t> input_pos_;
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;

@@ -155,6 +155,9 @@ class ETDumpGen : public ::executorch::runtime::EventTracer {
       EventTracerFilterBase* event_tracer_filter) override;
 
   Result<bool> set_debug_buffer(::executorch::runtime::Span<uint8_t> buffer);
+  size_t get_debug_buffer_used_bytes() const {
+    return buffer_data_sink_.get_used_bytes();
+  }
   void set_data_sink(DataSinkBase* data_sink);
   ETDumpResult get_etdump_data();
   size_t get_num_blocks();

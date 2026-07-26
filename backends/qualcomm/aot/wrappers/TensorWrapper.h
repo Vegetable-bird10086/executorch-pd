@@ -97,6 +97,10 @@ class TensorWrapper {
     return QNN_TENSOR_VER_PTR(tensor_)->quantizeParams;
   }
 
+  executorch::runtime::Error SetScaleOffsetQuantizeParams(
+      float scale,
+      std::int32_t offset);
+
   const std::string& GetName() const {
     return qnn_tensor_name_;
   };

@@ -29,6 +29,39 @@
 #include <vector>
 
 namespace example {
+
+PteRebuildBuffer::PteRebuildBuffer(size_t capacity) {
+  resize_uninitialized(capacity);
+}
+
+void PteRebuildBuffer::resize_uninitialized(size_t size) {
+  if (size > capacity_) {
+    bytes_.reset(size == 0 ? nullptr : new uint8_t[size]);
+    capacity_ = size;
+  }
+  size_ = size;
+}
+
+uint8_t* PteRebuildBuffer::data() {
+  return bytes_.get();
+}
+
+const uint8_t* PteRebuildBuffer::data() const {
+  return bytes_.get();
+}
+
+size_t PteRebuildBuffer::size() const {
+  return size_;
+}
+
+size_t PteRebuildBuffer::capacity() const {
+  return capacity_;
+}
+
+bool PteRebuildBuffer::empty() const {
+  return size_ == 0;
+}
+
 namespace {
 
 using json = nlohmann::json;
@@ -94,6 +127,11 @@ enum class GgufTensorType : uint32_t {
   F16 = 1,
   I2 = 37,
   GPTQ2_32 = 42,
+  // Keep these values in sync with the custom GGML GGUF tensor types.  The
+  // source group controls GPTQ scale/zero metadata; QNN's destination layout
+  // remains GS32 for every source group size.
+  GPTQ2_64 = 44,
+  GPTQ2_128 = 45,
 };
 
 struct RebuildRecord {
@@ -357,10 +395,13 @@ struct DirectTmacI2TensorView {
   bool has_explicit_zeros{false};
 };
 
-struct DirectGptq2_32TensorView {
+struct DirectGptq2TensorView {
   size_t rows{0};
   size_t cols{0};
-  size_t num_groups{0};
+  size_t source_group_size{0};
+  size_t source_group_code_bytes{0};
+  size_t source_group_bytes{0};
+  size_t num_source_groups{0};
   const uint8_t* data{nullptr};
 };
 
@@ -905,14 +946,20 @@ uint8_t decode_tmac_i2_qzero(
       kBits));
 }
 
-uint8_t decode_gptq2_32_qzero(const uint8_t* group_ptr) {
+uint8_t decode_gptq2_qzero_metadata(const uint8_t* metadata) {
   static constexpr size_t kBits = 2;
   const float scale =
-      std::max(read_f16_le_as_f32(group_ptr + 8), 1.0e-4f);
-  const float zero_bias = read_f16_le_as_f32(group_ptr + 10);
+      std::max(read_f16_le_as_f32(metadata), 1.0e-4f);
+  const float zero_bias = read_f16_le_as_f32(metadata + 2);
   return static_cast<uint8_t>(rounded_zero_point(
       static_cast<int16_t>(std::lround(zero_bias / scale)),
       kBits));
+}
+
+uint8_t decode_gptq2_qzero(
+    const uint8_t* group_ptr,
+    size_t source_group_code_bytes) {
+  return decode_gptq2_qzero_metadata(group_ptr + source_group_code_bytes);
 }
 
 DirectTmacI2TensorView parse_direct_tmac_i2_tensor(const GgufTensorInfo& tensor) {
@@ -944,28 +991,83 @@ DirectTmacI2TensorView parse_direct_tmac_i2_tensor(const GgufTensorInfo& tensor)
   return out;
 }
 
-DirectGptq2_32TensorView parse_direct_gptq2_32_tensor(
-    const GgufTensorInfo& tensor) {
-  DirectGptq2_32TensorView out;
-  if (tensor.tensor_type != GgufTensorType::GPTQ2_32 || tensor.shape.size() != 2) {
+GgufTensorType gptq2_tensor_type_for_group_size(size_t group_size) {
+  switch (group_size) {
+    case 32:
+      return GgufTensorType::GPTQ2_32;
+    case 64:
+      return GgufTensorType::GPTQ2_64;
+    case 128:
+      return GgufTensorType::GPTQ2_128;
+    default:
+      throw std::runtime_error(
+          "Unsupported GPTQ INT2 GGUF group size; supported values are 32, 64, and 128");
+  }
+}
+
+DirectGptq2TensorView parse_direct_gptq2_tensor(
+    const GgufTensorInfo& tensor,
+    size_t source_group_size) {
+  DirectGptq2TensorView out;
+  if (source_group_size == 0 || source_group_size % 32 != 0 ||
+      tensor.tensor_type != gptq2_tensor_type_for_group_size(source_group_size) ||
+      tensor.shape.size() != 2) {
     throw std::runtime_error(
-        "Unsupported GGUF tensor type for GPTQ2_32 rebuild");
+        "Unsupported GGUF tensor type or non-GS32-aligned source group size for "
+        "GPTQ INT2 rebuild");
   }
 
+  if (tensor.shape[0] <= 0 || tensor.shape[1] <= 0) {
+    throw std::runtime_error("GPTQ INT2 GGUF dimensions must be positive");
+  }
   out.cols = static_cast<size_t>(tensor.shape[0]);
   out.rows = static_cast<size_t>(tensor.shape[1]);
-  if (out.cols % 32 != 0) {
-    throw std::runtime_error("GPTQ2_32 GGUF tensor cols must be divisible by 32");
+  if (out.cols % source_group_size != 0 || out.rows % 64 != 0) {
+    throw std::runtime_error(
+        "GPTQ INT2 GGUF dimensions must divide into source groups and GS32 row blocks");
   }
-  out.num_groups = out.cols / 32;
-
-  const size_t expected_bytes = out.rows * out.num_groups * 12;
+  out.source_group_size = source_group_size;
+  out.source_group_code_bytes = source_group_size / 4;
+  out.source_group_bytes = out.source_group_code_bytes + 4;
+  out.num_source_groups = out.cols / source_group_size;
+  if (out.rows > std::numeric_limits<size_t>::max() / out.num_source_groups ||
+      out.rows * out.num_source_groups >
+          std::numeric_limits<size_t>::max() / out.source_group_bytes) {
+    throw std::runtime_error("GPTQ INT2 GGUF tensor payload size overflow");
+  }
+  const size_t expected_bytes =
+      out.rows * out.num_source_groups * out.source_group_bytes;
   if (tensor.num_bytes != expected_bytes) {
-    throw std::runtime_error("Unexpected GPTQ2_32 GGUF tensor payload size");
+    throw std::runtime_error("Unexpected GPTQ INT2 GGUF tensor payload size");
   }
 
   out.data = tensor.data;
   return out;
+}
+
+size_t gptq2_source_block_bytes(const DirectGptq2TensorView& tensor) {
+  static constexpr size_t kRowsPerBlock = 64;
+  if (tensor.num_source_groups == 0 ||
+      kRowsPerBlock > std::numeric_limits<size_t>::max() /
+              tensor.num_source_groups ||
+      kRowsPerBlock * tensor.num_source_groups >
+              std::numeric_limits<size_t>::max() / tensor.source_group_bytes) {
+    throw std::runtime_error("GPTQ INT2 source block size overflow");
+  }
+  return kRowsPerBlock * tensor.num_source_groups * tensor.source_group_bytes;
+}
+
+size_t gptq2_source_block_offset(
+    const DirectGptq2TensorView& tensor,
+    size_t block_index) {
+  if (block_index >= tensor.rows / 64) {
+    throw std::runtime_error("GPTQ INT2 source block index is out of range");
+  }
+  const size_t block_bytes = gptq2_source_block_bytes(tensor);
+  if (block_index > std::numeric_limits<size_t>::max() / block_bytes) {
+    throw std::runtime_error("GPTQ INT2 source block offset overflow");
+  }
+  return block_index * block_bytes;
 }
 
 void build_tmac_i2_qzeros_cache(
@@ -985,16 +1087,19 @@ void build_tmac_i2_qzeros_cache(
   }
 }
 
-void build_gptq2_32_qzeros_cache(
-    const DirectGptq2_32TensorView& tensor,
-    size_t row_start,
+void build_gptq2_qzeros_cache(
+    const uint8_t* block_data,
+    size_t num_source_groups,
+    size_t source_group_code_bytes,
+    size_t source_group_bytes,
     std::vector<uint8_t>* cache) {
-  cache->assign(tensor.num_groups * 64, 0);
-  for (size_t group = 0; group < tensor.num_groups; ++group) {
+  cache->assign(num_source_groups * 64, 0);
+  for (size_t group = 0; group < num_source_groups; ++group) {
     for (size_t row = 0; row < 64; ++row) {
       const uint8_t* group_ptr =
-          tensor.data + ((row_start + row) * tensor.num_groups + group) * 12;
-      (*cache)[group * 64 + row] = decode_gptq2_32_qzero(group_ptr);
+          block_data + (row * num_source_groups + group) * source_group_bytes;
+      (*cache)[group * 64 + row] =
+          decode_gptq2_qzero(group_ptr, source_group_code_bytes);
     }
   }
 }
@@ -1101,14 +1206,22 @@ void write_int4_block_from_tmac_i2_direct(
   }
 }
 
-void write_int4_block_from_gptq2_32_direct(
-    const DirectGptq2_32TensorView& tensor,
-    int block_id,
+void write_int4_block_from_gptq2_block(
+    const uint8_t* block_data,
+    size_t cols,
+    size_t source_group_size,
+    size_t num_source_groups,
+    size_t source_group_code_bytes,
+    size_t source_group_bytes,
     uint8_t* dst) {
-  const size_t row_start = static_cast<size_t>(block_id) * 64;
-  const size_t tile_cols = tensor.cols / 32;
+  const size_t tile_cols = cols / 32;
   std::vector<uint8_t> qzeros_cache;
-  build_gptq2_32_qzeros_cache(tensor, row_start, &qzeros_cache);
+  build_gptq2_qzeros_cache(
+      block_data,
+      num_source_groups,
+      source_group_code_bytes,
+      source_group_bytes,
+      &qzeros_cache);
 
   for (size_t bc = 0; bc < tile_cols; ++bc) {
     const size_t c0 = bc * 32;
@@ -1116,17 +1229,18 @@ void write_int4_block_from_gptq2_32_direct(
       const size_t r0 = br * 32;
       for (size_t tile_bc = 0; tile_bc < 4; ++tile_bc) {
         const size_t cc0 = c0 + tile_bc * 8;
-        const size_t group = cc0 / 32;
-        const size_t group_qbyte_offset = (cc0 % 32) / 4;
+        const size_t source_group = cc0 / source_group_size;
+        const size_t group_qbyte_offset = (cc0 % source_group_size) / 4;
         for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
           const size_t rr0 = r0 + tile_br * 8;
           for (size_t r = 0; r < 8; ++r) {
-            const size_t row = row_start + rr0 + r;
+            const size_t row = rr0 + r;
             const uint8_t* group_ptr =
-                tensor.data + (row * tensor.num_groups + group) * 12;
+                block_data +
+                (row * num_source_groups + source_group) * source_group_bytes;
             const uint8_t qbyte0 = group_ptr[group_qbyte_offset + 0];
             const uint8_t qbyte1 = group_ptr[group_qbyte_offset + 1];
-            const uint8_t zp = qzeros_cache[group * 64 + rr0 + r];
+            const uint8_t zp = qzeros_cache[source_group * 64 + rr0 + r];
             const uint32_t packed_row =
                 pack_gs32_int4_from_qbytes(qbyte0, qbyte1, zp);
             std::memcpy(dst, &packed_row, sizeof(packed_row));
@@ -1136,6 +1250,138 @@ void write_int4_block_from_gptq2_32_direct(
       }
     }
   }
+}
+
+void relayout_gptq2_block_for_gs32_source(
+    const uint8_t* source_block,
+    size_t cols,
+    size_t source_group_size,
+    size_t num_source_groups,
+    size_t source_group_code_bytes,
+    size_t source_group_bytes,
+    uint8_t* gs32_source_block) {
+  static constexpr size_t kRowsPerBlock = 64;
+  static constexpr size_t kTilesPerGroup = 4;
+  static constexpr size_t kQbytesPerTile = 2;
+  static constexpr size_t kMetadataBytesPerRow = 4;
+  const size_t qbytes_per_group =
+      kRowsPerBlock * kTilesPerGroup * kQbytesPerTile;
+  const size_t metadata_per_group = kRowsPerBlock * kMetadataBytesPerRow;
+  const size_t bytes_per_group = qbytes_per_group + metadata_per_group;
+  const size_t num_qnn_groups = cols / 32;
+  if (cols % 32 != 0 || cols / source_group_size != num_source_groups ||
+      cols > std::numeric_limits<size_t>::max() / 24) {
+    throw std::runtime_error("Invalid GPTQ INT2 GS32 source relayout dimensions");
+  }
+
+  for (size_t bc = 0; bc < num_qnn_groups; ++bc) {
+    uint8_t* group_dst = gs32_source_block + bc * bytes_per_group;
+    uint8_t* qbytes_dst = group_dst;
+    const size_t c0 = bc * 32;
+    const size_t source_group = c0 / source_group_size;
+    const size_t source_qbyte_offset = (c0 % source_group_size) / 4;
+    size_t qbytes_offset = 0;
+    for (size_t br = 0; br < 2; ++br) {
+      const size_t r0 = br * 32;
+      for (size_t tile_bc = 0; tile_bc < kTilesPerGroup; ++tile_bc) {
+        const size_t group_qbyte_offset = tile_bc * kQbytesPerTile;
+        for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
+          const size_t rr0 = r0 + tile_br * 8;
+          for (size_t r = 0; r < 8; ++r) {
+            const uint8_t* group_ptr = source_block +
+                ((rr0 + r) * num_source_groups + source_group) * source_group_bytes;
+            std::memcpy(
+                qbytes_dst + qbytes_offset,
+                group_ptr + source_qbyte_offset + group_qbyte_offset,
+                kQbytesPerTile);
+            qbytes_offset += kQbytesPerTile;
+          }
+        }
+      }
+    }
+    uint8_t* metadata_dst = group_dst + qbytes_per_group;
+    for (size_t row = 0; row < kRowsPerBlock; ++row) {
+      const uint8_t* group_ptr = source_block +
+          (row * num_source_groups + source_group) * source_group_bytes;
+      std::memcpy(
+          metadata_dst + row * kMetadataBytesPerRow,
+          group_ptr + source_group_code_bytes,
+          kMetadataBytesPerRow);
+    }
+  }
+}
+
+void write_int4_block_from_gptq2_gs32_source(
+    const uint8_t* gs32_source_block,
+    size_t cols,
+    size_t num_qnn_groups,
+    uint8_t* dst) {
+  static constexpr size_t kRowsPerBlock = 64;
+  static constexpr size_t kTilesPerGroup = 4;
+  static constexpr size_t kQbytesPerTile = 2;
+  static constexpr size_t kMetadataBytesPerRow = 4;
+  const size_t qbytes_per_group =
+      kRowsPerBlock * kTilesPerGroup * kQbytesPerTile;
+  const size_t metadata_per_group = kRowsPerBlock * kMetadataBytesPerRow;
+  const size_t bytes_per_group = qbytes_per_group + metadata_per_group;
+  if (cols % 32 != 0 || cols / 32 != num_qnn_groups ||
+      cols > std::numeric_limits<size_t>::max() / 24) {
+    throw std::runtime_error("Invalid GPTQ INT2 GS32 source dimensions");
+  }
+
+  std::vector<uint8_t> qzeros_cache;
+  qzeros_cache.assign(num_qnn_groups * kRowsPerBlock, 0);
+  for (size_t bc = 0; bc < num_qnn_groups; ++bc) {
+    const uint8_t* metadata =
+        gs32_source_block + bc * bytes_per_group + qbytes_per_group;
+    for (size_t row = 0; row < kRowsPerBlock; ++row) {
+      qzeros_cache[bc * kRowsPerBlock + row] =
+          decode_gptq2_qzero_metadata(
+              metadata + row * kMetadataBytesPerRow);
+    }
+  }
+
+  for (size_t bc = 0; bc < num_qnn_groups; ++bc) {
+    const uint8_t* qbytes = gs32_source_block + bc * bytes_per_group;
+    size_t qbytes_offset = 0;
+    for (size_t br = 0; br < 2; ++br) {
+      const size_t r0 = br * 32;
+      for (size_t tile_bc = 0; tile_bc < kTilesPerGroup; ++tile_bc) {
+        for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
+          const size_t rr0 = r0 + tile_br * 8;
+          for (size_t r = 0; r < 8; ++r) {
+            const uint8_t qbyte0 = qbytes[qbytes_offset + 0];
+            const uint8_t qbyte1 = qbytes[qbytes_offset + 1];
+            qbytes_offset += kQbytesPerTile;
+            const uint8_t zp = qzeros_cache[bc * kRowsPerBlock + rr0 + r];
+            const uint32_t packed_row =
+                pack_gs32_int4_from_qbytes(qbyte0, qbyte1, zp);
+            std::memcpy(dst, &packed_row, sizeof(packed_row));
+            dst += sizeof(packed_row);
+          }
+        }
+      }
+    }
+  }
+}
+
+void write_int4_block_from_gptq2_direct(
+    const DirectGptq2TensorView& tensor,
+    int block_id,
+    uint8_t* dst) {
+  if (block_id < 0) {
+    throw std::runtime_error("GPTQ INT2 source block index is negative");
+  }
+  const size_t source_offset =
+      gptq2_source_block_offset(tensor, static_cast<size_t>(block_id));
+  write_int4_block_from_gptq2_block(
+      tensor.data + source_offset,
+      tensor.cols,
+      tensor.source_group_size,
+      tensor.num_source_groups,
+      tensor.source_group_code_bytes,
+      tensor.source_group_bytes,
+      dst);
 }
 
 PackedTmacI2Tensor pack_tmac_i2_tensor(const GgufTensorInfo& tensor) {
@@ -1416,6 +1662,63 @@ void write_int4_block_from_tmac_i2(
 }
 
 
+void build_specialized_fastpath_tensor_contexts(
+    const SafeTensorsView& checkpoint,
+    std::vector<SpecializedTensorContext>* tensor_contexts) {
+  tensor_contexts->clear();
+  tensor_contexts->reserve(1 + 28 * kForwardTargetOps.size());
+
+  SpecializedTensorContext output_ctx;
+  const auto output_it = checkpoint.tensors.find("lm_head.qweight");
+  if (output_it != checkpoint.tensors.end()) {
+    output_ctx.qweight = &output_it->second;
+    output_ctx.packed_cols = static_cast<size_t>(output_ctx.qweight->shape[1]);
+    output_ctx.cols = static_cast<size_t>(output_ctx.qweight->shape[0]) * 4;
+    output_ctx.block_count = block_count_from_qweight(*output_ctx.qweight);
+  }
+  tensor_contexts->push_back(output_ctx);
+
+  for (int layer_id = 0; layer_id < 28; ++layer_id) {
+    for (size_t op_id = 0; op_id < kForwardTargetOps.size(); ++op_id) {
+      SpecializedTensorContext ctx;
+      const std::string base =
+          "model.layers." + std::to_string(layer_id) + "." +
+          std::string(kForwardTargetOps[op_id]);
+      ctx.qweight = &require_tensor(checkpoint, base + ".qweight");
+      ctx.qzeros = &require_tensor(checkpoint, base + ".qzeros");
+      ctx.packed_cols = static_cast<size_t>(ctx.qweight->shape[1]);
+      ctx.cols = static_cast<size_t>(ctx.qweight->shape[0]) * 16;
+      ctx.block_count = block_count_from_qweight(*ctx.qweight);
+      ctx.num_groups = static_cast<size_t>(ctx.qzeros->shape[0]);
+      ctx.qzeros_packed_cols = static_cast<size_t>(ctx.qzeros->shape[1]);
+      tensor_contexts->push_back(ctx);
+    }
+  }
+}
+
+void build_specialized_fastpath_records(
+    const std::vector<SpecializedTensorContext>& tensor_contexts,
+    const std::vector<const RebuildRecord*>& selected_records,
+    std::vector<SpecializedFastPathRecord>* records) {
+  records->clear();
+  records->reserve(selected_records.size());
+  for (const auto* rec : selected_records) {
+    if (rec->weight_id.kind == kWeightKindOutputConv) {
+      if (tensor_contexts.empty() || tensor_contexts[0].qweight == nullptr) {
+        throw std::runtime_error("QAT checkpoint is missing lm_head.qweight");
+      }
+      records->push_back(
+          SpecializedFastPathRecord{&tensor_contexts[0], true, rec->block_id});
+      continue;
+    }
+    const size_t ctx_index = 1 +
+        static_cast<size_t>(rec->weight_id.layer_id) * kForwardTargetOps.size() +
+        rec->weight_id.op_id;
+    records->push_back(SpecializedFastPathRecord{
+        &tensor_contexts[ctx_index], false, rec->block_id});
+  }
+}
+
 bool try_build_specialized_fastpath_plan(
     const ParsedIndex& parsed_index,
     const std::vector<const RebuildRecord*>& selected_records,
@@ -1424,60 +1727,13 @@ bool try_build_specialized_fastpath_plan(
     int group_size,
     const std::string& qweight_mode,
     SpecializedFastPathPlan* plan) {
+  (void)parsed_index;
   (void)bits_hint;
   (void)group_size;
   (void)qweight_mode;
-
-  bool has_output_conv = false;
-  for (const auto* rec : selected_records) {
-    if (rec->weight_id.kind == kWeightKindOutputConv) {
-      has_output_conv = true;
-      break;
-    }
-  }
-
-  plan->tensor_contexts.clear();
-  plan->records.clear();
-  plan->tensor_contexts.reserve((has_output_conv ? 1 : 0) + 28 * kForwardTargetOps.size());
-  plan->records.reserve(selected_records.size());
-
-  size_t output_ctx_index = 0;
-  if (has_output_conv) {
-    SpecializedTensorContext output_ctx;
-    output_ctx.qweight = &require_tensor(checkpoint, "lm_head.qweight");
-    output_ctx.packed_cols = static_cast<size_t>(output_ctx.qweight->shape[1]);
-    output_ctx.cols = static_cast<size_t>(output_ctx.qweight->shape[0]) * 4;
-    output_ctx.block_count = block_count_from_qweight(*output_ctx.qweight);
-    plan->tensor_contexts.push_back(output_ctx);
-  }
-
-  for (int layer_id = 0; layer_id < 28; ++layer_id) {
-    for (size_t op_id = 0; op_id < kForwardTargetOps.size(); ++op_id) {
-      SpecializedTensorContext ctx;
-      const std::string base =
-          "model.layers." + std::to_string(layer_id) + "." + std::string(kForwardTargetOps[op_id]);
-      ctx.qweight = &require_tensor(checkpoint, base + ".qweight");
-      ctx.qzeros = &require_tensor(checkpoint, base + ".qzeros");
-      ctx.packed_cols = static_cast<size_t>(ctx.qweight->shape[1]);
-      ctx.cols = static_cast<size_t>(ctx.qweight->shape[0]) * 16;
-      ctx.block_count = block_count_from_qweight(*ctx.qweight);
-      ctx.num_groups = static_cast<size_t>(ctx.qzeros->shape[0]);
-      ctx.qzeros_packed_cols = static_cast<size_t>(ctx.qzeros->shape[1]);
-      plan->tensor_contexts.push_back(ctx);
-    }
-  }
-
-  for (const auto* rec : selected_records) {
-    if (rec->weight_id.kind == kWeightKindOutputConv) {
-      const auto& ctx = plan->tensor_contexts[output_ctx_index];
-      plan->records.push_back(SpecializedFastPathRecord{&ctx, true, rec->block_id});
-      continue;
-    }
-    const size_t ctx_index = (has_output_conv ? 1 : 0) +
-        static_cast<size_t>(rec->weight_id.layer_id) * kForwardTargetOps.size() + rec->weight_id.op_id;
-    const auto& ctx = plan->tensor_contexts[ctx_index];
-    plan->records.push_back(SpecializedFastPathRecord{&ctx, false, rec->block_id});
-  }
+  build_specialized_fastpath_tensor_contexts(checkpoint, &plan->tensor_contexts);
+  build_specialized_fastpath_records(
+      plan->tensor_contexts, selected_records, &plan->records);
   return true;
 }
 
@@ -1594,7 +1850,16 @@ PteRebuildResult rebuild_pte_from_tmac_gguf_index(
     const auto& rec = *rec_ptr;
     const size_t insert_at = static_cast<size_t>(rec.source_offset);
     const size_t rec_len = static_cast<size_t>(rec.length);
+    if (insert_at > parsed_index.old_size ||
+        insert_at < dst_cursor ||
+        rec_len > parsed_index.old_size - insert_at) {
+      throw std::runtime_error("Invalid or overlapping PTE rebuild record range");
+    }
     const size_t keep_len = insert_at - dst_cursor;
+    if (src_ptr > stripped_pte.size() ||
+        keep_len > stripped_pte.size() - src_ptr) {
+      throw std::runtime_error("stripped.pte underflow while rebuilding static bytes");
+    }
     if (keep_len > 0) {
       std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, keep_len);
       src_ptr += keep_len;
@@ -1645,7 +1910,7 @@ PteRebuildResult rebuild_pte_from_gguf_index(
   auto rebuilt = std::make_shared<std::vector<uint8_t>>(parsed_index.old_size);
 
   std::string current_tensor_name;
-  DirectGptq2_32TensorView current_tensor;
+  DirectGptq2TensorView current_tensor;
   bool have_current_tensor = false;
 
   size_t src_ptr = 0;
@@ -1654,7 +1919,16 @@ PteRebuildResult rebuild_pte_from_gguf_index(
     const auto& rec = *rec_ptr;
     const size_t insert_at = static_cast<size_t>(rec.source_offset);
     const size_t rec_len = static_cast<size_t>(rec.length);
+    if (insert_at > parsed_index.old_size ||
+        insert_at < dst_cursor ||
+        rec_len > parsed_index.old_size - insert_at) {
+      throw std::runtime_error("Invalid or overlapping PTE rebuild record range");
+    }
     const size_t keep_len = insert_at - dst_cursor;
+    if (src_ptr > stripped_pte.size() ||
+        keep_len > stripped_pte.size() - src_ptr) {
+      throw std::runtime_error("stripped.pte underflow while rebuilding static bytes");
+    }
     if (keep_len > 0) {
       std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, keep_len);
       src_ptr += keep_len;
@@ -1662,18 +1936,19 @@ PteRebuildResult rebuild_pte_from_gguf_index(
 
     if (rec.weight_id.kind == kWeightKindOutputConv) {
       throw std::runtime_error(
-          "GGUF-backed rebuild does not support output.conv for GPTQ2_32 models");
+          "GGUF-backed rebuild does not support output.conv for GPTQ INT2 models");
     }
 
     const std::string tensor_name = gguf_tensor_name_from_record(rec);
     if (!have_current_tensor || current_tensor_name != tensor_name) {
       current_tensor =
-          parse_direct_gptq2_32_tensor(require_gguf_tensor(gguf, tensor_name));
+          parse_direct_gptq2_tensor(
+              require_gguf_tensor(gguf, tensor_name), 32);
       current_tensor_name = tensor_name;
       have_current_tensor = true;
     }
 
-    write_int4_block_from_gptq2_32_direct(
+    write_int4_block_from_gptq2_direct(
         current_tensor,
         rec.block_id,
         rebuilt->data() + insert_at);
@@ -1694,6 +1969,405 @@ PteRebuildResult rebuild_pte_from_gguf_index(
 }
 
 } // namespace
+
+struct PteQatRebuildContext::Impl {
+  std::shared_ptr<const std::vector<uint8_t>> checkpoint_bytes;
+  SafeTensorsView checkpoint;
+  std::vector<SpecializedTensorContext> tensor_contexts;
+};
+
+struct PteQatShardRecipe::Impl {
+  std::shared_ptr<const PteQatRebuildContext::Impl> checkpoint_context;
+  ParsedIndex parsed_index;
+  std::vector<const RebuildRecord*> selected_records;
+  SpecializedFastPathPlan specialized_plan;
+  size_t materialized_weight_bytes{0};
+};
+
+struct PteGgufRebuildContext::Impl {
+  std::shared_ptr<const std::vector<uint8_t>> gguf_bytes;
+  GgufView gguf;
+};
+
+struct PteGgufShardRecipe::Impl {
+  std::shared_ptr<const PteGgufRebuildContext::Impl> gguf_context;
+  ParsedIndex parsed_index;
+  std::vector<const RebuildRecord*> selected_records;
+  std::vector<DirectGptq2TensorView> record_tensors;
+  size_t source_group_size{0};
+  size_t materialized_weight_bytes{0};
+  std::unique_ptr<uint8_t[]> relayout_blocks;
+  std::vector<size_t> relayout_block_offsets;
+  size_t relayout_bytes{0};
+  double relayout_ms{0.0};
+  PteGgufRecipeRelayoutKind relayout_kind{PteGgufRecipeRelayoutKind::None};
+  bool relayout_enabled{false};
+};
+
+std::shared_ptr<PteQatRebuildContext> create_pte_qat_rebuild_context(
+    const std::shared_ptr<std::vector<uint8_t>>& checkpoint_bytes) {
+  if (!checkpoint_bytes || checkpoint_bytes->empty()) {
+    throw std::runtime_error("QAT rebuild checkpoint bytes are empty");
+  }
+
+  auto context = std::make_shared<PteQatRebuildContext>();
+  auto impl = std::make_shared<PteQatRebuildContext::Impl>();
+  impl->checkpoint_bytes = checkpoint_bytes;
+  impl->checkpoint = parse_safetensors(*impl->checkpoint_bytes);
+  build_specialized_fastpath_tensor_contexts(
+      impl->checkpoint, &impl->tensor_contexts);
+  context->impl_ = std::move(impl);
+  return context;
+}
+
+std::shared_ptr<PteQatShardRecipe> prepare_pte_qat_shard_recipe(
+    const std::shared_ptr<PteQatRebuildContext>& context,
+    const std::shared_ptr<std::vector<uint8_t>>& index_bytes,
+    int bits_hint,
+    int group_size,
+    const std::string& qweight_mode) {
+  if (!context || !context->impl_) {
+    throw std::runtime_error("QAT rebuild context is not initialized");
+  }
+  if (!index_bytes || index_bytes->empty()) {
+    throw std::runtime_error("QAT rebuild index bytes are empty");
+  }
+
+  auto recipe = std::make_shared<PteQatShardRecipe>();
+  auto impl = std::make_shared<PteQatShardRecipe::Impl>();
+  impl->checkpoint_context = context->impl_;
+  impl->parsed_index = parse_binary_index(*index_bytes);
+  impl->selected_records = select_records_for_split(impl->parsed_index, -1);
+  (void)bits_hint;
+  (void)group_size;
+  (void)qweight_mode;
+  build_specialized_fastpath_records(
+      impl->checkpoint_context->tensor_contexts,
+      impl->selected_records,
+      &impl->specialized_plan.records);
+  impl->materialized_weight_bytes =
+      total_materialized_weight_bytes(impl->selected_records);
+  recipe->impl_ = std::move(impl);
+  return recipe;
+}
+
+PteRebuildResult rebuild_pte_from_stripped_checkpoint_recipe(
+    const std::vector<uint8_t>& stripped_pte,
+    const PteQatShardRecipe& recipe,
+    std::shared_ptr<PteRebuildBuffer> output_buffer) {
+  if (!recipe.impl_) {
+    throw std::runtime_error("QAT rebuild recipe is not initialized");
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  const auto& impl = *recipe.impl_;
+  const auto allocation_start = std::chrono::steady_clock::now();
+  if (!output_buffer) {
+    output_buffer = std::make_shared<PteRebuildBuffer>(impl.parsed_index.old_size);
+  } else {
+    output_buffer->resize_uninitialized(impl.parsed_index.old_size);
+  }
+  auto rebuilt = std::move(output_buffer);
+  const auto allocation_end = std::chrono::steady_clock::now();
+
+  size_t src_ptr = 0;
+  size_t dst_cursor = 0;
+  const auto copy_start = std::chrono::steady_clock::now();
+  for (const auto* rec_ptr : impl.selected_records) {
+    const auto& rec = *rec_ptr;
+    const size_t insert_at = static_cast<size_t>(rec.source_offset);
+    const size_t rec_len = static_cast<size_t>(rec.length);
+    if (insert_at > impl.parsed_index.old_size ||
+        insert_at < dst_cursor ||
+        rec_len > impl.parsed_index.old_size - insert_at) {
+      throw std::runtime_error("Invalid or overlapping PTE rebuild record range");
+    }
+    const size_t keep_len = insert_at - dst_cursor;
+    if (src_ptr > stripped_pte.size() ||
+        keep_len > stripped_pte.size() - src_ptr) {
+      throw std::runtime_error("stripped.pte underflow while rebuilding static bytes");
+    }
+    if (keep_len > 0) {
+      std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, keep_len);
+      src_ptr += keep_len;
+    }
+    dst_cursor = insert_at + rec_len;
+  }
+  const size_t tail_len = impl.parsed_index.old_size - dst_cursor;
+  if (src_ptr > stripped_pte.size() ||
+      tail_len > stripped_pte.size() - src_ptr) {
+    throw std::runtime_error("stripped.pte underflow while rebuilding tail bytes");
+  }
+  if (tail_len > 0) {
+    std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, tail_len);
+  }
+  const auto copy_end = std::chrono::steady_clock::now();
+
+  const auto materialization_start = std::chrono::steady_clock::now();
+  for (size_t record_index = 0; record_index < impl.selected_records.size(); ++record_index) {
+    const auto& rec = *impl.selected_records[record_index];
+    build_block_bytes_into_specialized(
+        impl.specialized_plan.records[record_index],
+        rebuilt->data() + static_cast<size_t>(rec.source_offset));
+  }
+  const auto materialization_end = std::chrono::steady_clock::now();
+  return PteRebuildResult{
+      nullptr,
+      std::chrono::duration<double, std::milli>(materialization_end - start).count(),
+      impl.selected_records.size(),
+      impl.materialized_weight_bytes,
+      true,
+      std::chrono::duration<double, std::milli>(allocation_end - allocation_start).count(),
+      std::chrono::duration<double, std::milli>(copy_end - copy_start).count(),
+      std::chrono::duration<double, std::milli>(materialization_end - materialization_start).count(),
+      std::move(rebuilt)};
+}
+
+size_t pte_rebuild_output_size(const PteQatShardRecipe& recipe) {
+  if (!recipe.impl_) {
+    throw std::runtime_error("QAT rebuild recipe is not initialized");
+  }
+  return recipe.impl_->parsed_index.old_size;
+}
+
+std::shared_ptr<PteGgufRebuildContext> create_pte_gguf_rebuild_context(
+    const std::shared_ptr<std::vector<uint8_t>>& gguf_bytes) {
+  if (!gguf_bytes || gguf_bytes->empty()) {
+    throw std::runtime_error("GGUF rebuild source bytes are empty");
+  }
+
+  auto context = std::make_shared<PteGgufRebuildContext>();
+  auto impl = std::make_shared<PteGgufRebuildContext::Impl>();
+  impl->gguf_bytes = gguf_bytes;
+  impl->gguf = parse_gguf(*impl->gguf_bytes);
+  context->impl_ = std::move(impl);
+  return context;
+}
+
+std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
+    const std::shared_ptr<PteGgufRebuildContext>& context,
+    const std::shared_ptr<std::vector<uint8_t>>& index_bytes,
+    int source_group_size,
+    PteGgufRecipeRelayoutKind relayout_kind) {
+  if (!context || !context->impl_) {
+    throw std::runtime_error("GGUF rebuild context is not initialized");
+  }
+  if (!index_bytes || index_bytes->empty()) {
+    throw std::runtime_error("GGUF rebuild index bytes are empty");
+  }
+
+  auto recipe = std::make_shared<PteGgufShardRecipe>();
+  auto impl = std::make_shared<PteGgufShardRecipe::Impl>();
+  impl->gguf_context = context->impl_;
+  if (source_group_size <= 0) {
+    throw std::runtime_error("GGUF GPTQ source group size must be positive");
+  }
+  impl->source_group_size = static_cast<size_t>(source_group_size);
+  impl->parsed_index = parse_binary_index(*index_bytes);
+  impl->selected_records = select_records_for_split(impl->parsed_index, -1);
+  impl->record_tensors.reserve(impl->selected_records.size());
+  std::unordered_map<std::string, DirectGptq2TensorView> tensor_cache;
+  for (const auto* rec : impl->selected_records) {
+    if (rec->weight_id.kind == kWeightKindOutputConv) {
+      throw std::runtime_error(
+          "GGUF-backed rebuild does not support output.conv for GPTQ INT2 models");
+    }
+    const std::string tensor_name = gguf_tensor_name_from_record(*rec);
+    auto tensor_it = tensor_cache.find(tensor_name);
+    if (tensor_it == tensor_cache.end()) {
+      tensor_it = tensor_cache.emplace(
+          tensor_name,
+          parse_direct_gptq2_tensor(
+              require_gguf_tensor(impl->gguf_context->gguf, tensor_name),
+              impl->source_group_size)).first;
+    }
+    impl->record_tensors.push_back(tensor_it->second);
+  }
+  impl->materialized_weight_bytes =
+      total_materialized_weight_bytes(impl->selected_records);
+  if (relayout_kind != PteGgufRecipeRelayoutKind::None) {
+    const auto relayout_start = std::chrono::steady_clock::now();
+    impl->relayout_block_offsets.reserve(impl->selected_records.size());
+    for (size_t record_index = 0;
+         record_index < impl->selected_records.size();
+         ++record_index) {
+      const auto& rec = *impl->selected_records[record_index];
+      const auto& tensor = impl->record_tensors[record_index];
+      if (rec.block_id < 0 || tensor.cols > std::numeric_limits<size_t>::max() / 24) {
+        throw std::runtime_error("Invalid GPTQ INT2 relayout block size");
+      }
+      const size_t block_index = static_cast<size_t>(rec.block_id);
+      if (block_index >= tensor.rows / 64) {
+        throw std::runtime_error("GPTQ INT2 relayout block index is out of range");
+      }
+      const size_t block_bytes = relayout_kind == PteGgufRecipeRelayoutKind::RawBlocks
+          ? gptq2_source_block_bytes(tensor)
+          : tensor.cols * 24;
+      if (impl->relayout_bytes > std::numeric_limits<size_t>::max() - block_bytes) {
+        throw std::runtime_error("GPTQ INT2 relayout byte count overflow");
+      }
+      impl->relayout_block_offsets.push_back(impl->relayout_bytes);
+      impl->relayout_bytes += block_bytes;
+    }
+    if (impl->relayout_bytes > 0) {
+      impl->relayout_blocks =
+          std::unique_ptr<uint8_t[]>(new uint8_t[impl->relayout_bytes]);
+    }
+    for (size_t record_index = 0;
+         record_index < impl->selected_records.size();
+         ++record_index) {
+      const auto& rec = *impl->selected_records[record_index];
+      const auto& tensor = impl->record_tensors[record_index];
+      const size_t source_offset =
+          gptq2_source_block_offset(tensor, static_cast<size_t>(rec.block_id));
+      uint8_t* relayout_block =
+          impl->relayout_blocks.get() + impl->relayout_block_offsets[record_index];
+      if (relayout_kind == PteGgufRecipeRelayoutKind::RawBlocks) {
+        // Preserve raw GPTQ bytes; zero-point handling and QNN packing stay in rebuild.
+        std::memcpy(
+            relayout_block,
+            tensor.data + source_offset,
+            gptq2_source_block_bytes(tensor));
+      } else if (relayout_kind == PteGgufRecipeRelayoutKind::Gs32Source) {
+        // Copy raw qbytes plus raw scale/zero_bias fields only. Rebuild still
+        // decodes qzero and invokes the same GS32 INT4 packing LUT.
+        relayout_gptq2_block_for_gs32_source(
+            tensor.data + source_offset,
+            tensor.cols,
+            tensor.source_group_size,
+            tensor.num_source_groups,
+            tensor.source_group_code_bytes,
+            tensor.source_group_bytes,
+            relayout_block);
+      } else {
+        throw std::runtime_error("Unsupported GPTQ INT2 relayout kind");
+      }
+    }
+    impl->relayout_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - relayout_start)
+            .count();
+    impl->relayout_kind = relayout_kind;
+    impl->relayout_enabled = true;
+  }
+  recipe->impl_ = std::move(impl);
+  return recipe;
+}
+
+PteGgufRecipeRelayoutStats pte_gguf_recipe_relayout_stats(
+    const PteGgufShardRecipe& recipe) {
+  if (!recipe.impl_) {
+    throw std::runtime_error("GGUF rebuild recipe is not initialized");
+  }
+  const auto& impl = *recipe.impl_;
+  return PteGgufRecipeRelayoutStats{
+      impl.relayout_kind,
+      impl.relayout_enabled,
+      impl.relayout_ms,
+      impl.relayout_enabled ? impl.relayout_bytes : 0};
+}
+
+PteRebuildResult rebuild_pte_from_stripped_gguf_recipe(
+    const std::vector<uint8_t>& stripped_pte,
+    const PteGgufShardRecipe& recipe,
+    std::shared_ptr<PteRebuildBuffer> output_buffer) {
+  if (!recipe.impl_) {
+    throw std::runtime_error("GGUF rebuild recipe is not initialized");
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  const auto& impl = *recipe.impl_;
+  const auto allocation_start = std::chrono::steady_clock::now();
+  if (!output_buffer) {
+    output_buffer = std::make_shared<PteRebuildBuffer>(impl.parsed_index.old_size);
+  } else {
+    output_buffer->resize_uninitialized(impl.parsed_index.old_size);
+  }
+  auto rebuilt = std::move(output_buffer);
+  const auto allocation_end = std::chrono::steady_clock::now();
+
+  size_t src_ptr = 0;
+  size_t dst_cursor = 0;
+  const auto copy_start = std::chrono::steady_clock::now();
+  for (const auto* rec_ptr : impl.selected_records) {
+    const auto& rec = *rec_ptr;
+    const size_t insert_at = static_cast<size_t>(rec.source_offset);
+    const size_t rec_len = static_cast<size_t>(rec.length);
+    if (insert_at > impl.parsed_index.old_size ||
+        insert_at < dst_cursor ||
+        rec_len > impl.parsed_index.old_size - insert_at) {
+      throw std::runtime_error("Invalid or overlapping PTE rebuild record range");
+    }
+    const size_t keep_len = insert_at - dst_cursor;
+    if (src_ptr > stripped_pte.size() ||
+        keep_len > stripped_pte.size() - src_ptr) {
+      throw std::runtime_error("stripped.pte underflow while rebuilding static bytes");
+    }
+    if (keep_len > 0) {
+      std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, keep_len);
+      src_ptr += keep_len;
+    }
+    dst_cursor = insert_at + rec_len;
+  }
+  const size_t tail_len = impl.parsed_index.old_size - dst_cursor;
+  if (src_ptr > stripped_pte.size() ||
+      tail_len > stripped_pte.size() - src_ptr) {
+    throw std::runtime_error("stripped.pte underflow while rebuilding tail bytes");
+  }
+  if (tail_len > 0) {
+    std::memcpy(rebuilt->data() + dst_cursor, stripped_pte.data() + src_ptr, tail_len);
+  }
+  const auto copy_end = std::chrono::steady_clock::now();
+
+  const auto materialization_start = std::chrono::steady_clock::now();
+  for (size_t record_index = 0;
+       record_index < impl.selected_records.size();
+       ++record_index) {
+    const auto& rec = *impl.selected_records[record_index];
+    const size_t destination_offset = static_cast<size_t>(rec.source_offset);
+    const uint8_t* relayout_block = impl.relayout_enabled
+        ? impl.relayout_blocks.get() + impl.relayout_block_offsets[record_index]
+        : nullptr;
+    if (impl.relayout_kind == PteGgufRecipeRelayoutKind::RawBlocks) {
+      const auto& tensor = impl.record_tensors[record_index];
+      write_int4_block_from_gptq2_block(
+          relayout_block,
+          tensor.cols,
+          tensor.source_group_size,
+          tensor.num_source_groups,
+          tensor.source_group_code_bytes,
+          tensor.source_group_bytes,
+          rebuilt->data() + destination_offset);
+    } else if (impl.relayout_kind == PteGgufRecipeRelayoutKind::Gs32Source) {
+      write_int4_block_from_gptq2_gs32_source(
+          relayout_block,
+          impl.record_tensors[record_index].cols,
+          impl.record_tensors[record_index].cols / 32,
+          rebuilt->data() + destination_offset);
+    } else {
+      write_int4_block_from_gptq2_direct(
+          impl.record_tensors[record_index], rec.block_id, rebuilt->data() + destination_offset);
+    }
+  }
+  const auto materialization_end = std::chrono::steady_clock::now();
+  return PteRebuildResult{
+      nullptr,
+      std::chrono::duration<double, std::milli>(materialization_end - start).count(),
+      impl.selected_records.size(),
+      impl.materialized_weight_bytes,
+      true,
+      std::chrono::duration<double, std::milli>(allocation_end - allocation_start).count(),
+      std::chrono::duration<double, std::milli>(copy_end - copy_start).count(),
+      std::chrono::duration<double, std::milli>(materialization_end - materialization_start).count(),
+      std::move(rebuilt)};
+}
+
+size_t pte_rebuild_output_size(const PteGgufShardRecipe& recipe) {
+  if (!recipe.impl_) {
+    throw std::runtime_error("GGUF rebuild recipe is not initialized");
+  }
+  return recipe.impl_->parsed_index.old_size;
+}
 
 PteRebuildResult rebuild_pte_from_stripped_checkpoint(
     const std::vector<uint8_t>& stripped_pte,

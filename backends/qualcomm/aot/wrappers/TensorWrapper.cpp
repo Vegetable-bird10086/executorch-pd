@@ -147,6 +147,25 @@ Error TensorWrapper::AllocateDataBuffer() {
   return Error::Ok;
 }
 
+Error TensorWrapper::SetScaleOffsetQuantizeParams(
+    float scale,
+    std::int32_t offset) {
+  if (QNN_TENSOR_VER_PTR(tensor_)
+          ->quantizeParams.quantizationEncoding !=
+      QNN_QUANTIZATION_ENCODING_SCALE_OFFSET) {
+    QNN_EXECUTORCH_LOG_WARN(
+        "Tensor %s does not use SCALE_OFFSET quantization",
+        qnn_tensor_name_.c_str());
+    return Error::InvalidArgument;
+  }
+
+  quantize_param_wrapper_ =
+      std::make_unique<ScaleOffsetQuantizeParamsWrapper>(scale, offset);
+  QNN_TENSOR_VER_PTR(tensor_)->quantizeParams =
+      quantize_param_wrapper_->CreateQuantizeParams();
+  return Error::Ok;
+}
+
 void TensorWrapper::UpdateQnnTensorMeta(const Qnn_Tensor_t& tensor_src) {
   QNN_TENSOR_VER_PTR(tensor_)->id = QNN_TENSOR_VER_PTR(tensor_src)->id;
 }

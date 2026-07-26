@@ -88,6 +88,18 @@ DEFINE_int32(
     wikitext_max_tokens,
     0,
     "Maximum number of WikiText target tokens to score. Non-positive values mean score all available tokens.");
+DEFINE_int32(
+    wikitext_start_token,
+    0,
+    "Zero-based predictor-token row at which WikiText scoring starts.");
+DEFINE_double(
+    wikitext_logits_scale,
+    0.0,
+    "Explicit QNN logits scale for manifest-only WikiText PPL.");
+DEFINE_int32(
+    wikitext_logits_zero_point,
+    0,
+    "Explicit QNN logits zero point for manifest-only WikiText PPL.");
 DEFINE_string(
     prefill_export_dir,
     "",
@@ -122,9 +134,61 @@ DEFINE_bool(
     false,
     "Preload stripped shard inputs and rebuild one shard ahead on a CPU worker while QNN executes the current shard.");
 DEFINE_bool(
+    prefill_shard_pipeline_3stage,
+    false,
+    "Experimental stage-major pipeline: rebuild(i+2), QNN load(i+1), and execute(i) on separate stages.");
+DEFINE_bool(
+    prefill_qnn_backend_prewarm,
+    false,
+    "Prewarm the process-lifetime QNN backend/device from qnn_compile_spec_hex in the shard manifest without creating a QNN context or graph.");
+DEFINE_string(
+    prefill_etdump_dir,
+    "",
+    "Write one selected prefill shard's ETDump and intermediate tensor buffer here. "
+    "The shard PTE must be exported with --dump_intermediate_outputs.");
+DEFINE_int32(
+    prefill_etdump_shard,
+    0,
+    "Zero-based prefill shard index to capture when --prefill_etdump_dir is set.");
+DEFINE_int64(
+    prefill_etdump_debug_buffer_bytes,
+    536870912,
+    "Bytes reserved for the selected shard's ETDump intermediate tensor buffer.");
+DEFINE_bool(
     prefill_shard_stage_major,
     false,
     "For static Qwen3 shards, execute every AR block through one shard before advancing to the next shard.");
+DEFINE_bool(
+    prefill_gguf_relayout_blocks,
+    false,
+    "Before prefill rebuild, copy raw GPTQ2_32 64-row blocks into contiguous "
+    "PTE-record order. Layout-only benchmark; increases resident memory.");
+DEFINE_bool(
+    prefill_gguf_relayout_gs32_source,
+    false,
+    "Before prefill rebuild, copy raw GPTQ2_32 bytes into the GS32 source-read "
+    "order. Preserves raw qbytes and scale/zero_bias fields; increases resident memory.");
+DEFINE_bool(
+    prefill_no_output,
+    false,
+    "The prefill PTE has no logits output; export the last prompt token as the llama.cpp bridge token.");
+DEFINE_bool(
+    prefill_force_logits,
+    false,
+    "Override the shard manifest and use prefill logits to select the first decode token. "
+    "Use only with shard PTEs that retain the logits output.");
+DEFINE_bool(
+    prefill_separate_embed,
+    false,
+    "The prefill PTE takes hidden_states from a separate embedding matrix.");
+DEFINE_string(
+    prefill_embedding_matrix_path,
+    "",
+    "Path to separate_embed_matrix.bin when --prefill_separate_embed=true.");
+DEFINE_bool(
+    prefill_embedding_resident,
+    true,
+    "Keep separate embedding matrix resident in memory; false uses row-on-demand file reads.");
 DEFINE_string(
     llama_pd_cli_path,
     "",
@@ -153,6 +217,18 @@ DEFINE_int32(
     decode_ngl,
     0,
     "Decode-side number of offloaded layers (-ngl).");
+DEFINE_string(
+    decode_ppl_tokens_path,
+    "",
+    "Raw uint64 continuation-token file for teacher-forced PD WikiPPL.");
+DEFINE_string(
+    decode_ppl_output_path,
+    "",
+    "Output file written by llama-pd-cli in teacher-forced PD WikiPPL mode.");
+DEFINE_int32(
+    decode_ppl_max_tokens,
+    0,
+    "Maximum number of teacher-forced PD target tokens; zero scores the whole continuation file.");
 DEFINE_bool(
     decode_import_ro,
     false,
@@ -217,6 +293,8 @@ struct PdE2ERuntimeStats {
   int32_t prompt_tokens{0};
   double runner_setup_ms{0.0};
   double qnn_export_total_ms{0.0};
+  double qnn_backend_prewarm_ms{0.0};
+  bool qnn_backend_prewarmed{false};
   example::PDPrefillRunner<uint16_t>::RuntimeStats prefill{};
   std::vector<example::DecoderRunner::PrefillShardRuntimeStats> shard_stats;
   ProcessMemorySnapshot before_runner;
@@ -242,18 +320,61 @@ void log_pd_e2e_runtime_summary(
       prefill.shard_stats.size(),
       FLAGS_decode_n_predict);
   double shard_preload_total_ms = 0.0;
+  double qat_checkpoint_context_total_ms = 0.0;
+  double qat_recipe_total_ms = 0.0;
+  double gguf_checkpoint_context_total_ms = 0.0;
+  double gguf_recipe_total_ms = 0.0;
+  double gguf_relayout_total_ms = 0.0;
+  size_t gguf_relayout_total_bytes = 0;
+  double rebuild_allocation_total_ms = 0.0;
+  double rebuild_static_copy_total_ms = 0.0;
+  double rebuild_weight_materialization_total_ms = 0.0;
   double pipeline_wait_total_ms = 0.0;
   for (const auto& shard : prefill.shard_stats) {
     shard_preload_total_ms += shard.preload_ms;
+    qat_checkpoint_context_total_ms += shard.qat_checkpoint_context_ms;
+    qat_recipe_total_ms += shard.qat_recipe_ms;
+    gguf_checkpoint_context_total_ms += shard.gguf_checkpoint_context_ms;
+    gguf_recipe_total_ms += shard.gguf_recipe_ms;
+    gguf_relayout_total_ms += shard.gguf_relayout_ms;
+    gguf_relayout_total_bytes += shard.gguf_relayout_bytes;
+    rebuild_allocation_total_ms += shard.rebuild_allocation_ms;
+    rebuild_static_copy_total_ms += shard.rebuild_static_copy_ms;
+    rebuild_weight_materialization_total_ms +=
+        shard.rebuild_weight_materialization_ms;
     pipeline_wait_total_ms += shard.pipeline_wait_ms;
   }
   ET_LOG(
       Info,
-      "PD E2E shard setup: preload_ms=%.3f pipeline_wait_ms=%.3f pipeline_enabled=%d stage_major_enabled=%d",
+      "PD E2E shard setup: preload_ms=%.3f qat_checkpoint_context_ms=%.3f "
+      "qat_recipe_ms=%.3f gguf_checkpoint_context_ms=%.3f gguf_recipe_ms=%.3f "
+      "qnn_backend_prewarm_ms=%.3f qnn_backend_prewarmed=%d pipeline_wait_ms=%.3f "
+      "pipeline_enabled=%d stage_major_enabled=%d three_stage_enabled=%d",
       shard_preload_total_ms,
+      qat_checkpoint_context_total_ms,
+      qat_recipe_total_ms,
+      gguf_checkpoint_context_total_ms,
+      gguf_recipe_total_ms,
+      prefill.qnn_backend_prewarm_ms,
+      static_cast<int>(prefill.qnn_backend_prewarmed),
       pipeline_wait_total_ms,
-      static_cast<int>(FLAGS_prefill_shard_pipeline),
-      static_cast<int>(FLAGS_prefill_shard_stage_major));
+      static_cast<int>(
+          FLAGS_prefill_shard_pipeline || FLAGS_prefill_shard_pipeline_3stage),
+      static_cast<int>(FLAGS_prefill_shard_stage_major),
+      static_cast<int>(FLAGS_prefill_shard_pipeline_3stage));
+  ET_LOG(
+      Info,
+      "PD E2E rebuild breakdown: allocation_ms=%.3f static_copy_ms=%.3f "
+      "weight_materialization_ms=%.3f",
+      rebuild_allocation_total_ms,
+      rebuild_static_copy_total_ms,
+      rebuild_weight_materialization_total_ms);
+  ET_LOG(
+      Info,
+      "PD E2E GGUF source-block relayout: enabled=%d relayout_ms=%.3f relayout_bytes=%zu",
+      static_cast<int>(gguf_relayout_total_bytes > 0),
+      gguf_relayout_total_ms,
+      gguf_relayout_total_bytes);
   ET_LOG(
       Info,
       "PD E2E timing: runner_setup_ms=%.3f tokenize_ms=%.3f qnn_prefill_ms=%.3f "
@@ -284,16 +405,42 @@ void log_pd_e2e_runtime_summary(
     const auto& shard = prefill.shard_stats[i];
     ET_LOG(
         Info,
-        "PD E2E shard summary: index=%zu layers=[%zu,%zu) runs=%zu "
-        "preload_ms=%.3f materialize_ms=%.3f rebuild_ms=%.3f "
-        "pipeline_wait_ms=%.3f execute_ms=%.3f total_ms=%.3f",
+        "PD E2E shard config: index=%zu layers=[%zu,%zu) runs=%zu "
+        "preload_ms=%.3f qat_checkpoint_context_ms=%.3f qat_recipe_ms=%.3f "
+        "gguf_checkpoint_context_ms=%.3f gguf_recipe_ms=%.3f",
         i,
         shard.layer_offset,
         shard.layer_offset + shard.layer_count,
         shard.execution_count,
         shard.preload_ms,
+        shard.qat_checkpoint_context_ms,
+        shard.qat_recipe_ms,
+        shard.gguf_checkpoint_context_ms,
+        shard.gguf_recipe_ms);
+    if (shard.gguf_relayout_bytes > 0) {
+      ET_LOG(
+          Info,
+          "PD E2E shard GGUF source relayout: index=%zu relayout_ms=%.3f "
+          "relayout_bytes=%zu",
+          i,
+          shard.gguf_relayout_ms,
+          shard.gguf_relayout_bytes);
+    }
+    ET_LOG(
+        Info,
+        "PD E2E shard rebuild: index=%zu materialize_ms=%.3f rebuild_ms=%.3f "
+        "allocation_ms=%.3f static_copy_ms=%.3f weight_materialization_ms=%.3f",
+        i,
         shard.materialize_ms,
         shard.rebuild_ms,
+        shard.rebuild_allocation_ms,
+        shard.rebuild_static_copy_ms,
+        shard.rebuild_weight_materialization_ms);
+    ET_LOG(
+        Info,
+        "PD E2E shard execution: index=%zu pipeline_wait_ms=%.3f "
+        "execute_ms=%.3f total_ms=%.3f",
+        i,
         shard.pipeline_wait_ms,
         shard.execute_ms,
         shard.total_ms);
@@ -381,6 +528,10 @@ struct PrefillShardFiles {
   int64_t num_heads{0};
   int64_t head_dim{0};
   bool use_int64_token{false};
+  bool outputs_logits{true};
+  bool use_separate_embed{false};
+  std::string embedding_matrix_path;
+  std::shared_ptr<std::vector<uint8_t>> qnn_compile_spec_bytes;
 };
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
@@ -464,7 +615,7 @@ std::vector<std::string> read_string_array_field(
       field_name.c_str());
   const std::string array_body =
       manifest.substr(array_start, array_end - array_start + 1);
-  std::regex path_regex("\"([^\"]+)\"");
+  std::regex path_regex("\"([^\"]*)\"");
   std::sregex_iterator begin(array_body.begin(), array_body.end(), path_regex);
   std::sregex_iterator end;
   std::vector<std::string> paths;
@@ -538,6 +689,37 @@ bool read_bool_field_or(
   return default_value;
 }
 
+uint8_t decode_manifest_hex_nibble(char character, const char* field_name) {
+  if (character >= '0' && character <= '9') {
+    return static_cast<uint8_t>(character - '0');
+  }
+  if (character >= 'a' && character <= 'f') {
+    return static_cast<uint8_t>(character - 'a' + 10);
+  }
+  if (character >= 'A' && character <= 'F') {
+    return static_cast<uint8_t>(character - 'A' + 10);
+  }
+  ET_CHECK_MSG(false, "%s contains a non-hex character", field_name);
+  return 0;
+}
+
+std::vector<uint8_t> decode_hex_manifest_bytes(
+    const std::string& value,
+    const char* field_name) {
+  ET_CHECK_MSG(
+      value.size() % 2 == 0,
+      "%s must contain an even number of hex characters",
+      field_name);
+  std::vector<uint8_t> bytes;
+  bytes.reserve(value.size() / 2);
+  for (size_t index = 0; index < value.size(); index += 2) {
+    bytes.push_back(static_cast<uint8_t>(
+        (decode_manifest_hex_nibble(value[index], field_name) << 4) |
+        decode_manifest_hex_nibble(value[index + 1], field_name)));
+  }
+  return bytes;
+}
+
 PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
   PrefillShardFiles files;
   if (manifest_path.empty()) {
@@ -545,6 +727,31 @@ PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
   }
   const std::string manifest = read_text_file(manifest_path);
   const fs::path manifest_dir = fs::absolute(fs::path(manifest_path)).parent_path();
+  const std::string qnn_compile_spec_hex =
+      read_string_field(manifest, 0, "qnn_compile_spec_hex");
+  if (!qnn_compile_spec_hex.empty()) {
+    files.qnn_compile_spec_bytes =
+        std::make_shared<std::vector<uint8_t>>(decode_hex_manifest_bytes(
+            qnn_compile_spec_hex, "qnn_compile_spec_hex"));
+  }
+  ET_LOG(
+      Info,
+      "loaded qnn_compile_spec from shard manifest: bytes=%zu",
+      files.qnn_compile_spec_bytes->size());
+  files.outputs_logits =
+      read_bool_field_or(manifest, 0, "prefill_outputs_logits", files.outputs_logits);
+  files.use_separate_embed =
+      read_bool_field_or(manifest, 0, "separate_embed", files.use_separate_embed);
+  if (files.use_separate_embed) {
+    const std::string matrix_path =
+        read_string_field(manifest, 0, "separate_embed_matrix");
+    ET_CHECK_MSG(
+        !matrix_path.empty(),
+        "separate_embed manifest is missing separate_embed_matrix: %s",
+        manifest_path.c_str());
+    files.embedding_matrix_path =
+        resolve_manifest_path(manifest_dir, matrix_path);
+  }
   const size_t graph_pos = manifest.find("\"prefill_forward\"");
   ET_CHECK_MSG(
       graph_pos != std::string::npos,
@@ -558,7 +765,18 @@ PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
       manifest_dir,
       read_string_array_field(manifest, graph_pos, "index_bin_paths"));
   const std::string plan_type = read_string_field(manifest, graph_pos, "prefill_plan_type");
-  files.qwen3_static_plan = plan_type == "qwen3_4x7_static";
+  // The static Qwen3 ABI is independent of the number of evenly split
+  // decoder shards. Keep accepting the legacy 4x7 name and support names
+  // such as qwen3_14x2_static emitted by a 14-shard export.
+  const std::string static_suffix = "_static";
+  files.qwen3_static_plan =
+      plan_type == "qwen3_static" ||
+      (plan_type.rfind("qwen3_", 0) == 0 &&
+       plan_type.size() > std::strlen("qwen3_") + static_suffix.size() &&
+       plan_type.compare(
+           plan_type.size() - static_suffix.size(),
+           static_suffix.size(),
+           static_suffix) == 0);
   const size_t metadata_pos = manifest.find("\"prefill_metadata\"");
   if (metadata_pos != std::string::npos) {
     files.static_aux_size = read_int_field_or(manifest, metadata_pos, "aux_size", files.static_aux_size);
@@ -873,8 +1091,23 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   config.bits_hint = FLAGS_qat_bits_hint;
   config.group_size = FLAGS_qat_group_size;
   config.qweight_mode = FLAGS_qat_qweight_mode;
+  ET_CHECK_MSG(
+      !(FLAGS_prefill_gguf_relayout_blocks && FLAGS_prefill_gguf_relayout_gs32_source),
+      "Use at most one GGUF relayout benchmark flag");
+  config.gguf_relayout_kind = FLAGS_prefill_gguf_relayout_gs32_source
+      ? example::PteGgufRecipeRelayoutKind::Gs32Source
+      : (FLAGS_prefill_gguf_relayout_blocks
+             ? example::PteGgufRecipeRelayoutKind::RawBlocks
+             : example::PteGgufRecipeRelayoutKind::None);
+  ET_CHECK_MSG(
+      !FLAGS_prefill_shard_pipeline_3stage || FLAGS_prefill_shard_stage_major,
+      "--prefill_shard_pipeline_3stage requires --prefill_shard_stage_major");
   config.stage_major_execution = FLAGS_prefill_shard_stage_major;
-  config.pipeline_rebuild = FLAGS_prefill_shard_pipeline;
+  config.pipeline_qnn_load = FLAGS_prefill_shard_pipeline_3stage;
+  config.pipeline_rebuild =
+      FLAGS_prefill_shard_pipeline || FLAGS_prefill_shard_pipeline_3stage;
+  config.prewarm_qnn_backend = FLAGS_prefill_qnn_backend_prewarm;
+  config.qnn_compile_spec_bytes = files.qnn_compile_spec_bytes;
   ET_LOG(
       Info,
       "PD shard rebuild source: kind=%d size_bytes=%zu capacity_bytes=%zu",
@@ -911,6 +1144,18 @@ DecodeProcessResult run_decode_process(const std::string& handoff_dir) {
   if (FLAGS_decode_threads > 0) {
     args.push_back("-t");
     args.push_back(std::to_string(FLAGS_decode_threads));
+  }
+  if (!FLAGS_decode_ppl_tokens_path.empty()) {
+    args.push_back("--pd-ppl-tokens");
+    args.push_back(FLAGS_decode_ppl_tokens_path);
+    if (!FLAGS_decode_ppl_output_path.empty()) {
+      args.push_back("--pd-ppl-output");
+      args.push_back(FLAGS_decode_ppl_output_path);
+    }
+    if (FLAGS_decode_ppl_max_tokens > 0) {
+      args.push_back("--pd-ppl-max-tokens");
+      args.push_back(std::to_string(FLAGS_decode_ppl_max_tokens));
+    }
   }
   if (FLAGS_decode_import_ro) {
     args.push_back("--pd-import-ro");
@@ -968,42 +1213,88 @@ template <typename T>
 void run_wikitext_ppl(
     ModuleBundle module_bundle,
     const ModuleMetaInfo& module_meta,
+    PrefillShardFiles prefill_shard_files,
+    example::DecoderRunner::PrefillShardRebuildConfig prefill_shard_rebuild,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
-  example::Runner<T> runner(
+  const bool effective_outputs_logits = FLAGS_prefill_no_output
+      ? false
+      : (FLAGS_prefill_force_logits || prefill_shard_files.outputs_logits);
+  const bool effective_separate_embed =
+      FLAGS_prefill_separate_embed || prefill_shard_files.use_separate_embed;
+  const std::string effective_embedding_matrix_path =
+      !FLAGS_prefill_embedding_matrix_path.empty()
+      ? FLAGS_prefill_embedding_matrix_path
+      : prefill_shard_files.embedding_matrix_path;
+  ET_CHECK_MSG(effective_outputs_logits, "QNN WikiPPL requires prefill logits");
+
+  typename example::PDPrefillRunner<T>::StaticMetadata static_metadata;
+  if (prefill_shard_files.qwen3_static_plan) {
+    static_metadata.enabled = true;
+    static_metadata.context_len = prefill_shard_files.context_len;
+    static_metadata.prompt_ar_len = prefill_shard_files.prefill_ar_len;
+    static_metadata.token_generator_ar_len =
+        prefill_shard_files.token_generator_ar_len;
+    static_metadata.vocab_size = prefill_shard_files.vocab_size;
+    static_metadata.sliding_window = prefill_shard_files.context_len;
+    static_metadata.num_layers = prefill_shard_files.num_layers;
+    static_metadata.num_heads = prefill_shard_files.num_heads;
+    static_metadata.head_dim = prefill_shard_files.head_dim;
+    static_metadata.use_int64_token = prefill_shard_files.use_int64_token;
+    static_metadata.cache_mode = CacheMode::StaticCahce;
+    static_metadata.outputs_logits = true;
+    static_metadata.use_separate_embed = effective_separate_embed;
+    static_metadata.embedding_matrix_path = effective_embedding_matrix_path;
+    static_metadata.resident_embedding = FLAGS_prefill_embedding_resident;
+  }
+
+  example::PDPrefillRunner<T> runner(
       std::move(module_bundle.module),
-      read_prefill_shard_paths(FLAGS_prefill_shard_manifest_path),
+      std::move(prefill_shard_files.pte_paths),
+      std::move(prefill_shard_files.index_bin_paths),
+      std::move(prefill_shard_rebuild),
+      prefill_shard_files.qwen3_static_plan,
+      prefill_shard_files.static_aux_size,
+      prefill_shard_files.static_hidden_size,
+      true,
+      effective_separate_embed,
+      effective_embedding_matrix_path,
+      FLAGS_prefill_embedding_resident,
+      static_metadata,
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
       FLAGS_tokenizer_path.c_str(),
-      FLAGS_performance_output_path.c_str(),
-      "",
-      0.0f,
+      module_bundle.pte_bytes,
       FLAGS_eval_mode,
       FLAGS_shared_buffer,
-      0,
-      0,
-      0,
       nullptr,
       std::move(attention_sink_rope_module));
 
   double wiki_ppl = 0.0;
+  int64_t scored_tokens = 0;
   const auto ppl_error = runner.evaluate_wikitext_ppl(
       FLAGS_wikitext_path,
+      FLAGS_wikitext_start_token,
       FLAGS_wikitext_max_tokens,
       module_meta.logits_scale,
       module_meta.logits_zero_point,
-      &wiki_ppl);
+      &wiki_ppl,
+      &scored_tokens);
   ET_CHECK_MSG(
       ppl_error == executorch::runtime::Error::Ok,
       "Failed to evaluate WikiText perplexity");
 
   std::ofstream fout(FLAGS_output_path.c_str());
+  fout << std::setprecision(15);
   fout << "wiki_ppl=" << wiki_ppl << "\n";
+  fout << "scored_tokens=" << scored_tokens << "\n";
+  fout << "logits_scale=" << module_meta.logits_scale << "\n";
+  fout << "logits_zero_point=" << module_meta.logits_zero_point << "\n";
   fout.close();
   ET_LOG(
       Info,
-      "wiki_ppl=%f (ExecuTorch-side prompt-logit evaluation; PD handoff/decode skipped)",
-      wiki_ppl);
+      "wiki_ppl=%f scored_tokens=%ld (pure QNN sharded prefill)",
+      wiki_ppl,
+      scored_tokens);
 }
 
 template <typename T>
@@ -1015,6 +1306,22 @@ PdE2ERuntimeStats run_pd_e2e(
     PrefillShardFiles prefill_shard_files,
     example::DecoderRunner::PrefillShardRebuildConfig prefill_shard_rebuild,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
+  ET_CHECK_MSG(
+      !(FLAGS_prefill_no_output && FLAGS_prefill_force_logits),
+      "--prefill_no_output and --prefill_force_logits cannot both be true");
+  const bool effective_outputs_logits = FLAGS_prefill_no_output
+      ? false
+      : (FLAGS_prefill_force_logits || prefill_shard_files.outputs_logits);
+  const bool effective_separate_embed =
+      FLAGS_prefill_separate_embed || prefill_shard_files.use_separate_embed;
+  const std::string effective_embedding_matrix_path =
+      !FLAGS_prefill_embedding_matrix_path.empty()
+      ? FLAGS_prefill_embedding_matrix_path
+      : prefill_shard_files.embedding_matrix_path;
+  ET_CHECK_MSG(
+      !effective_separate_embed || !effective_embedding_matrix_path.empty(),
+      "Separate prefill embedding requires --prefill_embedding_matrix_path or separate_embed_matrix in the shard manifest");
+
   typename example::PDPrefillRunner<T>::StaticMetadata static_metadata;
   if (prefill_shard_files.qwen3_static_plan) {
     static_metadata.enabled = true;
@@ -1028,6 +1335,10 @@ PdE2ERuntimeStats run_pd_e2e(
     static_metadata.head_dim = prefill_shard_files.head_dim;
     static_metadata.use_int64_token = prefill_shard_files.use_int64_token;
     static_metadata.cache_mode = CacheMode::StaticCahce;
+    static_metadata.outputs_logits = effective_outputs_logits;
+    static_metadata.use_separate_embed = effective_separate_embed;
+    static_metadata.embedding_matrix_path = effective_embedding_matrix_path;
+    static_metadata.resident_embedding = FLAGS_prefill_embedding_resident;
   }
 
   PdE2ERuntimeStats stats;
@@ -1041,6 +1352,10 @@ PdE2ERuntimeStats run_pd_e2e(
       prefill_shard_files.qwen3_static_plan,
       prefill_shard_files.static_aux_size,
       prefill_shard_files.static_hidden_size,
+      effective_outputs_logits,
+      effective_separate_embed,
+      effective_embedding_matrix_path,
+      FLAGS_prefill_embedding_resident,
       static_metadata,
       FLAGS_decoder_model_version.c_str(),
       get_model_path_for_runner(),
@@ -1050,6 +1365,19 @@ PdE2ERuntimeStats run_pd_e2e(
       FLAGS_shared_buffer,
       nullptr,
       std::move(attention_sink_rope_module));
+  if (!FLAGS_prefill_etdump_dir.empty()) {
+    ET_CHECK_MSG(
+        FLAGS_prefill_etdump_shard >= 0,
+        "--prefill_etdump_shard must be non-negative");
+    ET_CHECK_MSG(
+        FLAGS_prefill_etdump_debug_buffer_bytes > 0,
+        "--prefill_etdump_debug_buffer_bytes must be positive");
+    runner.set_prefill_etdump_config({
+        FLAGS_prefill_etdump_dir,
+        FLAGS_prefill_etdump_shard,
+        static_cast<size_t>(FLAGS_prefill_etdump_debug_buffer_bytes),
+    });
+  }
   stats.runner_setup_ms = elapsed_ms(runner_setup_start);
   stats.after_runner = process_memory_snapshot();
 
@@ -1077,6 +1405,8 @@ PdE2ERuntimeStats run_pd_e2e(
   stats.prefill.kv_write_ms = runner_stats.kv_write_ms;
   stats.prefill.fingerprint_ms = runner_stats.fingerprint_ms;
   stats.shard_stats = runner.prefill_shard_runtime_stats();
+  stats.qnn_backend_prewarm_ms = runner.prefill_qnn_backend_prewarm_ms();
+  stats.qnn_backend_prewarmed = runner.prefill_qnn_backend_prewarmed();
   stats.after_export = process_memory_snapshot();
   return stats;
 }
@@ -1121,8 +1451,24 @@ int main(int argc, char** argv) {
   const bool manifest_only_prefill = prefill_shard_files.qwen3_static_plan &&
       !FLAGS_prefill_shard_manifest_path.empty();
   ET_CHECK_MSG(
-      !manifest_only_prefill || FLAGS_wikitext_path.empty(),
-      "WikiText PPL mode still requires a main PTE; manifest-only is PD handoff only");
+      !(FLAGS_prefill_no_output && FLAGS_prefill_force_logits),
+      "--prefill_no_output and --prefill_force_logits cannot both be true");
+  const bool effective_prefill_no_output = FLAGS_prefill_no_output ||
+      (!FLAGS_prefill_force_logits && !prefill_shard_files.outputs_logits);
+  const bool effective_prefill_separate_embed =
+      FLAGS_prefill_separate_embed || prefill_shard_files.use_separate_embed;
+  ET_CHECK_MSG(
+      !effective_prefill_no_output || manifest_only_prefill,
+      "--prefill_no_output requires a manifest-only static prefill shard export");
+  ET_CHECK_MSG(
+      !effective_prefill_separate_embed || manifest_only_prefill ||
+          !FLAGS_wikitext_path.empty(),
+      "--prefill_separate_embed requires static prefill shards");
+  ET_CHECK_MSG(
+      !effective_prefill_separate_embed ||
+          !FLAGS_prefill_embedding_matrix_path.empty() ||
+          !prefill_shard_files.embedding_matrix_path.empty(),
+      "--prefill_embedding_matrix_path is required when --prefill_separate_embed=true");
 
   ModuleBundle module_bundle;
   ModuleMetaInfo module_meta;
@@ -1137,6 +1483,14 @@ int main(int argc, char** argv) {
     // must match the normal QNN runner's KVManager instantiation.
     module_meta.kv_bitwidth = static_cast<example::KvBitWidth>(
         prefill_shard_files.kv_bitwidth);
+    if (!FLAGS_wikitext_path.empty()) {
+      ET_CHECK_MSG(
+          FLAGS_wikitext_logits_scale > 0.0,
+          "Manifest-only WikiPPL requires --wikitext_logits_scale");
+      module_meta.logits_scale =
+          static_cast<float>(FLAGS_wikitext_logits_scale);
+      module_meta.logits_zero_point = FLAGS_wikitext_logits_zero_point;
+    }
     ET_LOG(
         Info,
         "skipping main PTE load; using manifest-only prefill metadata with %d-bit KV storage",
@@ -1162,11 +1516,15 @@ int main(int argc, char** argv) {
       run_wikitext_ppl<uint8_t>(
           std::move(module_bundle),
           module_meta,
+          std::move(prefill_shard_files),
+          std::move(prefill_shard_rebuild),
           std::move(attention_sink_rope_module));
     } else if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth16) {
       run_wikitext_ppl<uint16_t>(
           std::move(module_bundle),
           module_meta,
+          std::move(prefill_shard_files),
+          std::move(prefill_shard_rebuild),
           std::move(attention_sink_rope_module));
     } else {
       ET_CHECK_MSG(

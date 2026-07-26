@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+from copy import copy
 from multiprocessing.connection import Client
 from typing import Dict
 
@@ -164,6 +165,7 @@ def compile(
                     # x86 emulator does not support shared buffer
                     shared_buffer=not args.enable_x86_64,
                     use_mha2sha=True,
+                    dump_intermediate_outputs=args.dump_intermediate_outputs,
                 )
             ] * len(DECODER_GRAPH_NAMES)
 
@@ -359,6 +361,15 @@ def _build_parser():
         help=f"The llm model to export. Current available options are: { SUPPORTED_LLM_MODELS.keys()}",
         required=True,
     )
+    parser.add_argument(
+        "--num_sharding",
+        type=int,
+        default=None,
+        help=(
+            "Override the model's default decoder shard count for this export. "
+            "The value must evenly divide the decoder layer count."
+        ),
+    )
 
     parser.add_argument(
         "--checkpoint",
@@ -457,6 +468,40 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--separate_embed",
+        action="store_true",
+        help=(
+            "Export the token embedding table as separate_embed_matrix.bin and "
+            "rewrite decoder graph input 0 from token_ids to hidden_states."
+        ),
+    )
+    parser.add_argument(
+        "--separate_embed_dtype",
+        default="fp32",
+        choices=["fp32", "fp16"],
+        help=(
+            "Storage and graph-input dtype for --separate_embed. The decoder "
+            "graph converts the external input back to its original dtype when needed."
+        ),
+    )
+    parser.add_argument(
+        "--prefill_only",
+        action="store_true",
+        help=(
+            "Export only prefill_forward while preserving its LM head/logits output. "
+            "Use this when decode runs outside ExecuTorch."
+        ),
+    )
+    parser.add_argument(
+        "--prefill_only_no_output",
+        action="store_true",
+        help=(
+            "Export only prefill_forward and remove the LM head/logits output. "
+            "PD decode resumes from the final prompt token."
+        ),
+    )
+
+    parser.add_argument(
         "--ngram",
         help="Represents the size of the n-grams used in the lookahead process.",
         default=5,
@@ -533,6 +578,22 @@ def _build_parser():
         help=(
             "Dump quantization-related graph/module info after prepare_pt2e and "
             "convert_pt2e."
+        ),
+    )
+    parser.add_argument(
+        "--dump_activation_quant_attrs",
+        action="store_true",
+        help=(
+            "Write per-shard QNN-lowered activation quantization attributes "
+            "to <artifact>/<mode>_activation_quant_attrs.json."
+        ),
+    )
+    parser.add_argument(
+        "--emit_llama_qnn_quant_profile",
+        action="store_true",
+        help=(
+            "Embed an exact per-shard QNN quantization profile in the decoder "
+            "shard manifest for llama.cpp decode alignment."
         ),
     )
     parser.add_argument(
@@ -704,6 +765,18 @@ def _build_parser():
 def export_llama(args) -> None:
     if args.compile_only and args.pre_gen_pte:
         raise RuntimeError("Cannot set both compile_only and pre_gen_pte as true")
+    if args.separate_embed and not args.compile_only:
+        raise RuntimeError("--separate_embed requires --compile_only")
+    if args.separate_embed and args.embedding_quantize is not None:
+        raise RuntimeError(
+            "--separate_embed does not support --embedding-quantize; "
+            "export the embedding input as fp32/fp16 instead"
+        )
+    if args.prefill_only or args.prefill_only_no_output:
+        if not args.compile_only:
+            raise RuntimeError("--prefill_only requires --compile_only")
+        if args.model_mode != "hybrid":
+            raise RuntimeError("--prefill_only requires --model_mode hybrid")
     if (TASKS_EVAL or SQNR_EVAL) in args.eval_methods and args.model_mode not in {
         "kv",
         "hybrid",
@@ -717,6 +790,15 @@ def export_llama(args) -> None:
         args.decoder_model in SUPPORTED_LLM_MODELS
     ), f"Unknown decoder_model: {args.decoder_model}."
     decoder_model_config = SUPPORTED_LLM_MODELS[args.decoder_model]
+    if args.num_sharding is not None:
+        if args.num_sharding <= 0:
+            raise RuntimeError("--num_sharding must be positive")
+        # Model configs are shared frozen instances. Override a private copy so
+        # one export invocation never changes another model's default.
+        decoder_model_config = copy(decoder_model_config)
+        object.__setattr__(
+            decoder_model_config, "num_sharding", args.num_sharding
+        )
     logging.info(f"*** {args.decoder_model} ***\n%s", str(decoder_model_config))
 
     if args.max_context_len is None:

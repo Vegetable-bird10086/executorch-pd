@@ -7,6 +7,9 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
+#include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <numeric>
 #include <type_traits>
 using executorch::aten::TensorImpl;
@@ -32,7 +35,16 @@ PromptProcessor<T>::PromptProcessor(
   k_cache_out_.resize(metadata_.num_layers);
   v_cache_out_.resize(metadata_.num_layers);
   // Calculate I/O size
-  input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        metadata_.separate_embedding != nullptr && metadata_.embedding_dim > 0 &&
+            metadata_.embedding_row_bytes > 0,
+        "Invalid separate embedding metadata");
+    input_embedding_.size =
+        static_cast<size_t>(metadata_.ar_len) * metadata_.embedding_row_bytes;
+  } else {
+    input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  }
   if (is_bert())
     input_pos_.size = 0;
   else
@@ -55,7 +67,9 @@ PromptProcessor<T>::PromptProcessor(
       break;
   }
 
-  logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(uint16_t);
+  if (metadata_.outputs_logits) {
+    logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(uint16_t);
+  }
 };
 template <typename T>
 void PromptProcessor<T>::init_io(
@@ -64,19 +78,37 @@ void PromptProcessor<T>::init_io(
   size_t idx = 0;
   input_tensors_.reserve(method_meta->num_inputs());
   output_tensors_.reserve(method_meta->num_outputs());
-  // [I]: input_tokens
+  // [I]: token ids or externally supplied hidden states.
   Result<TensorInfo> input_toks = method_meta->input_tensor_meta(idx++);
-  input_toks_.data =
-      reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
-  input_toks_.tensor = std::make_unique<TensorImpl>(
-      input_toks->scalar_type(),
-      input_toks->sizes().size(),
-      const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
-      input_toks_.data,
-      const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
-  input_tensors_.emplace_back(input_toks_.tensor.get());
-  buffer_manager->add_memory_info(
-      input_toks_.data, input_toks_.size, input_toks.get());
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        input_toks->sizes().size() == 3 &&
+            input_toks->sizes()[2] == metadata_.embedding_dim,
+        "Separate embedding input shape does not match exported decoder");
+    input_embedding_.data = reinterpret_cast<uint8_t*>(
+        buffer_manager->allocate(input_embedding_.size));
+    input_embedding_.tensor = std::make_unique<TensorImpl>(
+        input_toks->scalar_type(),
+        input_toks->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
+        input_embedding_.data,
+        const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
+    input_tensors_.emplace_back(input_embedding_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_embedding_.data, input_embedding_.size, input_toks.get());
+  } else {
+    input_toks_.data =
+        reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
+    input_toks_.tensor = std::make_unique<TensorImpl>(
+        input_toks->scalar_type(),
+        input_toks->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
+        input_toks_.data,
+        const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
+    input_tensors_.emplace_back(input_toks_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_toks_.data, input_toks_.size, input_toks.get());
+  }
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
@@ -159,21 +191,23 @@ void PromptProcessor<T>::init_io(
     }
   }
 
-  // [O]: logits
-  Result<TensorInfo> logits = method_meta->output_tensor_meta(0);
-  logits_.data =
-      reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
-  logits_.tensor = std::make_unique<TensorImpl>(
-      logits->scalar_type(),
-      logits->sizes().size(),
-      const_cast<TensorImpl::SizesType*>(logits->sizes().data()),
-      logits_.data,
-      const_cast<TensorImpl::DimOrderType*>(logits->dim_order().data()));
-  output_tensors_.emplace_back(logits_.tensor.get());
-  buffer_manager->add_memory_info(logits_.data, logits_.size, logits.get());
+  size_t index = 0;
+  if (metadata_.outputs_logits) {
+    // [O]: logits
+    Result<TensorInfo> logits = method_meta->output_tensor_meta(index++);
+    logits_.data =
+        reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
+    logits_.tensor = std::make_unique<TensorImpl>(
+        logits->scalar_type(),
+        logits->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(logits->sizes().data()),
+        logits_.data,
+        const_cast<TensorImpl::DimOrderType*>(logits->dim_order().data()));
+    output_tensors_.emplace_back(logits_.tensor.get());
+    buffer_manager->add_memory_info(logits_.data, logits_.size, logits.get());
+  }
 
   // [O] kv_cache
-  size_t index = 1;
   for (int cache_group = 0; cache_group < 2; ++cache_group) {
     std::vector<std::unique_ptr<TensorImpl>>& cache =
         (cache_group == 0 ? k_cache_out_ : v_cache_out_);
@@ -224,7 +258,8 @@ void PromptProcessor<T>::init_io_from_metadata(IMemAlloc* buffer_manager) {
   const ScalarType kv_type = qnn_io_type;
 
   const size_t num_inputs = 3 + static_cast<size_t>(metadata_.num_layers) * 2;
-  const size_t num_outputs = 1 + static_cast<size_t>(metadata_.num_layers) * 2;
+  const size_t num_outputs = (metadata_.outputs_logits ? 1 : 0) +
+      static_cast<size_t>(metadata_.num_layers) * 2;
   input_tensors_.reserve(num_inputs);
   output_tensors_.reserve(num_outputs);
   synthetic_sizes_.reserve(num_inputs + num_outputs);
@@ -248,11 +283,23 @@ void PromptProcessor<T>::init_io_from_metadata(IMemAlloc* buffer_manager) {
         synthetic_dim_orders_.back().data());
   };
 
-  input_toks_.data =
-      reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
-  input_toks_.tensor = make_tensor(
-      token_type, {1, static_cast<SizesType>(metadata_.ar_len)}, input_toks_.data);
-  input_tensors_.emplace_back(input_toks_.tensor.get());
+  if (metadata_.use_separate_embed) {
+    input_embedding_.data = reinterpret_cast<uint8_t*>(
+        buffer_manager->allocate(input_embedding_.size));
+    input_embedding_.tensor = make_tensor(
+        metadata_.embedding_scalar_type,
+        {1,
+         static_cast<SizesType>(metadata_.ar_len),
+         static_cast<SizesType>(metadata_.embedding_dim)},
+        input_embedding_.data);
+    input_tensors_.emplace_back(input_embedding_.tensor.get());
+  } else {
+    input_toks_.data =
+        reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
+    input_toks_.tensor = make_tensor(
+        token_type, {1, static_cast<SizesType>(metadata_.ar_len)}, input_toks_.data);
+    input_tensors_.emplace_back(input_toks_.tensor.get());
+  }
 
   attention_mask_.data = reinterpret_cast<uint16_t*>(
       buffer_manager->allocate(attention_mask_.size));
@@ -312,15 +359,17 @@ void PromptProcessor<T>::init_io_from_metadata(IMemAlloc* buffer_manager) {
     }
   }
 
-  logits_.data =
-      reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
-  logits_.tensor = make_tensor(
-      logits_type,
-      {1,
-       static_cast<SizesType>(metadata_.ar_len),
-       static_cast<SizesType>(metadata_.vocab_size)},
-      logits_.data);
-  output_tensors_.emplace_back(logits_.tensor.get());
+  if (metadata_.outputs_logits) {
+    logits_.data =
+        reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
+    logits_.tensor = make_tensor(
+        logits_type,
+        {1,
+         static_cast<SizesType>(metadata_.ar_len),
+         static_cast<SizesType>(metadata_.vocab_size)},
+        logits_.data);
+    output_tensors_.emplace_back(logits_.tensor.get());
+  }
 
   auto k_cache_ptrs = kv_manager_->get_k_cache_();
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
@@ -363,23 +412,31 @@ void PromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     int64_t prompt_pos,
     int64_t start_pos) {
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        metadata_.separate_embedding != nullptr,
+        "Separate embedding instance is required");
+    std::memset(input_embedding_.data, 0, input_embedding_.size);
+  }
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (!is_bert()) {
-      // Prepare pos data
       input_pos_.data[i] = start_pos + i;
     }
-
-    // Prepare input token data
-    if (prompt_pos + i < prompt_tokens.size()) {
-      // Support CPU 4-bit embedding, which requires int64 input.
-      // However, for QNN embedding, only int32 input is needed.
-      // Therefore, we need to cast to the correct type to write the data.
-      if (metadata_.use_int64_token) {
-        input_toks_.data[i] = prompt_tokens[prompt_pos + i];
-      } else {
-        int32_t* input_toks_ptr = reinterpret_cast<int32_t*>(input_toks_.data);
-        input_toks_ptr[i] = static_cast<int32_t>(prompt_tokens[prompt_pos + i]);
-      }
+    if (prompt_pos + i >= static_cast<int64_t>(prompt_tokens.size())) {
+      continue;
+    }
+    const uint64_t token = prompt_tokens[prompt_pos + i];
+    if (metadata_.use_separate_embed) {
+      metadata_.separate_embedding->copy_row_to_float(
+          token,
+          reinterpret_cast<float*>(input_embedding_.data) +
+              static_cast<size_t>(i) * metadata_.embedding_dim,
+          metadata_.embedding_dim);
+    } else if (metadata_.use_int64_token) {
+      input_toks_.data[i] = token;
+    } else {
+      int32_t* input_toks_ptr = reinterpret_cast<int32_t*>(input_toks_.data);
+      input_toks_ptr[i] = static_cast<int32_t>(token);
     }
   }
 }
@@ -390,6 +447,11 @@ void PromptProcessor<T>::clear_all_logits() {
 }
 
 template <typename T>
+void PromptProcessor<T>::reserve_all_logits(size_t elements) {
+  prompt_all_logits_.reserve(elements);
+}
+
+template <typename T>
 Result<uint64_t> PromptProcessor<T>::prefill(
     std::vector<uint64_t> prompt_tokens,
     int64_t start_pos,
@@ -397,6 +459,22 @@ Result<uint64_t> PromptProcessor<T>::prefill(
     AttentionSinkRopeRunner* attention_sink_rope_runner,
     bool force_greedy_argmax) {
   ET_CHECK_MSG(!prompt_tokens.empty(), "Prompt cannot be null");
+
+  if (const char* token_dump_path = std::getenv("ET_PROMPT_TOKEN_DUMP_PATH")) {
+    std::ofstream token_dump(token_dump_path, std::ios::trunc);
+    if (!token_dump.is_open()) {
+      ET_LOG(Error, "Unable to open prompt token dump path=%s", token_dump_path);
+    } else {
+      for (uint64_t token : prompt_tokens) {
+        token_dump << token << static_cast<char>(10);
+      }
+      ET_LOG(
+          Info,
+          "Wrote %zu QNN prompt tokens to %s",
+          prompt_tokens.size(),
+          token_dump_path);
+    }
+  }
 
   int64_t shifted_pos = start_pos;
   bool enable_attention_sink = attention_sink_rope_runner != nullptr;
@@ -517,7 +595,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
             layer_begin,
             layer_end_exclusive);
 
-        if (dump_logits && shard_index + 1 == shard_count) {
+        if (metadata_.outputs_logits && dump_logits && shard_index + 1 == shard_count) {
           prompt_all_logits_.insert(
               prompt_all_logits_.end(),
               logits_.data,
@@ -528,6 +606,9 @@ Result<uint64_t> PromptProcessor<T>::prefill(
           decoder_runner_->end_prefill_shard_stage(shard_index));
     }
 
+    if (!metadata_.outputs_logits) {
+      return 0;
+    }
     const int64_t logits_pos =
         (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
     cur_token = force_greedy_argmax
@@ -565,7 +646,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
 
     // Run inference
     decoder_runner_->step(method_name_, inputs_);
-    if (dump_logits) {
+    if (metadata_.outputs_logits && dump_logits) {
       prompt_all_logits_.insert(
           prompt_all_logits_.end(),
           logits_.data,
@@ -593,6 +674,9 @@ Result<uint64_t> PromptProcessor<T>::prefill(
     shifted_pos += metadata_.ar_len;
   }
 
+  if (!metadata_.outputs_logits) {
+    return 0;
+  }
   const int64_t logits_pos =
       (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
   cur_token = force_greedy_argmax

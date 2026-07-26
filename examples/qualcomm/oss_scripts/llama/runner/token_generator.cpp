@@ -7,6 +7,8 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
+#include <cmath>
+#include <limits>
 #include <numeric>
 
 using executorch::aten::TensorImpl;
@@ -39,7 +41,15 @@ TokenGenerator<T>::TokenGenerator(
   v_cache_out_.resize(metadata_.num_layers);
 
   // Calculate I/O size
-  input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        metadata_.separate_embedding != nullptr && metadata_.embedding_dim > 0,
+        "Invalid separate embedding metadata for token generator");
+    input_embedding_.size = static_cast<size_t>(metadata_.ar_len) *
+        metadata_.embedding_dim * sizeof(float);
+  } else {
+    input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  }
   input_pos_.size = metadata_.ar_len * sizeof(int32_t);
   attention_mask_.size =
       metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
@@ -72,17 +82,35 @@ void TokenGenerator<T>::init_io(
   output_tensors_.reserve(method_meta->num_outputs());
   // [I]: input_tokens
   Result<TensorInfo> input_toks = method_meta->input_tensor_meta(idx++);
-  input_toks_.data =
-      reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
-  input_toks_.tensor = std::make_unique<TensorImpl>(
-      input_toks->scalar_type(),
-      input_toks->sizes().size(),
-      const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
-      input_toks_.data,
-      const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
-  input_tensors_.emplace_back(input_toks_.tensor.get());
-  buffer_manager->add_memory_info(
-      input_toks_.data, input_toks_.size, input_toks.get());
+  if (metadata_.use_separate_embed) {
+    ET_CHECK_MSG(
+        input_toks->sizes().size() == 3 &&
+            input_toks->sizes()[2] == metadata_.embedding_dim,
+        "Separate embedding input shape does not match kv_forward");
+    input_embedding_.data = reinterpret_cast<uint8_t*>(
+        buffer_manager->allocate(input_embedding_.size));
+    input_embedding_.tensor = std::make_unique<TensorImpl>(
+        input_toks->scalar_type(),
+        input_toks->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
+        input_embedding_.data,
+        const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
+    input_tensors_.emplace_back(input_embedding_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_embedding_.data, input_embedding_.size, input_toks.get());
+  } else {
+    input_toks_.data =
+        reinterpret_cast<int64_t*>(buffer_manager->allocate(input_toks_.size));
+    input_toks_.tensor = std::make_unique<TensorImpl>(
+        input_toks->scalar_type(),
+        input_toks->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(input_toks->sizes().data()),
+        input_toks_.data,
+        const_cast<TensorImpl::DimOrderType*>(input_toks->dim_order().data()));
+    input_tensors_.emplace_back(input_toks_.tensor.get());
+    buffer_manager->add_memory_info(
+        input_toks_.data, input_toks_.size, input_toks.get());
+  }
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
@@ -218,8 +246,15 @@ void TokenGenerator<T>::clear_all_logits() {
 template <typename T>
 void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos) {
   // update input_tok
-  *input_toks_.data =
-      metadata_.use_int64_token ? cur_token : static_cast<int32_t>(cur_token);
+  if (metadata_.use_separate_embed) {
+    metadata_.separate_embedding->copy_row_to_float(
+        cur_token,
+        reinterpret_cast<float*>(input_embedding_.data),
+        metadata_.embedding_dim);
+  } else {
+    *input_toks_.data =
+        metadata_.use_int64_token ? cur_token : static_cast<int32_t>(cur_token);
+  }
   // update position_ids
   *input_pos_.data = static_cast<int32_t>(start_pos);
 }
@@ -378,6 +413,97 @@ Result<int64_t> TokenGenerator<T>::generate(
   }
 
   return pos - start_pos;
+}
+
+template <typename T>
+Result<double> TokenGenerator<T>::evaluate_teacher_forced(
+    const std::vector<uint64_t>& tokens,
+    int64_t start_pos,
+    float logits_scale,
+    int32_t logits_zero_point) {
+  ET_CHECK_MSG(
+      metadata_.ar_len == 1,
+      "Teacher-forced decode requires AR-1, got AR-%d",
+      metadata_.ar_len);
+  ET_CHECK_MSG(
+      tokens.size() >= 2,
+      "Teacher-forced decode requires an input and at least one target");
+  ET_CHECK_MSG(logits_scale > 0.0f, "logits_scale must be positive");
+  ET_CHECK_MSG(
+      start_pos + static_cast<int64_t>(tokens.size()) - 1 <=
+          metadata_.context_len,
+      "Teacher-forced sequence exceeds context: start=%ld tokens=%zu context=%d",
+      start_pos,
+      tokens.size(),
+      metadata_.context_len);
+
+  int64_t shifted_pos = start_pos;
+  kv_manager_->rearrange_cache(metadata_.ar_len);
+  const std::vector<int32_t> attention_map{-1};
+  kv_manager_->init_attention_mask(
+      attention_mask_.data, attention_map, metadata_.ar_len, shifted_pos);
+  if (metadata_.cache_mode == CacheMode::HybridCache) {
+    kv_manager_->init_attention_mask(
+        window_attention_mask_.data,
+        attention_map,
+        metadata_.ar_len,
+        shifted_pos,
+        metadata_.sliding_window);
+  }
+  ET_CHECK_MSG(
+      decoder_runner_->set_outputs(method_name_, output_tensors_) ==
+          executorch::runtime::Error::Ok,
+      "Failed to set output tensor for module %s",
+      method_name_.c_str());
+
+  double total_nll = 0.0;
+  for (size_t token_index = 0; token_index + 1 < tokens.size();
+       ++token_index) {
+    prepare_io(tokens[token_index], shifted_pos);
+    auto logits_res = decoder_runner_->step(method_name_, inputs_);
+    ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
+
+    const uint64_t target = tokens[token_index + 1];
+    ET_CHECK_MSG(
+        target < static_cast<uint64_t>(metadata_.vocab_size),
+        "Target token %lu exceeds vocab size %d",
+        target,
+        metadata_.vocab_size);
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
+      const double value =
+          (static_cast<double>(logits_.data[i]) -
+           static_cast<double>(logits_zero_point)) *
+          static_cast<double>(logits_scale);
+      max_logit = std::max(max_logit, value);
+    }
+    double exp_sum = 0.0;
+    for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
+      const double value =
+          (static_cast<double>(logits_.data[i]) -
+           static_cast<double>(logits_zero_point)) *
+          static_cast<double>(logits_scale);
+      exp_sum += std::exp(value - max_logit);
+    }
+    const double target_logit =
+        (static_cast<double>(logits_.data[target]) -
+         static_cast<double>(logits_zero_point)) *
+        static_cast<double>(logits_scale);
+    total_nll += std::log(exp_sum) + max_logit - target_logit;
+
+    kv_manager_->update_cache(1, shifted_pos, 1, {});
+    kv_manager_->update_attention_mask(attention_mask_.data, 1, shifted_pos, 1);
+    if (metadata_.cache_mode == CacheMode::HybridCache) {
+      kv_manager_->update_attention_mask(
+          window_attention_mask_.data,
+          1,
+          shifted_pos,
+          1,
+          metadata_.sliding_window);
+    }
+    ++shifted_pos;
+  }
+  return total_nll;
 }
 // Explicit instantiations
 template class TokenGenerator<uint16_t>;

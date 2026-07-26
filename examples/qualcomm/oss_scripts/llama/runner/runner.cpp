@@ -143,7 +143,9 @@ Runner<T>::Runner(
     const int window,
     const int gcap,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
-    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
+    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module,
+    const std::string& embedding_matrix_path,
+    bool resident_embedding)
     : module_(std::move(module)),
       prefill_shard_paths_(std::move(prefill_shard_paths)),
       ngram_(ngram),
@@ -156,6 +158,8 @@ Runner<T>::Runner(
       temperature_(temperature),
       eval_mode_(static_cast<EvalMode>(eval_mode)),
       shared_buffer_(shared_buffer),
+      embedding_matrix_path_(embedding_matrix_path),
+      resident_embedding_(resident_embedding),
       tokenizer_(std::move(tokenizer)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)) {
   stats_.reset();
@@ -200,7 +204,8 @@ Runner<T>::Runner(
 template <typename T>
 bool Runner<T>::is_loaded() const {
   return module_->is_loaded() && tokenizer_ && decoder_runner_ &&
-      prompt_processor_ && token_generator_ && kv_manager_ && buffer_manager_;
+      prompt_processor_ && (prefill_only_load_ || token_generator_) &&
+      kv_manager_ && buffer_manager_;
 }
 
 template <typename T>
@@ -227,6 +232,11 @@ Error Runner<T>::load() {
     case EvalMode::kUnsupported:
       ET_CHECK_MSG(false, "Unsupported llama evaluation mode");
       break;
+  }
+  if (prefill_only_load_) {
+    prompt_processor_method_name = "prefill_forward";
+    token_generator_method_name.clear();
+    method_names = {prompt_processor_method_name};
   }
   auto eos_ids = std::make_unique<std::unordered_set<uint64_t>>();
   if (tokenizer_ != nullptr) {
@@ -262,8 +272,9 @@ Error Runner<T>::load() {
     eos_ids->insert(tokenizer_->encode("<|user|>", 0, 0).get()[0]);
   }
 
-  Result<MethodMeta> method_meta =
-      module_->method_meta(token_generator_method_name);
+  Result<MethodMeta> method_meta = module_->method_meta(
+      prefill_only_load_ ? prompt_processor_method_name
+                         : token_generator_method_name);
 
   // For some tokenizer.json, runtime vocab_size might be different, use output
   // shape to get vocab size.
@@ -285,6 +296,25 @@ Error Runner<T>::load() {
   int64_t head_dim = k_cache_shape[2];
   bool use_int64_token = method_meta->input_tensor_meta(0)->scalar_type() ==
       executorch::aten::ScalarType::Long;
+  const bool use_separate_embed = !embedding_matrix_path_.empty();
+  int32_t embedding_dim = 0;
+  if (use_separate_embed) {
+    ET_CHECK_MSG(
+        separate_embedding_.load(
+            embedding_matrix_path_, resident_embedding_),
+        "Failed to load separate embedding matrix: %s",
+        embedding_matrix_path_.c_str());
+    ET_CHECK_MSG(
+        separate_embedding_.vocab_size() == vocab_size_,
+        "Separate embedding vocab mismatch: matrix=%d model=%d",
+        separate_embedding_.vocab_size(),
+        vocab_size_);
+    embedding_dim = separate_embedding_.embedding_dim();
+    ET_CHECK_MSG(
+        method_meta->input_tensor_meta(0)->sizes().size() == 3 &&
+            method_meta->input_tensor_meta(0)->sizes()[2] == embedding_dim,
+        "Separate embedding dimension does not match kv_forward");
+  }
 
   // Use attention mask length to retrieve AR length and context length
   // Cache len equals to context_len - ar_len
@@ -297,7 +327,9 @@ Error Runner<T>::load() {
   token_generator_ar_len = atten_mask_meta_token->sizes()[1];
   token_generator_ar_len_ = token_generator_ar_len;
   context_len_ = atten_mask_meta_token->sizes()[2];
-  if (eval_mode_ == EvalMode::kKVCached) {
+  if (prefill_only_load_) {
+    prompt_processor_ar_len = token_generator_ar_len;
+  } else if (eval_mode_ == EvalMode::kKVCached) {
     prompt_processor_ar_len = token_generator_ar_len;
   } else if (
       eval_mode_ == EvalMode::kHybrid ||
@@ -358,8 +390,16 @@ Error Runner<T>::load() {
           vocab_size,
           use_int64_token,
           sliding_window,
-          cache_mode_});
-  if (eval_mode_ == EvalMode::kLookaheadDecoding) {
+          cache_mode_,
+          true,
+          use_separate_embed,
+          embedding_dim,
+          static_cast<size_t>(embedding_dim) * sizeof(float),
+          executorch::aten::ScalarType::Float,
+          use_separate_embed ? &separate_embedding_ : nullptr});
+  if (prefill_only_load_) {
+    token_generator_.reset();
+  } else if (eval_mode_ == EvalMode::kLookaheadDecoding) {
     token_generator_ = std::make_unique<LhdTokenGenerator<T>>(
         tokenizer_.get(),
         decoder_runner_.get(),
@@ -394,7 +434,10 @@ Error Runner<T>::load() {
             vocab_size,
             use_int64_token,
             sliding_window,
-            cache_mode_},
+            cache_mode_,
+            use_separate_embed,
+            embedding_dim,
+            use_separate_embed ? &separate_embedding_ : nullptr},
         &stats_);
   }
 
@@ -403,7 +446,9 @@ Error Runner<T>::load() {
     buffer_manager_ = std::make_unique<RpcMem>(
         kv_manager_->total_cache_size_in_bytes(),
         prompt_processor_->total_prompt_processor_io_size_in_bytes(),
-        token_generator_->total_token_generator_io_size_in_bytes());
+        token_generator_
+            ? token_generator_->total_token_generator_io_size_in_bytes()
+            : 0);
   }
   ET_LOG(Info, "creating io_memory");
   // prepare io
@@ -411,8 +456,10 @@ Error Runner<T>::load() {
   prompt_processor_->init_io(
       buffer_manager_.get(),
       module_->method_meta(prompt_processor_method_name));
-  token_generator_->init_io(
-      buffer_manager_.get(), module_->method_meta(token_generator_method_name));
+  if (token_generator_) {
+    token_generator_->init_io(
+        buffer_manager_.get(), module_->method_meta(token_generator_method_name));
+  }
   return Error::Ok;
 }
 
@@ -578,14 +625,16 @@ Error Runner<T>::generate_from_prompt_or_file(
 template <typename T>
 Error Runner<T>::evaluate_wikitext_ppl(
     const std::string& wikitext_path,
+    int32_t start_token,
     int32_t max_eval_tokens,
     float logits_scale,
     int32_t logits_zero_point,
     double* ppl_out) {
   ET_CHECK_MSG(ppl_out != nullptr, "ppl_out cannot be null");
   ET_CHECK_MSG(!wikitext_path.empty(), "wikitext_path cannot be empty");
-  ET_CHECK_MSG(max_eval_tokens != 0, "wikitext_max_tokens cannot be zero");
+  ET_CHECK_MSG(start_token >= 0, "wikitext_start_token cannot be negative");
 
+  prefill_only_load_ = false;
   reset();
   const int64_t model_load_start_ms = time_in_ms();
   ET_CHECK_OK_OR_RETURN_ERROR(load());
@@ -599,65 +648,46 @@ Error Runner<T>::evaluate_wikitext_ppl(
   std::vector<uint64_t> tokens = encode_res.get();
   ET_CHECK_MSG(tokens.size() >= 2, "WikiText input must contain at least 2 tokens");
 
-  int64_t eval_tokens = static_cast<int64_t>(tokens.size()) - 1;
+  const int64_t available_predictor_rows =
+      static_cast<int64_t>(tokens.size()) - 1;
+  ET_CHECK_MSG(
+      start_token < available_predictor_rows,
+      "wikitext_start_token=%d exceeds available predictor rows=%ld",
+      start_token,
+      available_predictor_rows);
+  int64_t eval_tokens = available_predictor_rows - start_token;
   if (max_eval_tokens > 0) {
     eval_tokens = std::min<int64_t>(eval_tokens, max_eval_tokens);
   }
   ET_CHECK_MSG(eval_tokens > 0, "No tokens available for perplexity evaluation");
 
-  const int64_t max_window_tokens =
-      static_cast<int64_t>(context_len_) - static_cast<int64_t>(prompt_processor_ar_len_);
   ET_CHECK_MSG(
-      max_window_tokens > 0,
-      "Invalid prompt processor budget: context_len=%d ar_len=%d",
-      context_len_,
-      prompt_processor_ar_len_);
-  const int64_t score_stride =
-      std::min<int64_t>(static_cast<int64_t>(prompt_processor_ar_len_), max_window_tokens);
+      token_generator_ar_len_ == 1,
+      "Normal QNN WikiText PPL requires an AR-1 kv_forward graph, got AR-%d",
+      token_generator_ar_len_);
+  ET_CHECK_MSG(
+      start_token > 0,
+      "Normal hybrid WikiText PPL requires a non-empty prefill prefix");
+  ET_CHECK_MSG(
+      static_cast<int64_t>(start_token) + eval_tokens + 1 <= context_len_,
+      "WikiText range exceeds context: start=%d eval=%ld context=%d",
+      start_token,
+      eval_tokens,
+      context_len_);
 
-  double total_nll = 0.0;
-  int64_t total_scored_tokens = 0;
-  for (int64_t score_start = 0; score_start < eval_tokens; score_start += score_stride) {
-    const int64_t score_count =
-        std::min<int64_t>(score_stride, eval_tokens - score_start);
-    const int64_t window_end = score_start + score_count;
-    const int64_t window_start = std::max<int64_t>(0, window_end - max_window_tokens);
-    const int64_t window_token_count = window_end - window_start;
-    ET_CHECK_MSG(
-        window_token_count > 0 && window_token_count <= max_window_tokens,
-        "Invalid WikiText window size: %ld",
-        window_token_count);
+  std::vector<uint64_t> prefix(tokens.begin(), tokens.begin() + start_token);
+  auto prefill_res = prompt_processor_->prefill(
+      prefix, 0, false, attention_sink_rope_runner_.get());
+  ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
 
-    if (score_start != 0) {
-      reset();
-      ET_CHECK_OK_OR_RETURN_ERROR(load());
-    }
-
-    std::vector<uint64_t> window_tokens(
-        tokens.begin() + window_start, tokens.begin() + window_end);
-    prompt_processor_->clear_all_logits();
-    auto prefill_res = prompt_processor_->prefill(
-        window_tokens, 0, true, attention_sink_rope_runner_.get());
-    ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
-    const auto& prompt_logits = prompt_processor_->get_all_logits();
-    ET_CHECK_MSG(
-        prompt_logits.size() >=
-            static_cast<size_t>(window_token_count) * vocab_size_,
-        "Prompt logits buffer smaller than expected");
-
-    const int64_t first_score_row = score_start - window_start;
-    for (int64_t i = 0; i < score_count; ++i) {
-      const uint16_t* row = prompt_logits.data() +
-          static_cast<size_t>(first_score_row + i) * vocab_size_;
-      total_nll += nll_from_quantized_logits(
-          row,
-          vocab_size_,
-          tokens[score_start + i + 1],
-          logits_scale,
-          logits_zero_point);
-    }
-    total_scored_tokens += score_count;
-  }
+  std::vector<uint64_t> decode_tokens(
+      tokens.begin() + start_token,
+      tokens.begin() + start_token + eval_tokens + 1);
+  auto nll_res = token_generator_->evaluate_teacher_forced(
+      decode_tokens, start_token, logits_scale, logits_zero_point);
+  ET_CHECK_OK_OR_RETURN_ERROR(nll_res.error());
+  const double total_nll = nll_res.get();
+  const int64_t total_scored_tokens = eval_tokens;
 
   const int64_t inference_end_ms = time_in_ms();
   stats_.reset();
@@ -672,6 +702,14 @@ Error Runner<T>::evaluate_wikitext_ppl(
   print_performance_report(stats_, performance_output_path_);
 
   *ppl_out = std::exp(total_nll / static_cast<double>(total_scored_tokens));
+  ET_LOG(
+      Info,
+      "QNN teacher-forced WikiText: predictor_start=%d scored_tokens=%ld total_nll=%.12f mean_nll=%.12f ppl=%.12f",
+      start_token,
+      total_scored_tokens,
+      total_nll,
+      total_nll / static_cast<double>(total_scored_tokens),
+      *ppl_out);
   return Error::Ok;
 }
 

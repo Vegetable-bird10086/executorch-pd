@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include <cstddef>
+
 #include <executorch/backends/qualcomm/runtime/QnnBackendOptions.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/error.h>
@@ -18,6 +20,12 @@
 namespace executorch {
 namespace backends {
 namespace qnn {
+
+// Initializes the process-lifetime QNN backend/device bundle from an AOT
+// compile spec. This deliberately creates no QNN context, graph, or tensors.
+executorch::runtime::Error PrewarmQnnBackend(
+    const void* qnn_compile_spec_data,
+    size_t qnn_compile_spec_size);
 
 class QnnExecuTorchBackend final
     : public ::executorch::runtime::BackendInterface {

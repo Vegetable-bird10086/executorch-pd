@@ -22,6 +22,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/separate_embed.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
 #include <executorch/extension/llm/runner/irunner.h>
 #include <executorch/extension/llm/runner/stats.h>
@@ -70,7 +71,9 @@ class Runner : public executorch::extension::llm::IRunner {
       const int gcap = 0,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
-          attention_sink_rope_module = nullptr);
+          attention_sink_rope_module = nullptr,
+      const std::string& embedding_matrix_path = "",
+      bool resident_embedding = true);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -90,6 +93,7 @@ class Runner : public executorch::extension::llm::IRunner {
       std::function<void(const executorch::llm::Stats&)> stats_callback = {});
   executorch::runtime::Error evaluate_wikitext_ppl(
       const std::string& wikitext_path,
+      int32_t start_token,
       int32_t max_eval_tokens,
       float logits_scale,
       int32_t logits_zero_point,
@@ -130,6 +134,10 @@ class Runner : public executorch::extension::llm::IRunner {
   float temperature_;
   EvalMode eval_mode_;
   bool shared_buffer_;
+  bool prefill_only_load_{false};
+  std::string embedding_matrix_path_;
+  bool resident_embedding_{true};
+  SeparateEmbedding separate_embedding_;
 
   DecoderModelVersion decoder_model_version_;
   std::unique_ptr<IMemAlloc> buffer_manager_;

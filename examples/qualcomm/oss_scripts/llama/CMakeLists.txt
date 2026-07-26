@@ -33,6 +33,8 @@ list(
   ${CMAKE_CURRENT_LIST_DIR}/runner/decoder_runner.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/prompt_processor.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/prompt_processor.h
+  ${CMAKE_CURRENT_LIST_DIR}/runner/separate_embed.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/runner/separate_embed.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/token_generator.cpp
   ${CMAKE_CURRENT_LIST_DIR}/runner/token_generator.h
   ${CMAKE_CURRENT_LIST_DIR}/runner/pte_rebuilder.cpp
@@ -75,6 +77,8 @@ target_link_libraries(
   quantized_ops_lib
   quantized_kernels
   tokenizers::tokenizers
+  etdump
+  flatccrt
 )
 
 target_include_directories(
@@ -113,6 +117,8 @@ target_link_libraries(
   quantized_ops_lib
   quantized_kernels
   tokenizers::tokenizers
+  etdump
+  flatccrt
 )
 target_include_directories(
   qnn_llama_bench PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
@@ -161,6 +167,8 @@ target_link_libraries(
   quantized_ops_lib
   quantized_kernels
   tokenizers::tokenizers
+  etdump
+  flatccrt
 )
 target_compile_options(qnn_llama_pd_runner PUBLIC ${_common_compile_options})
 set_target_properties(
@@ -206,6 +214,8 @@ target_link_libraries(
   quantized_ops_lib
   quantized_kernels
   tokenizers::tokenizers
+  etdump
+  flatccrt
 )
 target_compile_options(qnn_llama_pd_e2e_runner PUBLIC ${_common_compile_options})
 set_target_properties(

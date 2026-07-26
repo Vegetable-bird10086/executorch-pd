@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import struct
 import types
 import gc
 
@@ -20,6 +21,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from executorch.backends.qualcomm._passes import FoldQDQ, I64toI32, TagQuantIO
+from executorch.backends.qualcomm.qnn_preprocess import (
+    consume_llama_quant_profile_batches,
+    reset_llama_quant_profile_batches,
+)
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
     get_capture_program_passes,
 )
@@ -30,6 +35,14 @@ from executorch.backends.qualcomm.builders.utils import is_graph_output
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 
 from executorch.backends.qualcomm.utils.constants import (
+    QCOM_DTYPE,
+    QCOM_QUANT_ATTRS,
+    QCOM_QUANT_MAX,
+    QCOM_QUANT_MIN,
+    QCOM_SCALE,
+    QCOM_SCALES,
+    QCOM_ZERO_POINT,
+    QCOM_ZERO_POINTS,
     QCOM_PASS_ACTIVATE_KEY,
     QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
 )
@@ -53,6 +66,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
     DECODE_QDQ_FILENAME,
     DECODER_GRAPH_NAMES,
+    SEPARATE_EMBED_INFO_FILENAME,
+    SEPARATE_EMBED_MATRIX_FILENAME,
     TEXT_DECODER,
     TEXT_ENCODER,
     TOK_EMBEDDING,
@@ -99,6 +114,18 @@ from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 from transformers import AutoModel
 
 
+_LLAMA_QNN_QUANT_PROFILE_CAPABILITIES = {
+    "exact_f32_scale_bits": True,
+    "raw_operator_parameters": True,
+    "operation_tensor_sources": True,
+    "embedded_static_affine_tensor_bytes": True,
+    "blockwise_weight_scale_payload": True,
+    "blockwise_weight_payload_digest": True,
+    "structured_decoder_tensor_bindings": True,
+    "complete_u16_tensor_qparams": True,
+}
+
+
 class TextDecoder(Component):
 
     def __init__(
@@ -118,6 +145,7 @@ class TextDecoder(Component):
         self.quant_recipe: StaticLLMQuantRecipe = (
             self.config.quant_recipe(True) if self.config.quant_recipe else None
         )
+        self.separate_embedding_weight = None
 
         # For multimodal embedding
         self.apply_embedding = apply_embedding
@@ -155,6 +183,9 @@ class TextDecoder(Component):
         graph_names: List[str],
         artifact_dir: str,
         base_name: str,
+        qnn_quant_profiles: Optional[List[Dict[str, Any]]] = None,
+        qnn_kv_profiles_by_graph: Optional[Dict[str, Dict[str, Any]]] = None,
+        gptq_source_recipe: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         def _node_shape(node):
             val = node.meta.get("val") if hasattr(node, "meta") else None
@@ -211,10 +242,62 @@ class TextDecoder(Component):
             return layer_start, layer_end_exclusive
 
         num_decoder_layers = int(self.meta["get_n_layers"])
+        profile_by_scope: Dict[str, Dict[str, Any]] = {}
+        profile_scopes_by_context_index: Dict[int, List[str]] = {}
+        if qnn_quant_profiles is not None:
+            for profile in qnn_quant_profiles:
+                if not isinstance(profile, dict):
+                    raise RuntimeError(
+                        "captured QNN quantization profile is not a JSON object"
+                    )
+                if profile.get("schema_version") != 2 or profile.get("format") != (
+                    "llama-qnn-quant-profile-v2"
+                ):
+                    raise RuntimeError(
+                        "unsupported captured QNN quantization profile schema: "
+                        f"{profile.get('format')} v{profile.get('schema_version')}"
+                    )
+                scope = profile.get("scope")
+                if not isinstance(scope, str) or not scope:
+                    raise RuntimeError("captured QNN quantization profile lacks scope")
+                if scope in profile_by_scope:
+                    raise RuntimeError(
+                        f"duplicate captured QNN quantization profile scope: {scope}"
+                    )
+                if not isinstance(profile.get("tensors"), dict) or not isinstance(
+                    profile.get("operations"), list
+                ):
+                    raise RuntimeError(
+                        f"captured QNN quantization profile {scope} is incomplete"
+                    )
+                if profile.get("capabilities") != _LLAMA_QNN_QUANT_PROFILE_CAPABILITIES:
+                    raise RuntimeError(
+                        f"captured QNN quantization profile {scope} lacks the "
+                        "exact-decode capability set"
+                    )
+                profile_by_scope[scope] = profile
+                scope_parts = scope.rsplit(".context_", 1)
+                if len(scope_parts) == 2 and scope_parts[1].isdigit():
+                    context_index = int(scope_parts[1])
+                    profile_scopes_by_context_index.setdefault(
+                        context_index, []
+                    ).append(scope)
+
         shard_manifest = {
             "combined_pte": os.path.join(artifact_dir, f"{base_name}.pte"),
             "num_shards": 0,
             "num_decoder_layers": num_decoder_layers,
+            "prefill_outputs_logits": not getattr(
+                self.control_args, "prefill_only_no_output", False
+            ),
+            "separate_embed": bool(
+                getattr(self.control_args, "separate_embed", False)
+            ),
+            "separate_embed_matrix": (
+                SEPARATE_EMBED_MATRIX_FILENAME
+                if getattr(self.control_args, "separate_embed", False)
+                else None
+            ),
             "graphs": {},
         }
         for graph_name in graph_names:
@@ -230,9 +313,6 @@ class TextDecoder(Component):
                 raise RuntimeError(
                     f"no lowered submodules found for sharded graph {graph_name}"
                 )
-            shard_manifest["num_shards"] = max(
-                shard_manifest["num_shards"], len(lowered_submodules)
-            )
             graph_manifest = {
                 "pte_paths": [],
                 "delegate_names": [name for name, _, _ in lowered_submodules],
@@ -240,13 +320,103 @@ class TextDecoder(Component):
                 "num_decoder_layers": num_decoder_layers,
                 "shards": [],
             }
-            shard_layer_ranges = [
-                _decoder_layer_range(lowered_module.original_module.graph)
-                for _, lowered_module, _ in lowered_submodules
-            ]
+            shard_layer_ranges = []
+            for _, lowered_module, _ in lowered_submodules:
+                try:
+                    shard_layer_ranges.append(
+                        _decoder_layer_range(lowered_module.original_module.graph)
+                    )
+                except RuntimeError:
+                    shard_layer_ranges = []
+                    break
+
+            if shard_layer_ranges:
+                graph_manifest["layer_range_source"] = "nn_module_stack"
+            else:
+                shard_count = len(lowered_submodules)
+                if num_decoder_layers % shard_count != 0:
+                    raise RuntimeError(
+                        "unable to infer non-uniform shard layer ranges without "
+                        "nn_module_stack metadata"
+                    )
+                layers_per_shard = num_decoder_layers // shard_count
+                shard_layer_ranges = [
+                    (
+                        shard_idx * layers_per_shard,
+                        (shard_idx + 1) * layers_per_shard,
+                    )
+                    for shard_idx in range(shard_count)
+                ]
+                graph_manifest["layer_range_source"] = "uniform_split_graph"
+                logging.warning(
+                    "Shard graph %s lacks nn_module_stack layer metadata; "
+                    "recording ranges from the configured uniform SplitGraph plan",
+                    graph_name,
+                )
+
+            diagnostic_shard_limit = int(
+                os.environ.get("ET_QNN_DIAGNOSTIC_SHARD_LIMIT", "0") or 0
+            )
+            if diagnostic_shard_limit:
+                retained_shards = min(
+                    diagnostic_shard_limit, len(lowered_submodules)
+                )
+                lowered_submodules = lowered_submodules[:retained_shards]
+                shard_layer_ranges = shard_layer_ranges[:retained_shards]
+                graph_manifest["delegate_names"] = [
+                    name for name, _, _ in lowered_submodules
+                ]
+                logging.warning(
+                    "Diagnostic shard serialization retained the first %d QNN "
+                    "delegate(s); uncompiled placeholders will not enter a PTE",
+                    retained_shards,
+                )
+            shard_manifest["num_shards"] = max(
+                shard_manifest["num_shards"], len(lowered_submodules)
+            )
             graph_manifest["shard_layer_starts"] = [
                 layer_start for layer_start, _ in shard_layer_ranges
             ]
+            profile_shards: List[Dict[str, Any]] = []
+            if qnn_quant_profiles is not None:
+                for shard_idx, (layer_start, layer_end_exclusive) in enumerate(
+                    shard_layer_ranges
+                ):
+                    scope = f"{graph_name}.context_{shard_idx}"
+                    profile = profile_by_scope.pop(scope, None)
+                    captured_scope = scope
+                    if profile is None:
+                        # QNN multi-method lowering owns the graph-name prefix.
+                        # Its context index is stable and ordered with the lowered
+                        # submodules, so it is the fallback ABI identity here.
+                        fallback_scopes = profile_scopes_by_context_index.get(
+                            shard_idx, []
+                        )
+                        captured_scope = (
+                            fallback_scopes[0] if len(fallback_scopes) == 1 else ""
+                        )
+                        if captured_scope:
+                            profile = profile_by_scope.pop(captured_scope, None)
+                    if profile is None:
+                        raise RuntimeError(
+                            "missing QNN quantization profile for exported shard: "
+                            f"graph={graph_name} shard={shard_idx} scope={scope} "
+                            f"captured_scopes={sorted(profile_by_scope)}"
+                        )
+                    profile_shards.append(
+                        {
+                            "scope": scope,
+                            "captured_scope": captured_scope,
+                            "layer_start": layer_start,
+                            "layer_end_exclusive": layer_end_exclusive,
+                            "tensors": profile["tensors"],
+                            "operations": profile["operations"],
+                            "logical_tensors": profile.get("logical_tensors", {}),
+                            "u16_tensor_index": profile.get("u16_tensor_index", {}),
+                            "coverage": profile.get("coverage", {}),
+                            "capabilities": profile["capabilities"],
+                        }
+                    )
             for shard_idx, (delegate_name, lowered_module, _) in enumerate(
                 lowered_submodules
             ):
@@ -301,6 +471,9 @@ class TextDecoder(Component):
                         "outputs": [_node_record(node) for node in output_nodes],
                     }
                 )
+                if profile_shards:
+                    profile_shards[shard_idx]["delegate_name"] = delegate_name
+                    profile_shards[shard_idx]["pte_path"] = shard_pte_path
                 logging.info(
                     "exported shard pte graph=%s shard=%d delegate=%s path=%s",
                     graph_name,
@@ -309,7 +482,26 @@ class TextDecoder(Component):
                     shard_pte_path,
                 )
                 gc.collect()
+            if profile_shards:
+                graph_profile = {
+                    "schema_version": 2,
+                    "format": "llama-qnn-quant-profile-v2",
+                    "quantization_formula": "real=(integer_code+offset)*scale",
+                    "capabilities": dict(_LLAMA_QNN_QUANT_PROFILE_CAPABILITIES),
+                    "shards": profile_shards,
+                }
+                if gptq_source_recipe is not None:
+                    graph_profile["gptq_source_recipe"] = gptq_source_recipe
+                if qnn_kv_profiles_by_graph and graph_name in qnn_kv_profiles_by_graph:
+                    graph_profile["kv_cache"] = qnn_kv_profiles_by_graph[graph_name]
+                graph_manifest["llama_qnn_quant_profile"] = graph_profile
             shard_manifest["graphs"][graph_name] = graph_manifest
+
+        if profile_by_scope:
+            raise RuntimeError(
+                "captured QNN quantization profiles did not match exported shards: "
+                f"unexpected scopes={sorted(profile_by_scope)}"
+            )
 
         shard_manifest_path = os.path.join(
             artifact_dir,
@@ -429,6 +621,28 @@ class TextDecoder(Component):
             dtype_override = DType[self.control_args.dtype_override]
             decoder = decoder.to(dtype_override.to_torch_dtype())
 
+        if getattr(self.control_args, "separate_embed", False):
+            embedding = getattr(decoder, "tok_embeddings", None)
+            if embedding is None or not hasattr(embedding, "weight"):
+                raise RuntimeError("separate embedding export requires decoder.tok_embeddings.weight")
+            separate_embed_dtype = getattr(
+                self.control_args, "separate_embed_dtype", "fp32"
+            )
+            dtype_map = {
+                "fp32": torch.float32,
+                "fp16": torch.float16,
+            }
+            if separate_embed_dtype not in dtype_map:
+                raise RuntimeError(
+                    f"Unsupported separate embedding dtype: {separate_embed_dtype}"
+                )
+            self.separate_embedding_weight = (
+                embedding.weight.detach()
+                .to(dtype_map[separate_embed_dtype])
+                .cpu()
+                .contiguous()
+            )
+
         # check embedding fallback
         if self.control_args.embedding_quantize:
             decoder = get_quant_embedding_transform(
@@ -536,6 +750,13 @@ class TextDecoder(Component):
                             break
 
     def _json_safe_value(self, value):
+        if isinstance(value, dict):
+            return {
+                str(key): self._json_safe_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe_value(item) for item in value]
         if isinstance(value, torch.Tensor):
             value = value.detach().cpu()
             return value.item() if value.numel() == 1 else value.tolist()
@@ -647,6 +868,199 @@ class TextDecoder(Component):
             json.dump(payload, f, indent=2, ensure_ascii=False)
             f.write("\n")
         logging.info("Saved KV quant attrs JSON to %s", json_path)
+
+    def _llama_qnn_kv_profile(self) -> Optional[Dict[str, Any]]:
+        output_qparams = self.kv_quant_attrs_sidecar.get("output")
+        if not output_qparams:
+            return None
+        n_layers = int(self.meta["get_n_layers"])
+        if len(output_qparams.get("k", [])) != n_layers or len(
+            output_qparams.get("v", [])
+        ) != n_layers:
+            raise RuntimeError(
+                "KV quantization profile is incomplete: expected one K and V "
+                f"record per layer ({n_layers})"
+            )
+        return {
+            "schema_version": 1,
+            "format": "llama-qnn-kv-profile-v1",
+            "quantization_formula": "real=(integer_code+offset)*scale",
+            "input_abi": {
+                "order": "tokens_or_hidden,attention_mask,position_ids,"
+                "k_cache[layer_0..N-1],v_cache[layer_0..N-1]",
+                "k_layout": "B,H,D,T",
+                "v_layout": "B,H,T,D",
+                "context_tokens": int(self.meta["get_max_context_len"])
+                - int(self.meta["get_ar_len"]),
+            },
+            "output_abi": {
+                "k_layout": "B,H,D,T",
+                "v_layout": "B,H,T,D",
+                "tokens_per_prefill_iteration": int(self.meta["get_ar_len"]),
+            },
+            # These records bind a QNN profile tensor back to a logical K/V layer.
+            # Its exact QNN scale/offset is found by matching node_name against
+            # profile.logical_tensors[*].fx_node_name.
+            "logical_output_qparams": output_qparams,
+        }
+
+    def _llama_gptq_source_recipe(self) -> Dict[str, Any]:
+        qweight_mode = str(
+            getattr(self.control_args, "qat_qweight_mode", "qweight_minus_qzeros")
+        )
+        if qweight_mode not in {"qweight_minus_qzeros", "qweight"}:
+            raise RuntimeError(f"unsupported GPTQ source qweight mode: {qweight_mode}")
+        source_bits = int(getattr(self.control_args, "qat_source_wbits", 2))
+        group_size = int(getattr(self.control_args, "qat_source_group_size", 32))
+        # QNN rebuild emits GS32 tiles.  A source GPTQ group must therefore
+        # cover an integral number of 32-column tiles (32, 64, 128, ...).
+        if source_bits != 2 or group_size <= 0 or group_size % 32 != 0:
+            raise RuntimeError(
+                "llama QNN exact-decode profile requires an INT2 source group "
+                "aligned to QNN GS32 tiles: "
+                f"bits={source_bits} group_size={group_size}"
+            )
+        return {
+            "schema_version": 1,
+            "format": "llama-gptq-source-recipe-v1",
+            "gguf_weight_type": f"GPTQ{source_bits}_{group_size}",
+            "source_weight_bits": source_bits,
+            "group_size": group_size,
+            "qweight_mode": qweight_mode,
+            "qnn_weight_code_contract": {
+                "schema_version": 1,
+                "source_group_size": group_size,
+                "source_group_code_bytes": group_size // 4,
+                "source_metadata_bytes": 4,
+                "source_code_packing": "four_int2_codes_per_byte_lsb_first",
+                "source_group_metadata": "fp16_le_scale_then_fp16_le_zero_bias",
+                "source_zero_point_formula": (
+                    "clamp(round(zero_bias/max(scale,0.0001)),0,3)"
+                ),
+                "source_code_bits": 2,
+                "qnn_code_bits": 4,
+                "qnn_code_formula": "qnn_signed_code=source_code-source_zero_point",
+                "qnn_code_storage": "two_complement_int4",
+                "qnn_pte_layout": "gs32_64_rows",
+                "decode_reconstruction": (
+                    "expand_gptq2_codes_in_registers_then_apply_qnn_blockwise_scale"
+                ),
+            },
+        }
+
+    def _activation_quant_tensor_meta(self, node):
+        value = node.meta.get("val")
+
+        def tensor_record(tensor):
+            return {
+                "shape": [str(dim) for dim in tensor.shape],
+                "dtype": str(tensor.dtype),
+            }
+
+        if isinstance(value, torch.Tensor):
+            return tensor_record(value)
+        if isinstance(value, (list, tuple)):
+            return [
+                tensor_record(item) if isinstance(item, torch.Tensor) else str(type(item))
+                for item in value
+            ]
+        return None
+
+    def _dump_lowered_activation_quant_attrs(self, edge_prog_mgr, graph_names):
+        if not getattr(self.control_args, "dump_activation_quant_attrs", False):
+            return
+
+        graphs = {}
+        total_records = 0
+        for graph_name in graph_names:
+            exported_program = edge_prog_mgr.exported_program(graph_name)
+            lowered_submodules = get_lowered_submodules(exported_program.graph_module)
+            if not lowered_submodules:
+                raise RuntimeError(
+                    "no lowered submodules found while dumping activation quant attrs "
+                    f"for graph {graph_name}"
+                )
+
+            shard_records = []
+            for shard_index, (delegate_name, lowered_module, _) in enumerate(
+                lowered_submodules
+            ):
+                records = []
+                for node in lowered_module.original_module.graph.nodes:
+                    quant_attrs = node.meta.get(QCOM_QUANT_ATTRS)
+                    if not quant_attrs:
+                        continue
+                    records.append(
+                        {
+                            "node_name": node.name,
+                            "node_op": node.op,
+                            "node_target": str(node.target),
+                            "tensor": self._activation_quant_tensor_meta(node),
+                            "quant_attrs": self._json_safe_value(quant_attrs),
+                            "scale": self._json_safe_value(
+                                quant_attrs.get(
+                                    QCOM_SCALES,
+                                    quant_attrs.get(QCOM_SCALE),
+                                )
+                            ),
+                            "zero_point": self._json_safe_value(
+                                quant_attrs.get(
+                                    QCOM_ZERO_POINTS,
+                                    quant_attrs.get(QCOM_ZERO_POINT),
+                                )
+                            ),
+                            "quant_min": self._json_safe_value(
+                                quant_attrs.get(QCOM_QUANT_MIN)
+                            ),
+                            "quant_max": self._json_safe_value(
+                                quant_attrs.get(QCOM_QUANT_MAX)
+                            ),
+                            "quantized_dtype": self._json_safe_value(
+                                quant_attrs.get(QCOM_DTYPE)
+                            ),
+                            "stack_trace": str(node.meta.get("stack_trace", "")),
+                            "source_fn_stack": str(
+                                node.meta.get("source_fn_stack", "")
+                            ),
+                        }
+                    )
+                shard_records.append(
+                    {
+                        "index": shard_index,
+                        "delegate_name": delegate_name,
+                        "records": records,
+                    }
+                )
+                total_records += len(records)
+            graphs[graph_name] = {"shards": shard_records}
+
+        if total_records == 0:
+            raise RuntimeError(
+                "no QCOM_QUANT_ATTRS found in lowered decoder shards; "
+                "cannot generate activation quantization sidecar"
+            )
+
+        artifact_dir = getattr(self.control_args, "artifact", ".")
+        os.makedirs(artifact_dir, exist_ok=True)
+        json_path = os.path.join(
+            artifact_dir,
+            f"{self.mode.name.lower()}_activation_quant_attrs.json",
+        )
+        payload = {
+            "format_version": "activation-quant-attrs-v1",
+            "mode": self.mode.name.lower(),
+            "model_mode": getattr(self.control_args, "model_mode", None),
+            "n_layers": self.meta.get("get_n_layers"),
+            "graphs": graphs,
+        }
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, ensure_ascii=False)
+            file.write("\n")
+        logging.info(
+            "Saved activation quant attrs JSON to %s (%d records)",
+            json_path,
+            total_records,
+        )
 
     def _tag_ios(self, node, fixed_point_type):
         atten_mask_shape = {
@@ -904,7 +1318,7 @@ class TextDecoder(Component):
                     if 'zero_point' in target:
                         kinds.append('zero_point')
                     kind_str = f" ({', '.join(kinds)})" if kinds else ''
-                    logger.info(
+                    logging.info(
                         '[get_attr]%s %s -> %s',
                         kind_str,
                         node.target,
@@ -1253,6 +1667,14 @@ class TextDecoder(Component):
         logger = getattr(self, "logger", None)
         if logger is None:
             logger = logging.getLogger(__name__)
+
+        if os.environ.get("ET_QNN_SKIP_QAT_DEQUANT_DUMP", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
 
         try:
             q_obj = self._resolve_attr(gm, q_attr)
@@ -3404,6 +3826,7 @@ class TextDecoder(Component):
                 use_i64_token=self.control_args.embedding_quantize is not None,
                 event_name=f"{event}_prompt",
                 lookahead_config=lookahead_config,
+                generate_tokens=not has_task_calibration,
             )
 
     def _run_post_replace_smoke_test(self, model):
@@ -3638,8 +4061,23 @@ class TextDecoder(Component):
                         keyword=getattr(self.control_args, "dump_quant_filter", None),
                     )
 
-            # start calibration (only for kv mode or prefill mode without kv cache)
-            if self.mode == Mode.DECODE or not self.model_args.use_kv_cache:
+            # Task calibration supports the prefill KV graph through
+            # GraphModuleCalibrationWrapper's chunked KV inference path.
+            has_task_calibration = self.control_args.tasks is not None
+            if (
+                self.mode == Mode.DECODE
+                or not self.model_args.use_kv_cache
+                or has_task_calibration
+            ):
+                if has_task_calibration:
+                    logging.info(
+                        "Running task calibration: mode=%s use_kv_cache=%s "
+                        "tasks=%s limit=%s",
+                        self.mode.name,
+                        self.model_args.use_kv_cache,
+                        self.control_args.tasks,
+                        self.control_args.limit,
+                    )
                 self._calibrate(
                     model=self.decoder,
                     tokenizer=data.tokenizer,
@@ -3823,12 +4261,22 @@ class HybridTextDecoder(Component):
         config: LLMModelConfig,
         apply_embedding: bool = False,
     ):
-        self.decode = TextDecoder(
-            control_args,
-            config,
-            Mode.DECODE,
-            apply_embedding=apply_embedding,
+        self.prefill_only_no_output = getattr(
+            control_args, "prefill_only_no_output", False
         )
+        self.prefill_only = self.prefill_only_no_output or getattr(
+            control_args, "prefill_only", False
+        )
+        if getattr(control_args, "separate_embed", False) and apply_embedding:
+            raise RuntimeError("--separate_embed supports text-only decoders only")
+        self.decode = None
+        if not self.prefill_only:
+            self.decode = TextDecoder(
+                control_args,
+                config,
+                Mode.DECODE,
+                apply_embedding=apply_embedding,
+            )
         self.prefill = TextDecoder(
             control_args,
             config,
@@ -3837,9 +4285,257 @@ class HybridTextDecoder(Component):
         )
         self.control_args = control_args
         self.config = config
-        self.set_next(self.decode).set_next(self.prefill)
+        if self.decode is None:
+            self.set_next(self.prefill)
+        else:
+            self.set_next(self.decode).set_next(self.prefill)
 
         self.apply_embedding = apply_embedding
+
+    @staticmethod
+    def _depends_on_node(node, source_node, memo):
+        if node == source_node:
+            return True
+        if node in memo:
+            return memo[node]
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                if HybridTextDecoder._depends_on_node(arg, source_node, memo):
+                    memo[node] = True
+                    return True
+            elif isinstance(arg, (tuple, list)):
+                for item in arg:
+                    if isinstance(item, torch.fx.Node) and HybridTextDecoder._depends_on_node(
+                        item, source_node, memo
+                    ):
+                        memo[node] = True
+                        return True
+        memo[node] = False
+        return False
+
+    @staticmethod
+    def _prune_dead_nodes(graph):
+        changed = True
+        while changed:
+            changed = False
+            for node in list(graph.nodes)[::-1]:
+                if node.op != "output" and not node.users:
+                    graph.erase_node(node)
+                    changed = True
+
+    @staticmethod
+    def _find_tokens_placeholder(graph, graph_name):
+        for node in graph.nodes:
+            if node.op == "placeholder" and "token" in node.name:
+                return node
+        raise RuntimeError(
+            f"Unable to find token placeholder in graph {graph_name} for separate embedding"
+        )
+
+    def _rewrite_decoder_input_for_separate_embed(
+        self, decoder_graph_module, graph_name, export_input
+    ):
+        graph = decoder_graph_module.graph
+        original_placeholders = [
+            node for node in graph.nodes if node.op == "placeholder"
+        ]
+        if len(original_placeholders) != len(export_input):
+            raise RuntimeError(
+                f"Graph {graph_name} placeholder/example-input mismatch before embedding rewrite: "
+                f"{len(original_placeholders)} vs {len(export_input)}"
+            )
+        original_inputs = {
+            node.name: value
+            for node, value in zip(original_placeholders, export_input)
+        }
+        tokens_node = self._find_tokens_placeholder(graph, graph_name)
+        memo = {}
+        boundary = None
+        for node in graph.nodes:
+            if node.op == "placeholder" or not self._depends_on_node(
+                node, tokens_node, memo
+            ):
+                continue
+            value = node.meta.get("val")
+            shape = getattr(value, "shape", None)
+            if shape is not None and len(shape) == 3:
+                boundary = node
+                break
+        if boundary is None:
+            raise RuntimeError(
+                f"Unable to identify embedding boundary in graph {graph_name}"
+            )
+
+        value = boundary.meta.get("val")
+        if value is None or not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            raise RuntimeError(
+                f"Embedding boundary in graph {graph_name} has no tensor metadata"
+            )
+        # QNN HTP lowering supports the decoder boundary as FP32. The sidecar
+        # may store FP16 rows, which the runtime converts before binding this input.
+        external_dtype = value.dtype
+        hidden_input = torch.zeros(list(value.shape), dtype=external_dtype)
+        with graph.inserting_before(tokens_node):
+            hidden_states = graph.placeholder("hidden_states")
+            hidden_states.meta = dict(boundary.meta)
+            hidden_states.meta["val"] = value
+        boundary.replace_all_uses_with(hidden_states)
+        self._prune_dead_nodes(graph)
+        graph.lint()
+
+        rewritten_inputs = []
+        placeholders = [
+            node
+            for node in graph.nodes
+            if node.op == "placeholder"
+        ]
+        if not placeholders or placeholders[0].name != "hidden_states":
+            raise RuntimeError(
+                f"Graph {graph_name} has invalid placeholder order after embedding rewrite: "
+                f"{[node.name for node in placeholders]}"
+            )
+        for node in placeholders:
+            if node.name == "hidden_states":
+                rewritten_inputs.append(hidden_input)
+            elif node.name in original_inputs:
+                rewritten_inputs.append(original_inputs[node.name])
+            else:
+                raise RuntimeError(
+                    f"Graph {graph_name} introduced unexpected placeholder {node.name}"
+                )
+        # torch.export(...).module() uses FXs PyTree code generator. Removing
+        # dead cache placeholders changes the flattened input ABI, so update
+        # both the GraphModule and the code generator before recompiling.
+        input_spec = torch.utils._pytree.tree_flatten(
+            (tuple(rewritten_inputs), {})
+        )[1]
+        codegen = graph._codegen
+        pytree_info = getattr(codegen, "pytree_info", None)
+        if pytree_info is not None:
+            codegen.pytree_info = pytree_info._replace(
+                orig_args=[node.name for node in placeholders],
+                in_spec=input_spec,
+            )
+        decoder_graph_module._in_spec = input_spec
+        decoder_graph_module.recompile()
+        return {
+            "graph_name": graph_name,
+            "hidden_states_shape": list(value.shape),
+            "hidden_states_dtype": str(external_dtype),
+            "decoder_hidden_states_dtype": str(value.dtype),
+            "input_count": len(rewritten_inputs),
+        }, tuple(rewritten_inputs)
+
+    @staticmethod
+    def _flat_graph_outputs(output_node):
+        outputs = output_node.args[0]
+        if isinstance(outputs, (tuple, list)) and len(outputs) == 1:
+            inner = outputs[0]
+            if isinstance(inner, (tuple, list)):
+                outputs = inner
+        return list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
+
+    def _remove_logits_output(
+        self, decoder_graph_module, graph_name, export_input
+    ):
+        graph = decoder_graph_module.graph
+        original_placeholders = [
+            node for node in graph.nodes if node.op == "placeholder"
+        ]
+        if len(original_placeholders) != len(export_input):
+            raise RuntimeError(
+                f"Graph {graph_name} placeholder/example-input mismatch before logits removal: "
+                f"{len(original_placeholders)} vs {len(export_input)}"
+            )
+        original_inputs = {
+            node.name: value
+            for node, value in zip(original_placeholders, export_input)
+        }
+        output_node = next(node for node in graph.nodes if node.op == "output")
+        outputs = self._flat_graph_outputs(output_node)
+        if len(outputs) < 3:
+            raise RuntimeError(
+                f"Graph {graph_name} has no logits plus KV output tuple to rewrite"
+            )
+        output_node.args = (tuple(outputs[1:]),)
+        self._prune_dead_nodes(graph)
+        graph.lint()
+
+        placeholders = [
+            node for node in graph.nodes if node.op == "placeholder"
+        ]
+        rewritten_inputs = []
+        for node in placeholders:
+            if node.name not in original_inputs:
+                raise RuntimeError(
+                    f"Graph {graph_name} introduced unexpected placeholder {node.name} "
+                    "while removing logits"
+                )
+            rewritten_inputs.append(original_inputs[node.name])
+
+        input_spec = torch.utils._pytree.tree_flatten(
+            (tuple(rewritten_inputs), {})
+        )[1]
+        codegen = graph._codegen
+        pytree_info = getattr(codegen, "pytree_info", None)
+        if pytree_info is not None:
+            codegen.pytree_info = pytree_info._replace(
+                orig_args=[node.name for node in placeholders],
+                in_spec=input_spec,
+                out_spec=None,
+            )
+        decoder_graph_module._in_spec = input_spec
+        decoder_graph_module._out_spec = None
+        decoder_graph_module.recompile()
+        return tuple(rewritten_inputs)
+
+    @staticmethod
+    def _embedding_dtype_code(dtype):
+        codes = {
+            torch.float32: 1,
+            torch.float16: 2,
+            torch.int8: 3,
+            torch.uint8: 4,
+            torch.int16: 5,
+            torch.uint16: 6,
+            torch.int32: 7,
+            torch.int64: 8,
+        }
+        if dtype not in codes:
+            raise RuntimeError(f"Unsupported separate embedding dtype: {dtype}")
+        return codes[dtype]
+
+    def _dump_separate_embedding_matrix(self):
+        weight = self.prefill.separate_embedding_weight
+        if weight is None or weight.dim() != 2:
+            raise RuntimeError("Missing 2D token embedding weight for separate export")
+        weight = weight.detach().cpu().contiguous()
+        if weight.dtype == torch.bfloat16:
+            weight = weight.to(torch.float32)
+        raw = weight.numpy().tobytes(order="C")
+        matrix_path = os.path.join(
+            self.control_args.artifact, SEPARATE_EMBED_MATRIX_FILENAME
+        )
+        with open(matrix_path, "wb") as output:
+            output.write(struct.pack("<4sII", b"SEMB", 1, 0))
+            output.write(
+                struct.pack(
+                    "<IIQ",
+                    self._embedding_dtype_code(weight.dtype),
+                    weight.dim(),
+                    len(raw),
+                )
+            )
+            output.write(struct.pack(f"<{weight.dim()}I", *weight.shape))
+            output.write(raw)
+            for _ in range(3):
+                output.write(struct.pack("<IIQ", 0, 0, 0))
+        return matrix_path, {
+            "format": "SEMB_v1",
+            "quantized": False,
+            "dtype": str(weight.dtype),
+            "shape": list(weight.shape),
+        }
 
     def _encoding_override(self, decode_model, prefill_model):  # noqa: C901
         pbq_target = {
@@ -3943,7 +4639,7 @@ class HybridTextDecoder(Component):
         # here we use a mechanism to make sure the encoding align correctly and
         # save AoT quantization time as well.
         # ---
-        if self.prefill.decoder is not None and self.prefill.model_args.use_kv_cache:
+        if self.decode is not None and self.prefill.decoder is not None and self.prefill.model_args.use_kv_cache:
             self._encoding_override(
                 decode_model=self.decode.decoder,
                 prefill_model=self.prefill.decoder,
@@ -3973,9 +4669,51 @@ class HybridTextDecoder(Component):
 
         # prepare lowering decoder
         data = request.method_data[TEXT_DECODER]
-        models = [d for d in [self.decode, self.prefill] if d.decoder is not None]
-        example_inputs = [m.export_input for m in models if m is not None]
-        graph_names = DECODER_GRAPH_NAMES[: len(models)]
+        if self.prefill_only:
+            models = [self.prefill]
+            graph_names = ["prefill_forward"]
+        else:
+            models = [d for d in [self.decode, self.prefill] if d.decoder is not None]
+            graph_names = DECODER_GRAPH_NAMES[: len(models)]
+
+        if getattr(self.control_args, "separate_embed", False):
+            matrix_path, matrix_meta = self._dump_separate_embedding_matrix()
+            separate_embed_info = []
+            for graph_name, model in zip(graph_names, models):
+                graph_info, rewritten_export_input = (
+                    self._rewrite_decoder_input_for_separate_embed(
+                        model.decoder, graph_name, model.export_input
+                    )
+                )
+                model.export_input = rewritten_export_input
+                separate_embed_info.append(graph_info)
+            sidecar_path = os.path.join(
+                self.control_args.artifact, SEPARATE_EMBED_INFO_FILENAME
+            )
+            with open(sidecar_path, "w") as info_file:
+                json.dump(
+                    {
+                        "model_mode": self.control_args.model_mode,
+                        "embedding_matrix": {
+                            "file": os.path.basename(matrix_path),
+                            **matrix_meta,
+                        },
+                        "graphs": separate_embed_info,
+                    },
+                    info_file,
+                    indent=2,
+                )
+            logging.info("Saved separate embedding matrix to %s", matrix_path)
+            logging.info("Saved separate embedding sidecar to %s", sidecar_path)
+
+        if self.prefill_only_no_output:
+            self.prefill.export_input = self._remove_logits_output(
+                self.prefill.decoder,
+                "prefill_forward",
+                self.prefill.export_input,
+            )
+
+        example_inputs = [m.export_input for m in models]
 
         # start lowering
         if self.apply_embedding:
@@ -4031,15 +4769,55 @@ class HybridTextDecoder(Component):
         # exit()
 
         # decoder lowering
+        emit_llama_qnn_quant_profile = bool(
+            getattr(self.control_args, "emit_llama_qnn_quant_profile", False)
+        )
+        qnn_quant_profiles = None
+        previous_profile_flag = None
+        if emit_llama_qnn_quant_profile:
+            previous_profile_flag = os.environ.get("ET_QNN_LLAMA_QUANT_PROFILE")
+            reset_llama_quant_profile_batches()
+            os.environ["ET_QNN_LLAMA_QUANT_PROFILE"] = "1"
+
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             module=dict(zip(graph_names, [model.decoder for model in models])),
             inputs=dict(zip(graph_names, example_inputs)),
             compiler_specs=dict(zip(graph_names, data.compile_spec)),
-            constant_methods={**self.decode.meta},
+            constant_methods={**models[0].meta},
             dep_table=dict(zip(graph_names, [model.dep_table for model in models])),
             passes_job=dict(zip(graph_names, [model.passes_job for model in models])),
             skip_node_op_set={"llama.fallback.default"},
         )
+
+        diagnostic_shard_limit = os.environ.get(
+            "ET_QNN_DIAGNOSTIC_SHARD_LIMIT", ""
+        )
+        if diagnostic_shard_limit:
+            if not getattr(self.control_args, "dump_intermediate_outputs", False):
+                raise RuntimeError(
+                    "ET_QNN_DIAGNOSTIC_SHARD_LIMIT is restricted to exports using "
+                    "--dump_intermediate_outputs"
+                )
+            if emit_llama_qnn_quant_profile:
+                raise RuntimeError(
+                    "ET_QNN_DIAGNOSTIC_SHARD_LIMIT cannot be combined with "
+                    "--emit_llama_qnn_quant_profile"
+                )
+            data = request.method_data[TEXT_DECODER]
+            models[0]._export_sharded_decoder_ptes(
+                edge_prog_mgr=edge_prog_mgr,
+                graph_names=graph_names,
+                artifact_dir=self.control_args.artifact,
+                base_name=data.pte_filename,
+            )
+            logging.warning(
+                "Completed diagnostic-only QNN shard export; skipped combined PTE "
+                "serialization and remaining shards"
+            )
+            return
+
+        for graph_name, model in zip(graph_names, models):
+            model._dump_lowered_activation_quant_attrs(edge_prog_mgr, [graph_name])
 
         if getattr(self.control_args, "replace_with_qat_checkpoint", None) and getattr(
             self.control_args, "qat_verify_chain", False
@@ -4074,17 +4852,60 @@ class HybridTextDecoder(Component):
                 alloc_graph_output=False,
             ),
         )
-        exec_prog_mgr = edge_prog_mgr.to_executorch(executorch_config)
+        try:
+            exec_prog_mgr = edge_prog_mgr.to_executorch(executorch_config)
+        finally:
+            if emit_llama_qnn_quant_profile:
+                qnn_quant_profiles = consume_llama_quant_profile_batches()
+                if not qnn_quant_profiles:
+                    raise RuntimeError(
+                        "QNN quantization profile capture produced no shard records"
+                    )
+                logging.info(
+                    "Captured QNN quantization profile shards: count=%d scopes=%s",
+                    len(qnn_quant_profiles),
+                    [profile.get("scope") for profile in qnn_quant_profiles],
+                )
+                if previous_profile_flag is None:
+                    os.environ.pop("ET_QNN_LLAMA_QUANT_PROFILE", None)
+                else:
+                    os.environ["ET_QNN_LLAMA_QUANT_PROFILE"] = previous_profile_flag
+
+        if emit_llama_qnn_quant_profile and self.config.num_sharding <= 1:
+            raise RuntimeError(
+                "--emit_llama_qnn_quant_profile currently requires --num_sharding "
+                "so the profile can be embedded in a shard manifest"
+            )
+        qnn_kv_profiles_by_graph = {}
+        gptq_source_recipe = None
+        if emit_llama_qnn_quant_profile:
+            # The recipe describes the shared source GGUF contract.  It lives
+            # on TextDecoder (each entry in models), not on this HybridTextDecoder
+            # orchestrator.
+            gptq_source_recipe = models[0]._llama_gptq_source_recipe()
+            for graph_name, model in zip(graph_names, models):
+                if graph_name != "prefill_forward":
+                    continue
+                kv_profile = model._llama_qnn_kv_profile()
+                if kv_profile is None:
+                    raise RuntimeError(
+                        "prefill QNN quantization profile requested but KV metadata "
+                        "was not captured"
+                    )
+                qnn_kv_profiles_by_graph[graph_name] = kv_profile
         data = request.method_data[TEXT_DECODER]
         combined_pte_path = f"{self.control_args.artifact}/{data.pte_filename}.pte"
         with open(combined_pte_path, "wb") as file:
             exec_prog_mgr.write_to_file(file)
         if self.config.num_sharding > 1:
-            self.decode._export_sharded_decoder_ptes(
+            models[0]._export_sharded_decoder_ptes(
                 edge_prog_mgr=edge_prog_mgr,
                 graph_names=graph_names,
                 artifact_dir=self.control_args.artifact,
                 base_name=data.pte_filename,
+                qnn_quant_profiles=qnn_quant_profiles,
+                qnn_kv_profiles_by_graph=qnn_kv_profiles_by_graph,
+                gptq_source_recipe=gptq_source_recipe,
             )
 
 

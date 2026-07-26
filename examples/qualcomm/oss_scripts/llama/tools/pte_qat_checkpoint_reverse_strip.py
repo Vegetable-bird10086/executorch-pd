@@ -70,6 +70,36 @@ INVALID_OP_ID = 0xFF
 DEFAULT_NUM_LAYERS = 28
 DEFAULT_OLD_PTE = "/root/autodl-tmp/executorch/llama_qnn/hybrid_llama_qnn.pte"
 
+_LLAMA_QNN_QUANT_PROFILE_CAPABILITIES = {
+    "exact_f32_scale_bits": True,
+    "raw_operator_parameters": True,
+    "operation_tensor_sources": True,
+    "embedded_static_affine_tensor_bytes": True,
+    "blockwise_weight_scale_payload": True,
+    "blockwise_weight_payload_digest": True,
+    "structured_decoder_tensor_bindings": True,
+    "complete_u16_tensor_qparams": True,
+}
+
+def _gptq2_qnn_weight_code_contract(group_size: int) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "source_group_size": group_size,
+        "source_group_code_bytes": group_size // 4,
+        "source_metadata_bytes": 4,
+        "source_code_packing": "four_int2_codes_per_byte_lsb_first",
+        "source_group_metadata": "fp16_le_scale_then_fp16_le_zero_bias",
+        "source_zero_point_formula": "clamp(round(zero_bias/max(scale,0.0001)),0,3)",
+        "source_code_bits": 2,
+        "qnn_code_bits": 4,
+        "qnn_code_formula": "qnn_signed_code=source_code-source_zero_point",
+        "qnn_code_storage": "two_complement_int4",
+        "qnn_pte_layout": "gs32_64_rows",
+        "decode_reconstruction": (
+            "expand_gptq2_codes_in_registers_then_apply_qnn_blockwise_scale"
+        ),
+    }
+
 
 @dataclass
 class QATWeightSpec:
@@ -485,7 +515,7 @@ def realtime_delete(
     layer_end_exclusive: int = DEFAULT_NUM_LAYERS,
     split_layer_starts: Optional[List[int]] = None,
     shard_index: Optional[int] = None,
-) -> Tuple[bytearray, Dict[str, Any], List[str]]:
+) -> Tuple[bytearray, Dict[str, Any], List[str], bytes]:
     order = expected_reverse_names(
         include_output=include_output,
         layer_start=layer_start,
@@ -659,9 +689,10 @@ def realtime_delete(
         if split_layer_starts is not None
         else build_split_starts(num_layers, num_splits),
         "shard_index": shard_index,
+        "stripped_output_weight": include_output,
         "records": records,
     }
-    return stripped_buf, index_payload, report_lines
+    return stripped_buf, index_payload, report_lines, source_bytes
 
 
 
@@ -701,6 +732,234 @@ def write_binary_index(index_bin: Path, index_payload: Dict[str, Any]) -> None:
             )
         )
     index_bin.write_bytes(bytes(payload))
+
+
+def _read_u16(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 2 > len(data):
+        raise ValueError(f"flatbuffer u16 offset out of range: {offset}")
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+def _read_u32(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 4 > len(data):
+        raise ValueError(f"flatbuffer u32 offset out of range: {offset}")
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def _read_i32(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 4 > len(data):
+        raise ValueError(f"flatbuffer i32 offset out of range: {offset}")
+    return struct.unpack_from("<i", data, offset)[0]
+
+
+def _table_field(data: bytes, table: int, field_id: int) -> Optional[int]:
+    vtable = table - _read_i32(data, table)
+    if vtable < 0:
+        raise ValueError(f"flatbuffer vtable offset out of range: {vtable}")
+    vtable_size = _read_u16(data, vtable)
+    entry = vtable + 4 + 2 * field_id
+    if entry + 2 > vtable + vtable_size:
+        return None
+    relative = _read_u16(data, entry)
+    if relative == 0:
+        return None
+    field = table + relative
+    if field >= len(data):
+        raise ValueError(f"flatbuffer field offset out of range: {field}")
+    return field
+
+
+def _offset_target(data: bytes, offset: int) -> int:
+    target = offset + _read_u32(data, offset)
+    if target >= len(data):
+        raise ValueError(f"flatbuffer offset target out of range: {target}")
+    return target
+
+
+def _table_vector(data: bytes, field: Optional[int]) -> List[int]:
+    if field is None:
+        return []
+    vector = _offset_target(data, field)
+    count = _read_u32(data, vector)
+    entries = vector + 4
+    if entries + 4 * count > len(data):
+        raise ValueError("flatbuffer table vector exceeds PTE size")
+    return [_offset_target(data, entries + 4 * index) for index in range(count)]
+
+
+def _string_field(data: bytes, field: Optional[int]) -> Optional[str]:
+    if field is None:
+        return None
+    string = _offset_target(data, field)
+    count = _read_u32(data, string)
+    start = string + 4
+    if start + count > len(data):
+        raise ValueError("flatbuffer string exceeds PTE size")
+    return data[start : start + count].decode("utf-8")
+
+
+def _byte_vector(data: bytes, field: Optional[int]) -> Optional[bytes]:
+    if field is None:
+        return None
+    vector = _offset_target(data, field)
+    count = _read_u32(data, vector)
+    start = vector + 4
+    if start + count > len(data):
+        raise ValueError("flatbuffer byte vector exceeds PTE size")
+    return bytes(data[start : start + count])
+
+
+def extract_qnn_compile_spec_from_complete_pte(pte_bytes: bytes) -> bytes:
+    # The input is the original complete PTE. Never call this for stripped.pte.
+    program = _read_u32(pte_bytes, 0)
+    for plan in _table_vector(pte_bytes, _table_field(pte_bytes, program, 1)):
+        for delegate in _table_vector(pte_bytes, _table_field(pte_bytes, plan, 7)):
+            for spec in _table_vector(pte_bytes, _table_field(pte_bytes, delegate, 2)):
+                if _string_field(pte_bytes, _table_field(pte_bytes, spec, 0)) != "qnn_compile_spec":
+                    continue
+                value = _byte_vector(pte_bytes, _table_field(pte_bytes, spec, 1))
+                if value:
+                    return value
+    raise ValueError("qnn_compile_spec not found in complete PTE")
+
+
+def embed_qnn_compile_spec_in_manifest(
+    manifest_path: Path, qnn_compile_spec: bytes
+) -> None:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    encoded = qnn_compile_spec.hex()
+    existing = payload.get("qnn_compile_spec_hex")
+    if existing is not None and existing != encoded:
+        raise ValueError(
+            f"qnn_compile_spec_hex in {manifest_path} does not match the complete PTE"
+        )
+    payload["qnn_compile_spec_hex"] = encoded
+    manifest_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def embed_llama_qnn_quant_profile_in_manifest(
+    source_manifest_path: Path,
+    destination_manifest_path: Path,
+    graph_name: str,
+) -> None:
+    source_payload = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    source_graph = source_payload.get("graphs", {}).get(graph_name)
+    if not isinstance(source_graph, dict):
+        raise ValueError(
+            f"graph {graph_name!r} is missing from source manifest: {source_manifest_path}"
+        )
+    profile = source_graph.get("llama_qnn_quant_profile")
+    if not isinstance(profile, dict):
+        raise ValueError(
+            "source manifest has no embedded llama_qnn_quant_profile; re-export "
+            "with --emit_llama_qnn_quant_profile"
+        )
+    if profile.get("schema_version") != 2 or profile.get("format") != (
+        "llama-qnn-quant-profile-v2"
+    ):
+        raise ValueError("source manifest has an unsupported llama QNN profile schema")
+    if profile.get("capabilities") != _LLAMA_QNN_QUANT_PROFILE_CAPABILITIES:
+        raise ValueError(
+            "source manifest has an incomplete llama QNN exact-decode profile"
+        )
+    gptq_source_recipe = profile.get("gptq_source_recipe")
+    if not isinstance(gptq_source_recipe, dict) or (
+        gptq_source_recipe.get("schema_version") != 1
+        or gptq_source_recipe.get("format") != "llama-gptq-source-recipe-v1"
+    ):
+        raise ValueError(
+            "source manifest has no complete GPTQ source recipe in "
+            "llama_qnn_quant_profile; re-export with "
+            "--emit_llama_qnn_quant_profile"
+        )
+    source_weight_bits = int(gptq_source_recipe.get("source_weight_bits", 0))
+    group_size = int(gptq_source_recipe.get("group_size", 0))
+    if (
+        source_weight_bits != 2
+        or group_size <= 0
+        or group_size % 32 != 0
+        or gptq_source_recipe.get("gguf_weight_type") != f"GPTQ2_{group_size}"
+        or gptq_source_recipe.get("qweight_mode")
+        not in {"qweight_minus_qzeros", "qweight"}
+        or gptq_source_recipe.get("qnn_weight_code_contract")
+        != _gptq2_qnn_weight_code_contract(group_size)
+    ):
+        raise ValueError("source manifest has an invalid GPTQ source recipe")
+    profile_shards = profile.get("shards")
+    source_shards = source_graph.get("shards")
+    if not isinstance(profile_shards, list) or not isinstance(source_shards, list):
+        raise ValueError("source manifest has incomplete shard/profile metadata")
+    if len(profile_shards) != len(source_shards):
+        raise ValueError(
+            "source manifest QNN profile shard count does not match graph shard count"
+        )
+    for shard_index, profile_shard in enumerate(profile_shards):
+        if not isinstance(profile_shard, dict):
+            raise ValueError(f"QNN profile shard {shard_index} is not an object")
+        if profile_shard.get("capabilities") != _LLAMA_QNN_QUANT_PROFILE_CAPABILITIES:
+            raise ValueError(
+                f"QNN profile shard {shard_index} has an incomplete capability set"
+            )
+        tensors = profile_shard.get("tensors")
+        operations = profile_shard.get("operations")
+        u16_tensor_index = profile_shard.get("u16_tensor_index")
+        if (
+            not isinstance(tensors, dict)
+            or not isinstance(operations, list)
+            or not isinstance(u16_tensor_index, dict)
+        ):
+            raise ValueError(f"QNN profile shard {shard_index} has incomplete graph data")
+        expected_u16_tensors = {
+            tensor_name
+            for tensor_name, tensor in tensors.items()
+            if isinstance(tensor, dict)
+            and tensor.get("data_type") == "QNN_DATATYPE_UFIXED_POINT_16"
+        }
+        if set(u16_tensor_index) != expected_u16_tensors:
+            raise ValueError(
+                f"QNN profile shard {shard_index} has incomplete U16 tensor coverage"
+            )
+        for tensor_name, tensor in tensors.items():
+            if not isinstance(tensor, dict):
+                raise ValueError(
+                    f"QNN profile shard {shard_index} tensor {tensor_name} is invalid"
+                )
+            if tensor.get("tensor_type") != "QNN_TENSOR_TYPE_STATIC":
+                continue
+            static_payload = tensor.get("static_payload")
+            if not isinstance(static_payload, dict):
+                raise ValueError(
+                    f"QNN profile shard {shard_index} static tensor {tensor_name} "
+                    "lacks exact payload metadata"
+                )
+            encoding = tensor.get("quantization_encoding")
+            expected_storage = (
+                "external_gptq_int2_source_reconstruction"
+                if encoding == "QNN_QUANTIZATION_ENCODING_BLOCKWISE_EXPANSION"
+                else "embedded_exact_bytes"
+            )
+            if static_payload.get("storage") != expected_storage:
+                raise ValueError(
+                    f"QNN profile shard {shard_index} static tensor {tensor_name} "
+                    "has an invalid payload contract"
+                )
+
+    destination_payload = json.loads(destination_manifest_path.read_text(encoding="utf-8"))
+    destination_graphs = destination_payload.setdefault("graphs", {})
+    destination_graph = destination_graphs.setdefault(graph_name, {})
+    existing = destination_graph.get("llama_qnn_quant_profile")
+    if existing is not None and existing != profile:
+        raise ValueError(
+            f"llama_qnn_quant_profile in {destination_manifest_path} does not "
+            "match the source export manifest"
+        )
+    destination_graph["llama_qnn_quant_profile"] = profile
+    destination_manifest_path.write_text(
+        json.dumps(destination_payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def write_outputs(
@@ -806,9 +1065,41 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--out-dir", default="pte_qat_strip_out", help="Output directory")
     ap.add_argument(
+        "--embed-qnn-compile-spec-manifest",
+        default=None,
+        help="Manifest JSON to receive qnn_compile_spec_hex from the complete PTE.",
+    )
+    ap.add_argument(
+        "--qnn-compile-spec-only",
+        action="store_true",
+        help="Only extract qnn_compile_spec from --old-pte and embed it in the requested manifest.",
+    )
+    ap.add_argument(
+        "--embed-llama-qnn-quant-profile-manifest",
+        default=None,
+        help=(
+            "Device manifest JSON that receives the embedded QNN quantization "
+            "profile from --llama-qnn-quant-profile-source-manifest or "
+            "--shard-manifest."
+        ),
+    )
+    ap.add_argument(
+        "--llama-qnn-quant-profile-source-manifest",
+        default=None,
+        help=(
+            "Exported *.shards.json containing llama_qnn_quant_profile. "
+            "Defaults to --shard-manifest."
+        ),
+    )
+    ap.add_argument(
         "--keep-output",
         action="store_true",
         help="Keep output.conv in stripped.pte and exclude it from rebuild indexes",
+    )
+    ap.add_argument(
+        "--no-output",
+        action="store_true",
+        help="The exported prefill PTE has no LM head/logits output, so output.conv is absent.",
     )
     ap.add_argument(
         "--no-strict",
@@ -881,11 +1172,46 @@ def read_manifest_shard(
             for entry in sorted(shards, key=lambda entry: int(entry["index"]))
         ],
         "shard_index": shard_index,
+        "prefill_outputs_logits": bool(payload.get("prefill_outputs_logits", True)),
     }
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.qnn_compile_spec_only:
+        if args.old_pte is None or args.embed_qnn_compile_spec_manifest is None:
+            raise ValueError(
+                "--qnn-compile-spec-only requires --old-pte and "
+                "--embed-qnn-compile-spec-manifest"
+            )
+        old_pte = Path(args.old_pte).expanduser().resolve()
+        manifest_path = Path(args.embed_qnn_compile_spec_manifest).expanduser().resolve()
+        qnn_compile_spec = extract_qnn_compile_spec_from_complete_pte(
+            old_pte.read_bytes()
+        )
+        embed_qnn_compile_spec_in_manifest(manifest_path, qnn_compile_spec)
+        print(
+            f"embedded qnn_compile_spec_hex ({len(qnn_compile_spec)} bytes) -> "
+            f"{manifest_path}"
+        )
+        if args.embed_llama_qnn_quant_profile_manifest is not None:
+            if args.llama_qnn_quant_profile_source_manifest is None:
+                raise ValueError(
+                    "--qnn-compile-spec-only profile embedding requires "
+                    "--llama-qnn-quant-profile-source-manifest"
+                )
+            source_manifest = Path(
+                args.llama_qnn_quant_profile_source_manifest
+            ).expanduser().resolve()
+            destination_manifest = Path(
+                args.embed_llama_qnn_quant_profile_manifest
+            ).expanduser().resolve()
+            embed_llama_qnn_quant_profile_in_manifest(
+                source_manifest, destination_manifest, args.shard_graph
+            )
+            print(f"embedded llama_qnn_quant_profile -> {destination_manifest}")
+        return
 
     manifest_shard = None
     if args.shard_manifest is not None:
@@ -936,22 +1262,27 @@ def main() -> None:
             f"invalid layer range: [{layer_start}, {layer_end_exclusive}) for num_layers={num_layers}"
         )
 
+    include_output = not args.keep_output and not args.no_output
+    if manifest_shard is not None and not manifest_shard["prefill_outputs_logits"]:
+        include_output = False
+        print("manifest declares prefill_outputs_logits=false; skipping output.conv strip")
+
     qat_sd = load_file(str(qat_checkpoint))
     specs_by_name = build_qat_specs(
-        include_output=not args.keep_output,
+        include_output=include_output,
         layer_start=layer_start,
         layer_end_exclusive=layer_end_exclusive,
     )
     strict = not args.no_strict
 
-    stripped, index_payload, report_lines = realtime_delete(
+    stripped, index_payload, report_lines, complete_pte_bytes = realtime_delete(
         old_pte=old_pte,
         specs_by_name=specs_by_name,
         qat_sd=qat_sd,
         bits_hint=args.bits_hint,
         group_size=args.group_size,
         qweight_mode=args.qweight_mode,
-        include_output=not args.keep_output,
+        include_output=include_output,
         strict=strict,
         show_progress=not args.no_progress,
         search_direction=args.search_direction,
@@ -966,6 +1297,28 @@ def main() -> None:
             manifest_shard["shard_index"] if manifest_shard is not None else None
         ),
     )
+    qnn_compile_spec_bytes = extract_qnn_compile_spec_from_complete_pte(
+        complete_pte_bytes
+    )
+    if args.embed_qnn_compile_spec_manifest is not None:
+        embed_qnn_compile_spec_in_manifest(
+            Path(args.embed_qnn_compile_spec_manifest).expanduser().resolve(),
+            qnn_compile_spec_bytes,
+        )
+    if args.embed_llama_qnn_quant_profile_manifest is not None:
+        source_manifest_arg = (
+            args.llama_qnn_quant_profile_source_manifest or args.shard_manifest
+        )
+        if source_manifest_arg is None:
+            raise ValueError(
+                "profile embedding requires --llama-qnn-quant-profile-source-manifest "
+                "or --shard-manifest"
+            )
+        embed_llama_qnn_quant_profile_in_manifest(
+            Path(source_manifest_arg).expanduser().resolve(),
+            Path(args.embed_llama_qnn_quant_profile_manifest).expanduser().resolve(),
+            args.shard_graph,
+        )
     if manifest_shard is not None:
         index_payload["shard_manifest"] = str(manifest_path)
         index_payload["shard_graph"] = args.shard_graph

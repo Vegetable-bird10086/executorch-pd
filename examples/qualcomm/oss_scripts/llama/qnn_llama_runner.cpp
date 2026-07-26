@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <regex>
 #include <sstream>
@@ -91,6 +92,14 @@ DEFINE_string(
     "If path is provided, program will dump all logits generated. This option is for analysis purpose. It is not recommended for general usage as it will cause token rate drop and increase in memory usage.");
 DEFINE_string(tokenizer_path, "tokenizer.bin", "Tokenizer stuff.");
 DEFINE_string(
+    embedding_matrix_path,
+    "",
+    "Separate embedding matrix used when decoder graph input 0 is hidden states.");
+DEFINE_bool(
+    embedding_resident,
+    true,
+    "Keep the separate embedding matrix resident in memory.");
+DEFINE_string(
     prompt,
     "The answer to the ultimate question is",
     "User prompts for Llama. When multiple prompts are entered, a multi-turn conversation will be initiated. Note that this feature is currently for testing purposes only.");
@@ -110,6 +119,10 @@ DEFINE_int32(
     wikitext_max_tokens,
     0,
     "Maximum number of WikiText target tokens to score. Non-positive values mean score all available tokens.");
+DEFINE_int32(
+    wikitext_start_token,
+    0,
+    "Zero-based predictor-token row at which WikiText scoring starts.");
 DEFINE_double(
     temperature,
     0.0f,
@@ -459,7 +472,9 @@ void start_runner(
       FLAGS_window,
       FLAGS_gcap,
       nullptr,
-      std::move(attention_sink_rope_module));
+      std::move(attention_sink_rope_module),
+      FLAGS_embedding_matrix_path,
+      FLAGS_embedding_resident);
 
   if (module_bundle.rebuilt_from_stripped) {
     ET_LOG(
@@ -477,6 +492,7 @@ void start_runner(
     double wiki_ppl = 0.0;
     const auto ppl_error = runner.evaluate_wikitext_ppl(
         FLAGS_wikitext_path,
+        FLAGS_wikitext_start_token,
         FLAGS_wikitext_max_tokens,
         module_meta.logits_scale,
         module_meta.logits_zero_point,
@@ -485,7 +501,7 @@ void start_runner(
         ppl_error == executorch::runtime::Error::Ok,
         "Failed to evaluate WikiText perplexity");
     std::ofstream fout(FLAGS_output_path.c_str());
-    fout << "wiki_ppl=" << wiki_ppl << "\n";
+    fout << std::setprecision(15) << "wiki_ppl=" << wiki_ppl << "\n";
     fout.close();
     ET_LOG(Info, "wiki_ppl=%f", wiki_ppl);
     return;

@@ -32,6 +32,7 @@
 #include <gflags/gflags.h>
 
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <numeric>
@@ -46,6 +47,12 @@ DEFINE_string(
     "outputs",
     "Executorch inference data output path.");
 DEFINE_string(input_list_path, "input_list.txt", "Model input list path.");
+DEFINE_bool(
+    allow_short_input_payloads,
+    false,
+    "Allow an input file smaller than its logical MethodMeta tensor. This is "
+    "required for QNN native-carrier inputs whose physical payload is smaller "
+    "than the exported Float tensor metadata.");
 DEFINE_int32(iteration, 1, "Iterations of inference.");
 DEFINE_int32(warm_up, 0, "Pre-run before inference.");
 DEFINE_bool(
@@ -341,6 +348,7 @@ int main(int argc, char** argv) {
         "Failed to allocate custom memory. tensor index: %d, bytes: %zu",
         input_index,
         tensor_meta->nbytes());
+    std::memset(custom_mem_ptr->GetPtr(), 0, tensor_meta->nbytes());
     TensorImpl impl = TensorImpl(
         tensor_meta->scalar_type(),
         /*dim=*/tensor_meta->sizes().size(),
@@ -457,20 +465,28 @@ int main(int argc, char** argv) {
         fin.seekg(0, fin.end);
         size_t file_size = fin.tellg();
 
-        fin.seekg(0, fin.beg);
-        fin.read(
-            static_cast<char*>(in_custom_mem[input_index]->GetPtr()),
-            file_size);
-        fin.close();
-
-        if (expected_input_shapes.empty()) {
+        if (expected_input_shapes.empty() && !FLAGS_allow_short_input_payloads) {
           ET_CHECK_MSG(
               file_size == tensor_meta->nbytes(),
               "Input(%d) size mismatch. file bytes: %zu, tensor bytes: %zu",
               input_index,
               file_size,
               tensor_meta->nbytes());
+        } else if (expected_input_shapes.empty()) {
+          ET_CHECK_MSG(
+              file_size <= tensor_meta->nbytes(),
+              "Input(%d) native payload exceeds tensor storage. file bytes: %zu, "
+              "tensor bytes: %zu",
+              input_index,
+              file_size,
+              tensor_meta->nbytes());
         }
+
+        fin.seekg(0, fin.beg);
+        fin.read(
+            static_cast<char*>(in_custom_mem[input_index]->GetPtr()),
+            file_size);
+        fin.close();
 
         // For pre-allocated use case, we need to call set_input
         // to copy data for the input tensors since they doesn't
@@ -625,13 +641,15 @@ int main(int argc, char** argv) {
   }
 
   if (FLAGS_dump_intermediate_outputs) {
+    const size_t debug_output_size = etdump_gen.get_debug_buffer_used_bytes();
     ET_LOG(
         Info,
-        "Write debug output binary to %s, Size = %zu",
+        "Write debug output binary to %s, Size = %zu (capacity = %zu)",
         FLAGS_debug_output_path.c_str(),
+        debug_output_size,
         (size_t)FLAGS_debug_buffer_size);
     FILE* f = fopen(FLAGS_debug_output_path.c_str(), "w+");
-    fwrite((uint8_t*)debug_buffer, 1, FLAGS_debug_buffer_size, f);
+    fwrite((uint8_t*)debug_buffer, 1, debug_output_size, f);
     fclose(f);
     free(debug_buffer);
   }

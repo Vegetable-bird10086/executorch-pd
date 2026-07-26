@@ -12,14 +12,16 @@
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 
 #include <algorithm>
-#include <chrono>
+#include <array>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <regex>
@@ -38,6 +40,40 @@ using json = nlohmann::json;
 
 namespace example {
 namespace {
+
+double nll_from_quantized_logits(
+    const uint16_t* logits,
+    int32_t vocab_size,
+    uint64_t target_token,
+    float logits_scale,
+    int32_t logits_zero_point) {
+  ET_CHECK_MSG(logits != nullptr, "logits cannot be null");
+  ET_CHECK_MSG(logits_scale > 0.0f, "logits_scale must be positive");
+  ET_CHECK_MSG(
+      target_token < static_cast<uint64_t>(vocab_size),
+      "target token is outside vocabulary");
+  double max_logit = -std::numeric_limits<double>::infinity();
+  for (int32_t i = 0; i < vocab_size; ++i) {
+    const double value =
+        (static_cast<double>(logits[i]) - logits_zero_point) * logits_scale;
+    max_logit = std::max(max_logit, value);
+  }
+  double exp_sum = 0.0;
+  for (int32_t i = 0; i < vocab_size; ++i) {
+    const double value =
+        (static_cast<double>(logits[i]) - logits_zero_point) * logits_scale;
+    exp_sum += std::exp(value - max_logit);
+  }
+  const double target =
+      (static_cast<double>(logits[target_token]) - logits_zero_point) *
+      logits_scale;
+  return max_logit + std::log(exp_sum) - target;
+}
+
+int32_t argmax_u16_logits(const uint16_t* logits, int32_t vocab_size) {
+  return static_cast<int32_t>(
+      std::max_element(logits, logits + vocab_size) - logits);
+}
 
 struct KvQuantAttr {
   double scale{1.0};
@@ -678,6 +714,45 @@ std::vector<uint16_t> build_canonical_kv(
   return canonical;
 }
 
+std::vector<uint8_t> build_qnn_u8_kv_handoff(
+    KVManager<uint8_t>* kv_manager,
+    int64_t num_layers,
+    int64_t num_heads,
+    int64_t head_dim,
+    int32_t prompt_len,
+    int32_t max_cache_len) {
+  ET_CHECK_MSG(kv_manager != nullptr, "QNN U8 KV manager cannot be null");
+  const auto& k_cache = kv_manager->get_k_cache_();
+  const auto& v_cache = kv_manager->get_v_cache_();
+  const size_t per_layer_count =
+      static_cast<size_t>(num_heads) * prompt_len * head_dim;
+  const size_t per_kind_count = static_cast<size_t>(num_layers) * per_layer_count;
+  std::vector<uint8_t> direct(per_kind_count * 2);
+  uint8_t* direct_k = direct.data();
+  uint8_t* direct_v = direct.data() + per_kind_count;
+
+  for (int64_t layer = 0; layer < num_layers; ++layer) {
+    const auto& layer_k = k_cache.at(static_cast<size_t>(layer));
+    const auto& layer_v = v_cache.at(static_cast<size_t>(layer));
+    for (int64_t head = 0; head < num_heads; ++head) {
+      for (int32_t seq = 0; seq < prompt_len; ++seq) {
+        const size_t dst_base =
+            ((static_cast<size_t>(layer) * num_heads + head) * prompt_len + seq) *
+            head_dim;
+        const size_t v_src_base =
+            (static_cast<size_t>(head) * max_cache_len + seq) * head_dim;
+        for (int64_t dim = 0; dim < head_dim; ++dim) {
+          const size_t k_src =
+              (static_cast<size_t>(head) * head_dim + dim) * max_cache_len + seq;
+          direct_k[dst_base + dim] = layer_k.buffer[k_src];
+          direct_v[dst_base + dim] = layer_v.buffer[v_src_base + dim];
+        }
+      }
+    }
+  }
+  return direct;
+}
+
 void write_binary(
     const fs::path& path,
     const void* data,
@@ -699,6 +774,10 @@ PDPrefillRunner<T>::PDPrefillRunner(
     bool prefill_qwen3_static_plan,
     int32_t prefill_static_aux_size,
     int32_t prefill_static_hidden_size,
+    bool prefill_outputs_logits,
+    bool separate_embed,
+    const std::string& embedding_matrix_path,
+    bool resident_embedding,
     StaticMetadata static_metadata,
     const std::string& decoder_model_version,
     const std::string& model_path,
@@ -715,7 +794,11 @@ PDPrefillRunner<T>::PDPrefillRunner(
       prefill_qwen3_static_plan_(prefill_qwen3_static_plan),
       prefill_static_aux_size_(prefill_static_aux_size),
       prefill_static_hidden_size_(prefill_static_hidden_size),
-      static_metadata_(static_metadata),
+      prefill_outputs_logits_(prefill_outputs_logits),
+      separate_embed_(separate_embed),
+      embedding_matrix_path_(embedding_matrix_path),
+      resident_embedding_(resident_embedding),
+      static_metadata_(std::move(static_metadata)),
       model_path_(model_path),
       tokenizer_path_(tokenizer_path),
       pte_bytes_(std::move(pte_bytes)),
@@ -791,6 +874,10 @@ Error PDPrefillRunner<T>::load() {
 
   bool use_int64_token = false;
   int32_t sliding_window = 0;
+  int32_t embedding_dim = 0;
+  size_t embedding_row_bytes = 0;
+  executorch::aten::ScalarType embedding_scalar_type =
+      executorch::aten::ScalarType::Float;
   if (static_metadata_.enabled) {
     ET_CHECK_MSG(
         !prefill_shard_paths_.empty(),
@@ -807,6 +894,10 @@ Error PDPrefillRunner<T>::load() {
     token_generator_ar_len_ = static_metadata_.token_generator_ar_len;
     use_int64_token = static_metadata_.use_int64_token;
     cache_mode_ = static_metadata_.cache_mode;
+    prefill_outputs_logits_ = static_metadata_.outputs_logits;
+    separate_embed_ = static_metadata_.use_separate_embed;
+    embedding_matrix_path_ = static_metadata_.embedding_matrix_path;
+    resident_embedding_ = static_metadata_.resident_embedding;
     sliding_window = static_metadata_.sliding_window > 0
         ? static_metadata_.sliding_window
         : context_len_;
@@ -849,6 +940,37 @@ Error PDPrefillRunner<T>::load() {
     }
   }
 
+  if (separate_embed_) {
+    ET_CHECK_MSG(
+        static_metadata_.enabled,
+        "Separate embedding currently requires manifest-only static prefill");
+    ET_CHECK_MSG(
+        !embedding_matrix_path_.empty(),
+        "Separate embedding requires an embedding matrix path");
+    ET_CHECK_MSG(
+        separate_embedding_.load(embedding_matrix_path_, resident_embedding_),
+        "Failed to load separate embedding matrix: %s",
+        embedding_matrix_path_.c_str());
+    ET_CHECK_MSG(
+        separate_embedding_.vocab_size() == vocab_size_,
+        "Separate embedding vocab mismatch: matrix=%d model=%d",
+        separate_embedding_.vocab_size(),
+        vocab_size_);
+    ET_CHECK_MSG(
+        separate_embedding_.embedding_dim() == prefill_static_hidden_size_,
+        "Separate embedding dim mismatch: matrix=%d graph=%d",
+        separate_embedding_.embedding_dim(),
+        prefill_static_hidden_size_);
+    embedding_dim = separate_embedding_.embedding_dim();
+    ET_CHECK_MSG(
+        separate_embedding_.embedding_dtype_code() == 1 ||
+            separate_embedding_.embedding_dtype_code() == 2,
+        "Separate embedding supports only float32/float16 storage, got dtype code %u",
+        separate_embedding_.embedding_dtype_code());
+    embedding_row_bytes = static_cast<size_t>(embedding_dim) * sizeof(float);
+    embedding_scalar_type = executorch::aten::ScalarType::Float;
+  }
+
   decoder_runner_ = std::make_unique<DecoderRunner>(
       module_.get(),
       vocab_size_,
@@ -860,6 +982,9 @@ Error PDPrefillRunner<T>::load() {
       prefill_qwen3_static_plan_,
       prefill_static_aux_size_,
       prefill_static_hidden_size_);
+  decoder_runner_->set_prefill_outputs_logits(prefill_outputs_logits_);
+  decoder_runner_->set_prefill_separate_embed(separate_embed_);
+  decoder_runner_->set_prefill_etdump_config(prefill_etdump_config_);
 
   int32_t max_cache_len = prompt_processor_ar_len_ == context_len_
       ? context_len_
@@ -912,7 +1037,13 @@ Error PDPrefillRunner<T>::load() {
           vocab_size_,
           use_int64_token,
           sliding_window,
-          cache_mode_});
+          cache_mode_,
+          prefill_outputs_logits_,
+          separate_embed_,
+          embedding_dim,
+          embedding_row_bytes,
+          embedding_scalar_type,
+          separate_embed_ ? &separate_embedding_ : nullptr});
 
   buffer_manager_ = std::make_unique<ClientMem>();
   if (shared_buffer_) {
@@ -973,6 +1104,112 @@ PDPrefillRunner<T>::prefill_shard_runtime_stats() const {
 }
 
 template <typename T>
+Error PDPrefillRunner<T>::evaluate_wikitext_ppl(
+    const std::string& wikitext_path,
+    int32_t start_token,
+    int32_t max_eval_tokens,
+    float logits_scale,
+    int32_t logits_zero_point,
+    double* ppl_out,
+    int64_t* scored_tokens_out) {
+  ET_CHECK_MSG(ppl_out != nullptr, "ppl_out cannot be null");
+  ET_CHECK_MSG(prefill_outputs_logits_, "WikiPPL requires prefill logits");
+  ET_CHECK_MSG(start_token >= 0, "start_token cannot be negative");
+  ET_CHECK_MSG(max_eval_tokens > 0, "max_eval_tokens must be positive");
+  ET_CHECK_OK_OR_RETURN_ERROR(load());
+
+  std::ifstream input(wikitext_path);
+  ET_CHECK_MSG(input.is_open(), "Unable to read WikiText: %s", wikitext_path.c_str());
+  std::stringstream buffer;
+  buffer << input.rdbuf();
+  auto encode_res = tokenizer_->encode(buffer.str(), 0, 0);
+  ET_CHECK_TK_OK_OR_RETURN_ERROR(
+      encode_res.error(), "failed to encode WikiText %s", wikitext_path.c_str());
+  std::vector<uint64_t> all_tokens = encode_res.get();
+  const int64_t available_rows = static_cast<int64_t>(all_tokens.size()) - 1;
+  ET_CHECK_MSG(start_token < available_rows, "WikiText start token is out of range");
+  const int64_t score_count =
+      std::min<int64_t>(max_eval_tokens, available_rows - start_token);
+  const int64_t input_count = static_cast<int64_t>(start_token) + score_count;
+  ET_CHECK_MSG(
+      input_count <= context_len_ - prompt_processor_ar_len_,
+      "WikiPPL input exceeds QNN prefill budget");
+
+  std::vector<uint64_t> input_tokens(
+      all_tokens.begin(), all_tokens.begin() + input_count);
+  const size_t iterations =
+      (input_tokens.size() + prompt_processor_ar_len_ - 1) /
+      prompt_processor_ar_len_;
+  prompt_processor_->clear_all_logits();
+  prompt_processor_->reserve_all_logits(
+      iterations * static_cast<size_t>(prompt_processor_ar_len_) * vocab_size_);
+  auto prefill_res = prompt_processor_->prefill(
+      std::move(input_tokens), 0, true, attention_sink_rope_runner_.get());
+  ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+
+  const auto& logits = prompt_processor_->get_all_logits();
+  ET_CHECK_MSG(
+      logits.size() >=
+          static_cast<size_t>(input_count) * static_cast<size_t>(vocab_size_),
+      "QNN WikiPPL logits buffer is smaller than expected");
+  double total_nll = 0.0;
+  for (int64_t row = start_token; row < start_token + score_count; ++row) {
+    const uint16_t* row_logits =
+        logits.data() + static_cast<size_t>(row) * vocab_size_;
+    total_nll += nll_from_quantized_logits(
+        row_logits,
+        vocab_size_,
+        all_tokens[row + 1],
+        logits_scale,
+        logits_zero_point);
+  }
+  *ppl_out = std::exp(total_nll / static_cast<double>(score_count));
+  if (scored_tokens_out != nullptr) {
+    *scored_tokens_out = score_count;
+  }
+  ET_LOG(
+      Info,
+      "QNN WikiPPL: ppl=%.12f nll=%.12f scored_tokens=%ld start_token=%d",
+      *ppl_out,
+      total_nll,
+      score_count,
+      start_token);
+  if (start_token > 0) {
+    const uint16_t* prompt_last_logits =
+        logits.data() + static_cast<size_t>(start_token - 1) * vocab_size_;
+    ET_LOG(
+        Info,
+        "QNN WikiPPL boundary check: u16_prompt_last_top1=%d "
+        "expected_first_target=%llu",
+        argmax_u16_logits(prompt_last_logits, vocab_size_),
+        static_cast<unsigned long long>(all_tokens[start_token]));
+  }
+  return Error::Ok;
+}
+
+template <typename T>
+double PDPrefillRunner<T>::prefill_qnn_backend_prewarm_ms() const {
+  return decoder_runner_ != nullptr
+      ? decoder_runner_->prefill_qnn_backend_prewarm_ms()
+      : 0.0;
+}
+
+template <typename T>
+bool PDPrefillRunner<T>::prefill_qnn_backend_prewarmed() const {
+  return decoder_runner_ != nullptr &&
+      decoder_runner_->prefill_qnn_backend_prewarmed();
+}
+
+template <typename T>
+void PDPrefillRunner<T>::set_prefill_etdump_config(
+    DecoderRunner::PrefillEtDumpConfig config) {
+  ET_CHECK_MSG(
+      decoder_runner_ == nullptr,
+      "Configure prefill ETDump before PDPrefillRunner::load");
+  prefill_etdump_config_ = std::move(config);
+}
+
+template <typename T>
 Error PDPrefillRunner<T>::export_prefill_handoff(
     const std::string& prompt,
     bool tokenized_prompt,
@@ -1016,20 +1253,34 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   last_runtime_stats_.prompt_tokens = num_prompt_tokens;
   last_runtime_stats_.tokenize_ms = elapsed_ms(tokenize_start);
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
+  const bool bridge_prompt_tail = !prefill_outputs_logits_;
+  std::vector<uint64_t> cached_prompt_tokens = prompt_tokens;
+  uint64_t first_token = 0;
+  if (bridge_prompt_tail) {
+    ET_CHECK_MSG(
+        num_prompt_tokens >= 2,
+        "No-output PD prefill requires at least two prompt tokens");
+    first_token = cached_prompt_tokens.back();
+    cached_prompt_tokens.pop_back();
+  }
+  const int32_t num_cached_tokens =
+      static_cast<int32_t>(cached_prompt_tokens.size());
   ET_CHECK_MSG(
-      cur_pos_ + num_prompt_tokens < seq_len,
+      cur_pos_ + num_cached_tokens < seq_len,
       "sequence length exceeded - please increase seq_len");
 
   const auto prefill_start = SteadyClock::now();
   auto prefill_res = prompt_processor_->prefill(
-      prompt_tokens,
+      cached_prompt_tokens,
       cur_pos_,
       false,
       attention_sink_rope_runner_.get());
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
-  const uint64_t first_token = prefill_res.get();
+  if (!bridge_prompt_tail) {
+    first_token = prefill_res.get();
+  }
   last_runtime_stats_.prefill_ms = elapsed_ms(prefill_start);
-  cur_pos_ += num_prompt_tokens;
+  cur_pos_ += num_cached_tokens;
 
   const auto handoff_start = SteadyClock::now();
   const auto quant_attrs_start = SteadyClock::now();
@@ -1054,11 +1305,22 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       num_layers_,
       num_heads_,
       head_dim_,
-      num_prompt_tokens,
+      num_cached_tokens,
       prefill_cache_stride_,
       quant_attrs);
+  std::vector<uint8_t> qnn_u8_kv;
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    qnn_u8_kv = build_qnn_u8_kv_handoff(
+        kv_manager_.get(),
+        num_layers_,
+        num_heads_,
+        head_dim_,
+        num_cached_tokens,
+        prefill_cache_stride_);
+  }
   const double kv_layout_ms = elapsed_ms(kv_layout_start);
   const size_t canonical_kv_bytes = canonical_kv.size() * sizeof(uint16_t);
+  const size_t qnn_u8_kv_bytes = qnn_u8_kv.size();
   const bool export_undo_r3 = should_undo_r3_on_export(
       decoder_model_version_, model_path_, num_layers_, num_heads_, head_dim_);
 
@@ -1067,8 +1329,8 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   const auto metadata_files_start = SteadyClock::now();
   write_binary(
       export_path / "prompt_tokens.bin",
-      prompt_tokens.data(),
-      prompt_tokens.size() * sizeof(uint64_t));
+      cached_prompt_tokens.data(),
+      cached_prompt_tokens.size() * sizeof(uint64_t));
   write_binary(
       export_path / "first_token.bin",
       &first_token,
@@ -1080,13 +1342,21 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       export_path / "kv.bin",
       canonical_kv.data(),
       canonical_kv_bytes);
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    write_binary(
+        export_path / "kv_qnn_u8.bin",
+        qnn_u8_kv.data(),
+        qnn_u8_kv_bytes);
+  }
   const double kv_write_ms = elapsed_ms(kv_write_start);
 
   json manifest;
   manifest["format_version"] = "pd-handoff-v1";
   manifest["decoder_model_version"] = decoder_model_to_string(decoder_model_version_);
   manifest["context_length"] = context_len_;
-  manifest["prompt_length"] = num_prompt_tokens;
+  manifest["prompt_length"] = num_cached_tokens;
+  manifest["original_prompt_length"] = num_prompt_tokens;
+  manifest["first_token_is_prompt_tail"] = bridge_prompt_tail;
   manifest["num_layers"] = num_layers_;
   manifest["num_kv_heads"] = num_heads_;
   manifest["head_dim"] = head_dim_;
@@ -1106,7 +1376,19 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   manifest["first_token_id"] = first_token;
   manifest["kv_file"] = "kv.bin";
   manifest["kv_file_size_bytes"] = static_cast<uint64_t>(canonical_kv_bytes);
-  manifest["first_token_owner"] = "executorch";
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    manifest["qnn_u8_kv_file"] = "kv_qnn_u8.bin";
+    manifest["qnn_u8_kv_file_size_bytes"] = static_cast<uint64_t>(qnn_u8_kv_bytes);
+    manifest["qnn_u8_kv_dtype"] = "uint8";
+    manifest["qnn_u8_kv_layout"] = {
+        {"order", "K_then_V"},
+        {"shape", "[layer,kv_head,seq,head_dim]"},
+        {"k_cache_transform", "spinquant_r3"},
+        {"endianness", "little"},
+    };
+  }
+  manifest["first_token_owner"] =
+      bridge_prompt_tail ? "prompt_tail_bridge" : "executorch";
   const auto fingerprint_start = SteadyClock::now();
   manifest["pte_fingerprint"] = make_file_fingerprint(model_path_);
   manifest["tokenizer_fingerprint"] = make_file_fingerprint(tokenizer_path_);
@@ -1157,11 +1439,13 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       handoff_total_ms);
   ET_LOG(
       Info,
-      "PD handoff exported: dir=%s prompt_len=%d kv_bytes=%zu first_token=%llu",
+      "PD handoff exported: dir=%s prompt_len=%d cached_prompt_len=%d kv_bytes=%zu first_token=%llu bridge_prompt_tail=%d",
       export_dir.c_str(),
       num_prompt_tokens,
+      num_cached_tokens,
       canonical_kv_bytes,
-      static_cast<unsigned long long>(first_token));
+      static_cast<unsigned long long>(first_token),
+      static_cast<int>(bridge_prompt_tail));
   return Error::Ok;
 }
 

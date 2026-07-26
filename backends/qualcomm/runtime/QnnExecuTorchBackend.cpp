@@ -64,7 +64,45 @@ int ParseIndexedQnnTensorName(const std::string& name, const char* prefix) {
 } // namespace
 
 // ========== Public method implementations =========================
-constexpr const char* QNN_COMPILE_SPEC = "qnn_compile_spec";
+namespace {
+constexpr const char* kQnnCompileSpec = "qnn_compile_spec";
+} // namespace
+
+Error PrewarmQnnBackend(
+    const void* qnn_compile_spec_data,
+    size_t qnn_compile_spec_size) {
+  if (qnn_compile_spec_data == nullptr || qnn_compile_spec_size == 0) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "QNN backend prewarm requires a non-empty qnn_compile_spec");
+    return Error::InvalidArgument;
+  }
+
+  const auto prewarm_start = Clock::now();
+  const auto* qnn_executorch_options = GetQnnExecuTorchOptions(
+      qnn_compile_spec_data);
+  if (qnn_executorch_options == nullptr) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "Failed to parse qnn_compile_spec for backend prewarm");
+    return Error::InvalidArgument;
+  }
+
+  auto backend_bundle = std::make_shared<QnnBackendBundle>();
+  const Error bundle_error =
+      QnnBackendUnifiedRegistry::GetInstance().GetOrCreateBackendBundle(
+          qnn_executorch_options, backend_bundle);
+  if (bundle_error != Error::Ok) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "Failed to prewarm QNN backend bundle: error=%d",
+        static_cast<int>(bundle_error));
+    return bundle_error;
+  }
+  QNN_EXECUTORCH_LOG_INFO(
+      "QNN backend prewarm timing: backend_device_ms=%.3f compile_spec_bytes=%zu",
+      elapsed_ms(prewarm_start),
+      qnn_compile_spec_size);
+  return Error::Ok;
+}
+
 Result<DelegateHandle*> QnnExecuTorchBackend::init(
     BackendInitContext& context,
     FreeableBuffer* processed,
@@ -94,7 +132,7 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
 
   // convert CompileSpec to qnn ExecuTorch option
   for (auto& compile_spec : compile_specs) {
-    if (std::strcmp(compile_spec.key, QNN_COMPILE_SPEC) == 0)
+    if (std::strcmp(compile_spec.key, kQnnCompileSpec) == 0)
       qnn_executorch_options =
           GetQnnExecuTorchOptions(compile_spec.value.buffer);
     else
@@ -117,12 +155,19 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
   // check if current context binary has already been initialized
   // return cached one for reducing memory footprint
 
-  auto iter = delegate_map_.find(signature);
-  if (iter != delegate_map_.end()) {
+  DelegateHandle* cached_delegate = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto iter = delegate_map_.find(signature);
+    if (iter != delegate_map_.end()) {
+      cached_delegate = iter->second;
+    }
+  }
+  if (cached_delegate != nullptr) {
     QNN_EXECUTORCH_LOG_INFO(
         "Use cached delegate handle for current method: %s",
         context.get_method_name());
-    return iter->second;
+    return cached_delegate;
   }
 
   const auto init_backend_start = Clock::now();
@@ -176,8 +221,13 @@ Error QnnExecuTorchBackend::execute(
     BackendExecutionContext& context,
     DelegateHandle* handle,
     Span<EValue*> args) const {
+  bool delegate_exists = false;
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    delegate_exists = delegate_map_rev_.count(handle) != 0;
+  }
   ET_CHECK_OR_RETURN_ERROR(
-      delegate_map_rev_.count(handle) != 0,
+      delegate_exists,
       Internal,
       "DelegateHandle has been deleted");
   QnnManager* qnn_manager = static_cast<QnnManager*>(handle);
@@ -349,7 +399,12 @@ Error QnnExecuTorchBackend::execute(
 }
 
 void QnnExecuTorchBackend::destroy(DelegateHandle* handle) const {
-  if (handle != nullptr && delegate_map_rev_.count(handle)) {
+  bool delegate_exists = false;
+  if (handle != nullptr) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    delegate_exists = delegate_map_rev_.count(handle) != 0;
+  }
+  if (delegate_exists) {
     QnnManager* qnn_manager = static_cast<QnnManager*>(handle);
     qnn_manager->Destroy();
     erase_cached_delegate(handle);

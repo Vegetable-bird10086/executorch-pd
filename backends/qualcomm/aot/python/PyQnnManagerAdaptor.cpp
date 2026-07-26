@@ -396,7 +396,65 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
                     const std::vector<uint32_t>&,
                     const std::vector<uint8_t>&,
                     py::array&,
-                    bool>(&CreateTensorWrapper)));
+                    bool>(&CreateTensorWrapper)))
+      .def("GetName", &TensorWrapper::GetName)
+      .def("GetDataType", &TensorWrapper::GetDataType)
+      .def("GetBytes", &TensorWrapper::GetBytes)
+      .def("IsTensorStatic", &TensorWrapper::IsTensorStatic)
+      .def(
+          "GetDims",
+          [](const TensorWrapper& self) {
+            return std::vector<std::uint32_t>(
+                self.GetDims(), self.GetDims() + self.GetRank());
+          })
+      .def(
+          "GetQuantizationEncoding",
+          [](const TensorWrapper& self) {
+            return self.GetQuantizeParams().quantizationEncoding;
+          })
+      .def(
+          "SetScaleOffsetQuantizeParams",
+          [](TensorWrapper& self, float scale, std::int32_t offset) {
+            if (self.SetScaleOffsetQuantizeParams(scale, offset) !=
+                executorch::runtime::Error::Ok) {
+              throw std::runtime_error(
+                  "Cannot replace non-SCALE_OFFSET QNN tensor qparams");
+            }
+          },
+          py::arg("scale"),
+          py::arg("offset"))
+      .def(
+          "GetStaticDataBytes",
+          [](const TensorWrapper& self) {
+            if (!self.IsTensorStatic()) {
+              throw std::runtime_error("QNN tensor is not static");
+            }
+            const auto size = self.GetBytes();
+            const auto* data = self.GetStaticTensorData();
+            if (size != 0 && data == nullptr) {
+              throw std::runtime_error("QNN static tensor has no data");
+            }
+            return py::bytes(
+                static_cast<const char*>(data),
+                static_cast<py::ssize_t>(size));
+          })
+      .def(
+          "SetStaticDataBytes",
+          [](TensorWrapper& self, const py::bytes& data) {
+            if (!self.IsTensorStatic()) {
+              throw std::runtime_error("QNN tensor is not static");
+            }
+            const std::string raw = data;
+            if (raw.size() != self.GetBytes()) {
+              throw std::runtime_error(
+                  "QNN static tensor replacement has the wrong byte length");
+            }
+            if (self.FillDataBuffer(raw.data(), true) !=
+                executorch::runtime::Error::Ok) {
+              throw std::runtime_error("Failed to replace QNN static tensor data");
+            }
+          },
+          py::arg("data"));
 
   py::class_<QuantizeParamsWrapper>(m, "QuantizeParamsWrapper");
 
@@ -508,7 +566,68 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
 
   py::class_<Qnn_Scalar_t>(m, "Qnn_Scalar_t")
       .def_readonly("dataType", &Qnn_Scalar_t::dataType)
-      .def("value", &GetScalarValue, "Get the value of the scalar as a string");
+      .def("value", &GetScalarValue, "Get the value of the scalar as a string")
+      .def("rawValueBytes", [](const Qnn_Scalar_t& scalar) {
+        switch (scalar.dataType) {
+          case QNN_DATATYPE_FLOAT_32:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.floatValue),
+                sizeof(scalar.floatValue));
+          case QNN_DATATYPE_FLOAT_64:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.doubleValue),
+                sizeof(scalar.doubleValue));
+          case QNN_DATATYPE_UINT_64:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.uint64Value),
+                sizeof(scalar.uint64Value));
+          case QNN_DATATYPE_INT_64:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.int64Value),
+                sizeof(scalar.int64Value));
+          case QNN_DATATYPE_UINT_32:
+          case QNN_DATATYPE_UFIXED_POINT_32:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.uint32Value),
+                sizeof(scalar.uint32Value));
+          case QNN_DATATYPE_INT_32:
+          case QNN_DATATYPE_SFIXED_POINT_32:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.int32Value),
+                sizeof(scalar.int32Value));
+          case QNN_DATATYPE_FLOAT_16:
+          case QNN_DATATYPE_UINT_16:
+          case QNN_DATATYPE_UFIXED_POINT_16:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.uint16Value),
+                sizeof(scalar.uint16Value));
+          case QNN_DATATYPE_INT_16:
+          case QNN_DATATYPE_SFIXED_POINT_16:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.int16Value),
+                sizeof(scalar.int16Value));
+          case QNN_DATATYPE_UINT_8:
+          case QNN_DATATYPE_UFIXED_POINT_4:
+          case QNN_DATATYPE_UFIXED_POINT_8:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.uint8Value),
+                sizeof(scalar.uint8Value));
+          case QNN_DATATYPE_INT_8:
+          case QNN_DATATYPE_SFIXED_POINT_4:
+          case QNN_DATATYPE_SFIXED_POINT_8:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.int8Value),
+                sizeof(scalar.int8Value));
+          case QNN_DATATYPE_BOOL_8:
+            return py::bytes(
+                reinterpret_cast<const char*>(&scalar.bool8Value),
+                sizeof(scalar.bool8Value));
+          case QNN_DATATYPE_STRING:
+            return py::bytes(scalar.stringValue == nullptr ? "" : scalar.stringValue);
+          default:
+            throw std::runtime_error("Unsupported QNN scalar datatype");
+        }
+      }, "Get the scalar payload without decimal conversion");
 
   py::class_<Qnn_Tensor_t>(m, "Qnn_Tensor_t")
       .def_readonly("version", &Qnn_Tensor_t::version)
@@ -548,6 +667,20 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
                 ? std::vector<uint32_t>()
                 : std::vector<uint32_t>(t.dimensions, t.dimensions + t.rank);
           })
+      .def_property_readonly(
+          "rawDataBytes",
+          [](const Qnn_TensorV2_t& t) {
+            const auto size = t.clientBuf.dataSize;
+            if (size == 0) {
+              return py::bytes();
+            }
+            if (t.clientBuf.data == nullptr) {
+              throw std::runtime_error("QNN tensor has dataSize without data");
+            }
+            return py::bytes(
+                static_cast<const char*>(t.clientBuf.data),
+                static_cast<py::ssize_t>(size));
+          })
       .def_readonly("memType", &Qnn_TensorV2_t::memType);
 
   py::enum_<Qnn_TensorMemType_t>(m, "Qnn_TensorMemType_t")
@@ -584,7 +717,58 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
             }
             throw std::runtime_error(
                 "Invalid quantization encoding type for axisScaleOffsetEncoding.");
-          });
+          })
+      .def(
+          "blockwiseExpansionEncoding",
+          [](const Qnn_QuantizeParams_t& qp, uint32_t num_scale_offsets) {
+            if (qp.quantizationEncoding !=
+                QNN_QUANTIZATION_ENCODING_BLOCKWISE_EXPANSION) {
+              throw std::runtime_error(
+                  "Invalid quantization encoding type for blockwise expansion.");
+            }
+            if (qp.blockwiseExpansion == nullptr) {
+              throw std::runtime_error("QNN blockwise expansion metadata is null.");
+            }
+
+            const auto& blockwise = *qp.blockwiseExpansion;
+            if (blockwise.blockScaleStorageType !=
+                    QNN_BLOCKWISE_EXPANSION_BITWIDTH_SCALE_STORAGE_8 &&
+                blockwise.blockScaleStorageType !=
+                    QNN_BLOCKWISE_EXPANSION_BITWIDTH_SCALE_STORAGE_16) {
+              throw std::runtime_error(
+                  "Unsupported QNN blockwise block-scale storage type.");
+            }
+            const size_t block_scale_element_size =
+                blockwise.blockScaleStorageType ==
+                    QNN_BLOCKWISE_EXPANSION_BITWIDTH_SCALE_STORAGE_16
+                ? 2
+                : 1;
+            const size_t blocks_scale_size =
+                static_cast<size_t>(num_scale_offsets) *
+                static_cast<size_t>(blockwise.numBlocksPerAxis) *
+                block_scale_element_size;
+            if (num_scale_offsets != 0 && blockwise.scaleOffsets == nullptr) {
+              throw std::runtime_error("QNN blockwise scale offsets are null.");
+            }
+            if (blocks_scale_size != 0 && blockwise.blocksScale8 == nullptr) {
+              throw std::runtime_error("QNN blockwise scales are null.");
+            }
+
+            py::dict result;
+            result["axis"] = blockwise.axis;
+            result["numBlocksPerAxis"] = blockwise.numBlocksPerAxis;
+            result["blockScaleBitwidth"] = blockwise.blockScaleBitwidth;
+            result["blockScaleStorageType"] = blockwise.blockScaleStorageType;
+            result["scaleOffsets"] = std::vector<Qnn_ScaleOffset_t>(
+                blockwise.scaleOffsets,
+                blockwise.scaleOffsets + num_scale_offsets);
+            result["blocksScale8"] = py::bytes(
+                reinterpret_cast<const char*>(blockwise.blocksScale8),
+                static_cast<py::ssize_t>(blocks_scale_size));
+            return result;
+          },
+          py::arg("num_scale_offsets"),
+          "Get exact blockwise expansion metadata for a tensor.");
 
   py::enum_<Qnn_Definition_t>(m, "QnnDefinition")
       .value(

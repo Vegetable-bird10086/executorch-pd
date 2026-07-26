@@ -6,6 +6,8 @@
 
 # decode qdq file name
 DECODE_QDQ_FILENAME = "decode_qdq.pt2"
+SEPARATE_EMBED_INFO_FILENAME = "separate_embed_info.json"
+SEPARATE_EMBED_MATRIX_FILENAME = "separate_embed_matrix.bin"
 
 # eval methods
 PROMPT_EVAL = "prompt_eval"

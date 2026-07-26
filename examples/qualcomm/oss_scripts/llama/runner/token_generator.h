@@ -12,6 +12,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/separate_embed.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/extension/llm/runner/stats.h>
 #include <pytorch/tokenizers/tokenizer.h>
@@ -34,6 +35,9 @@ class TokenGenerator {
     bool use_int64_token;
     int sliding_window;
     CacheMode cache_mode;
+    bool use_separate_embed{false};
+    int32_t embedding_dim{0};
+    const SeparateEmbedding* separate_embedding{nullptr};
   };
   TokenGenerator(
       tokenizers::Tokenizer* tokenizer,
@@ -82,12 +86,26 @@ class TokenGenerator {
       std::function<void(const std::string&)> token_callback,
       bool dump_logits,
       AttentionSinkRopeRunner* attention_sink_rope_runner);
+
+  /**
+   * @brief Run AR-1 decode with ground-truth tokens and accumulate next-token
+   * negative log likelihood.
+   */
+  virtual executorch::runtime::Result<double> evaluate_teacher_forced(
+      const std::vector<uint64_t>& tokens,
+      int64_t start_pos,
+      float logits_scale,
+      int32_t logits_zero_point);
   inline const size_t total_token_generator_io_size_in_bytes() const {
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
+      return (metadata_.use_separate_embed ? input_embedding_.size
+                                           : input_toks_.size) +
+          input_pos_.size + attention_mask_.size +
           window_attention_mask_.size + logits_.size;
     } else {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
+      return (metadata_.use_separate_embed ? input_embedding_.size
+                                           : input_toks_.size) +
+          input_pos_.size + attention_mask_.size +
           logits_.size;
     }
   }
@@ -101,6 +119,7 @@ class TokenGenerator {
 
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
+  TensorStruct<uint8_t> input_embedding_;
   TensorStruct<int32_t> input_pos_;
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;
