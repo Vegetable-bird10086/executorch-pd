@@ -23,10 +23,12 @@
 #include <cstring>
 #include <limits>
 #include <fcntl.h>
+#include <linux/memfd.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unordered_map>
 #include <unistd.h>
 #include <utility>
@@ -37,8 +39,12 @@ namespace example {
 ReadOnlyMappedFile::ReadOnlyMappedFile(
     int fd,
     const uint8_t* data,
-    size_t size)
-    : fd_(fd), data_(data), size_(size) {}
+    size_t size,
+    bool shared_memory_backed)
+    : fd_(fd),
+      data_(data),
+      size_(size),
+      shared_memory_backed_(shared_memory_backed) {}
 
 std::shared_ptr<ReadOnlyMappedFile> ReadOnlyMappedFile::open(
     const std::string& path) {
@@ -62,7 +68,92 @@ std::shared_ptr<ReadOnlyMappedFile> ReadOnlyMappedFile::open(
   }
   (void)::madvise(mapping, size, MADV_RANDOM);
   return std::shared_ptr<ReadOnlyMappedFile>(new ReadOnlyMappedFile(
-      fd, static_cast<const uint8_t*>(mapping), size));
+      fd, static_cast<const uint8_t*>(mapping), size, false));
+}
+
+std::shared_ptr<ReadOnlyMappedFile>
+ReadOnlyMappedFile::load_into_shared_memory(const std::string& path) {
+  const int source_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (source_fd < 0) {
+    throw std::runtime_error("Failed to open shared-memory source: " + path);
+  }
+  struct stat metadata {};
+  if (::fstat(source_fd, &metadata) != 0 || metadata.st_size <= 0) {
+    ::close(source_fd);
+    throw std::runtime_error("Failed to stat shared-memory source: " + path);
+  }
+  const size_t size = static_cast<size_t>(metadata.st_size);
+  const int fd = static_cast<int>(::syscall(
+      SYS_memfd_create, "pd-model-ram", MFD_ALLOW_SEALING));
+  if (fd < 0) {
+    ::close(source_fd);
+    throw std::runtime_error(
+        "Failed to create model shared memory: " +
+        std::string(std::strerror(errno)));
+  }
+  if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+    ::close(fd);
+    ::close(source_fd);
+    throw std::runtime_error(
+        "Failed to size model shared memory: " +
+        std::string(std::strerror(errno)));
+  }
+  void* writable = ::mmap(
+      nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (writable == MAP_FAILED) {
+    ::close(fd);
+    ::close(source_fd);
+    throw std::runtime_error(
+        "Failed to map writable model shared memory: " +
+        std::string(std::strerror(errno)));
+  }
+
+  size_t copied = 0;
+  while (copied < size) {
+    const size_t chunk = std::min<size_t>(size - copied, 8U * 1024U * 1024U);
+    ssize_t count;
+    do {
+      count = ::pread(
+          source_fd,
+          static_cast<uint8_t*>(writable) + copied,
+          chunk,
+          static_cast<off_t>(copied));
+    } while (count < 0 && errno == EINTR);
+    if (count <= 0) {
+      ::munmap(writable, size);
+      ::close(fd);
+      ::close(source_fd);
+      throw std::runtime_error(
+          "Failed while loading model into shared memory: " +
+          std::string(std::strerror(errno)));
+    }
+    copied += static_cast<size_t>(count);
+  }
+  (void)::posix_fadvise(
+      source_fd, 0, static_cast<off_t>(size), POSIX_FADV_DONTNEED);
+  ::close(source_fd);
+  if (::munmap(writable, size) != 0) {
+    ::close(fd);
+    throw std::runtime_error("Failed to unmap writable model shared memory");
+  }
+
+  const int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW;
+  if (::fcntl(fd, F_ADD_SEALS, seals) != 0) {
+    ::close(fd);
+    throw std::runtime_error(
+        "Failed to seal model shared memory: " +
+        std::string(std::strerror(errno)));
+  }
+  void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+  if (mapping == MAP_FAILED) {
+    ::close(fd);
+    throw std::runtime_error(
+        "Failed to map read-only model shared memory: " +
+        std::string(std::strerror(errno)));
+  }
+  (void)::madvise(mapping, size, MADV_WILLNEED);
+  return std::shared_ptr<ReadOnlyMappedFile>(new ReadOnlyMappedFile(
+      fd, static_cast<const uint8_t*>(mapping), size, true));
 }
 
 ReadOnlyMappedFile::~ReadOnlyMappedFile() {
@@ -86,8 +177,19 @@ bool ReadOnlyMappedFile::empty() const {
   return size_ == 0;
 }
 
+bool ReadOnlyMappedFile::shared_memory_backed() const {
+  return shared_memory_backed_;
+}
+
+std::string ReadOnlyMappedFile::inherited_fd_spec() const {
+  if (fd_ < 0) {
+    return {};
+  }
+  return "fd:" + std::to_string(fd_);
+}
+
 void ReadOnlyMappedFile::discard_resident_pages() const {
-  if (data_ != nullptr && size_ > 0) {
+  if (!shared_memory_backed_ && data_ != nullptr && size_ > 0) {
     (void)::madvise(const_cast<uint8_t*>(data_), size_, MADV_DONTNEED);
   }
 }

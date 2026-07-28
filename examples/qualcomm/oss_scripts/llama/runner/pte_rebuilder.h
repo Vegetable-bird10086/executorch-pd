@@ -19,6 +19,8 @@ namespace example {
 class ReadOnlyMappedFile {
  public:
   static std::shared_ptr<ReadOnlyMappedFile> open(const std::string& path);
+  static std::shared_ptr<ReadOnlyMappedFile> load_into_shared_memory(
+      const std::string& path);
   ~ReadOnlyMappedFile();
 
   ReadOnlyMappedFile(const ReadOnlyMappedFile&) = delete;
@@ -27,14 +29,21 @@ class ReadOnlyMappedFile {
   const uint8_t* data() const;
   size_t size() const;
   bool empty() const;
+  bool shared_memory_backed() const;
+  std::string inherited_fd_spec() const;
   void discard_resident_pages() const;
 
  private:
-  ReadOnlyMappedFile(int fd, const uint8_t* data, size_t size);
+  ReadOnlyMappedFile(
+      int fd,
+      const uint8_t* data,
+      size_t size,
+      bool shared_memory_backed);
 
   int fd_{-1};
   const uint8_t* data_{nullptr};
   size_t size_{0};
+  bool shared_memory_backed_{false};
 };
 
 class PteRebuildBuffer {

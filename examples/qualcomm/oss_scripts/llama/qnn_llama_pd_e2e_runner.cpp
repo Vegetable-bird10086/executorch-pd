@@ -52,6 +52,10 @@ DEFINE_string(
     gguf_model_path,
     "",
     "Path to the llama.cpp GPTQ2_32 GGUF model used to rebuild stripped decoder blocks in memory.");
+DEFINE_bool(
+    model_ram_store,
+    false,
+    "Load the shared Prefill/Decode GGUF into a sealed memfd before E2E timing.");
 DEFINE_string(
     prefill_shard_manifest_path,
     "",
@@ -234,6 +238,8 @@ namespace fs = std::filesystem;
 namespace {
 
 using SteadyClock = std::chrono::steady_clock;
+
+std::string g_model_ram_fd_spec;
 
 double elapsed_ms(
     SteadyClock::time_point start,
@@ -1059,6 +1065,9 @@ std::string get_formatted_prompt(
 }
 
 std::string resolve_decode_gguf_path() {
+  if (!g_model_ram_fd_spec.empty()) {
+    return g_model_ram_fd_spec;
+  }
   if (!FLAGS_decode_gguf_path.empty()) {
     return FLAGS_decode_gguf_path;
   }
@@ -1087,8 +1096,28 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   if (has_gguf) {
     config.source_kind =
         example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::Gguf;
-    config.mapped_source_bytes =
-        example::ReadOnlyMappedFile::open(FLAGS_gguf_model_path);
+    if (FLAGS_model_ram_store) {
+      ET_CHECK_MSG(
+          FLAGS_decode_gguf_path.empty() ||
+              FLAGS_decode_gguf_path == FLAGS_gguf_model_path,
+          "--model_ram_store requires Prefill and Decode to use the same GGUF");
+      const auto load_start = SteadyClock::now();
+      config.mapped_source_bytes =
+          example::ReadOnlyMappedFile::load_into_shared_memory(
+              FLAGS_gguf_model_path);
+      g_model_ram_fd_spec =
+          config.mapped_source_bytes->inherited_fd_spec();
+      ET_LOG(
+          Info,
+          "PD model RAM store ready: bytes=%zu load_ms=%.3f fd_spec=%s "
+          "timing_scope=bootstrap",
+          config.mapped_source_bytes->size(),
+          elapsed_ms(load_start),
+          g_model_ram_fd_spec.c_str());
+    } else {
+      config.mapped_source_bytes =
+          example::ReadOnlyMappedFile::open(FLAGS_gguf_model_path);
+    }
   } else if (has_tmac_gguf) {
     config.source_kind =
         example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::TmacGguf;
@@ -1200,6 +1229,8 @@ ResidentDecodeProcess start_resident_decode_process(
       std::to_string(FLAGS_decode_ngl),
       "--temp",
       std::to_string(FLAGS_decode_temp),
+      "-fit",
+      "off",
   };
   if (FLAGS_decode_threads > 0) {
     args.push_back("-t");
