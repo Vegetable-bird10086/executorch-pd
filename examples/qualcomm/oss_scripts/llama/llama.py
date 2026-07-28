@@ -10,6 +10,7 @@
 import json
 import logging
 import os
+import subprocess
 import sys
 from copy import copy
 from multiprocessing.connection import Client
@@ -597,6 +598,21 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        "--llama_qnn_profile_gguf",
+        type=str,
+        default=None,
+        help=(
+            "Shared Prefill/Decode GGUF used to finalize the emitted QNN "
+            "profile as kernel-ready qnn_u16_runtime_profile.bin."
+        ),
+    )
+    parser.add_argument(
+        "--llama_qnn_profile_converter",
+        type=str,
+        default=None,
+        help="Optional qnn-u16-profile-convert executable.",
+    )
+    parser.add_argument(
         "--dump_quant_filter",
         default=None,
         type=str,
@@ -913,6 +929,45 @@ def export_llama(args) -> None:
         and os.path.exists(shard_manifest_path)
     ):
         logging.info("decoder shard manifest exported at %s", shard_manifest_path)
+    if args.emit_llama_qnn_quant_profile:
+        if not args.llama_qnn_profile_gguf:
+            raise RuntimeError(
+                "--emit_llama_qnn_quant_profile requires "
+                "--llama_qnn_profile_gguf"
+            )
+        profile_tool = os.path.join(
+            os.path.dirname(__file__),
+            "tools",
+            "qnn_llama_quant_profile_compact.py",
+        )
+        profile_json = os.path.join(
+            args.artifact, "qnn_u16_runtime_profile.json"
+        )
+        profile_bin = os.path.join(
+            args.artifact, "qnn_u16_runtime_profile.bin"
+        )
+        profile_command = [
+            sys.executable,
+            profile_tool,
+            "--manifest",
+            shard_manifest_path,
+            "--gguf",
+            args.llama_qnn_profile_gguf,
+            "--out",
+            profile_json,
+            "--bin-out",
+            profile_bin,
+        ]
+        if args.llama_qnn_profile_converter:
+            profile_command.extend(
+                ["--bin-converter", args.llama_qnn_profile_converter]
+            )
+        subprocess.run(profile_command, check=True)
+        logging.info(
+            "kernel-ready QNN profile exported at %s from %s",
+            profile_bin,
+            args.llama_qnn_profile_gguf,
+        )
     if args.use_attention_sink:
         compile_attention_sink_evictor(
             args,

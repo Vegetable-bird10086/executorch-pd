@@ -200,8 +200,9 @@ int run_compare(int argc, char** argv) {
   }
 
   ET_LOG(Info, "Loading GGUF model: %s", gguf_model_path.c_str());
-  const std::vector<uint8_t> gguf_bytes = read_binary_file(gguf_model_path);
-  ET_LOG(Info, "GGUF model size: %zu bytes", gguf_bytes.size());
+  auto gguf_bytes = example::ReadOnlyMappedFile::open(gguf_model_path);
+  auto gguf_context = example::create_pte_gguf_rebuild_context(gguf_bytes);
+  ET_LOG(Info, "GGUF model size: %zu bytes (read-only mmap)", gguf_bytes->size());
 
   const std::string manifest = read_text_file(stripped_manifest_path);
   const std::string manifest_dir = [&]() {
@@ -262,22 +263,27 @@ int run_compare(int argc, char** argv) {
         read_binary_file(orig_name.str());
     const std::vector<uint8_t> stripped_bytes =
         read_binary_file(stripped_path);
-    const std::vector<uint8_t> index_bytes = read_binary_file(index_path);
+    auto index_bytes = std::make_shared<std::vector<uint8_t>>(
+        read_binary_file(index_path));
 
     ET_LOG(Info, "  Sizes: original=%zu stripped=%zu index=%zu",
-        original_bytes.size(), stripped_bytes.size(), index_bytes.size());
+        original_bytes.size(), stripped_bytes.size(), index_bytes->size());
 
+    auto recipe = example::prepare_pte_gguf_shard_recipe(
+        gguf_context, index_bytes, 32);
     example::PteRebuildResult rebuild_result =
-        example::rebuild_pte_from_stripped_gguf(
-            stripped_bytes, index_bytes, gguf_bytes);
+        example::rebuild_pte_from_stripped_gguf_recipe(
+            stripped_bytes, *recipe, nullptr);
+    example::discard_pte_gguf_rebuild_source_pages(gguf_context);
 
-    if (rebuild_result.rebuilt_pte == nullptr) {
+    if (rebuild_result.rebuilt_pte_buffer == nullptr) {
       ET_LOG(Error, "  REBUILD FAILED");
       ++mismatched_shards;
       continue;
     }
 
-    const std::vector<uint8_t>& rebuilt = *rebuild_result.rebuilt_pte;
+    const example::PteRebuildBuffer& rebuilt =
+        *rebuild_result.rebuilt_pte_buffer;
 
     ET_LOG(Info,
         "  Rebuilt:   %zu bytes  records=%zu  weight_bytes=%zu  time=%.2f ms",

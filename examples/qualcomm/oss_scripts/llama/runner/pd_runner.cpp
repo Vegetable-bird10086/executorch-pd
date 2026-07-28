@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -27,7 +28,11 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <type_traits>
+#include <unistd.h>
 #include <vector>
 
 using executorch::extension::llm::time_in_ms;
@@ -714,22 +719,26 @@ std::vector<uint16_t> build_canonical_kv(
   return canonical;
 }
 
-std::vector<uint8_t> build_qnn_u8_kv_handoff(
+void build_qnn_u8_kv_handoff(
     KVManager<uint8_t>* kv_manager,
     int64_t num_layers,
     int64_t num_heads,
     int64_t head_dim,
     int32_t prompt_len,
-    int32_t max_cache_len) {
+    int32_t max_cache_len,
+    uint8_t* direct,
+    size_t direct_size) {
   ET_CHECK_MSG(kv_manager != nullptr, "QNN U8 KV manager cannot be null");
   const auto& k_cache = kv_manager->get_k_cache_();
   const auto& v_cache = kv_manager->get_v_cache_();
   const size_t per_layer_count =
       static_cast<size_t>(num_heads) * prompt_len * head_dim;
   const size_t per_kind_count = static_cast<size_t>(num_layers) * per_layer_count;
-  std::vector<uint8_t> direct(per_kind_count * 2);
-  uint8_t* direct_k = direct.data();
-  uint8_t* direct_v = direct.data() + per_kind_count;
+  ET_CHECK_MSG(
+      direct != nullptr && direct_size == per_kind_count * 2,
+      "QNN U8 KV handoff buffer has an unexpected size");
+  uint8_t* direct_k = direct;
+  uint8_t* direct_v = direct + per_kind_count;
 
   for (int64_t layer = 0; layer < num_layers; ++layer) {
     const auto& layer_k = k_cache.at(static_cast<size_t>(layer));
@@ -750,6 +759,27 @@ std::vector<uint8_t> build_qnn_u8_kv_handoff(
       }
     }
   }
+}
+
+std::vector<uint8_t> build_qnn_u8_kv_handoff(
+    KVManager<uint8_t>* kv_manager,
+    int64_t num_layers,
+    int64_t num_heads,
+    int64_t head_dim,
+    int32_t prompt_len,
+    int32_t max_cache_len) {
+  const size_t size =
+      static_cast<size_t>(num_layers) * num_heads * prompt_len * head_dim * 2;
+  std::vector<uint8_t> direct(size);
+  build_qnn_u8_kv_handoff(
+      kv_manager,
+      num_layers,
+      num_heads,
+      head_dim,
+      prompt_len,
+      max_cache_len,
+      direct.data(),
+      direct.size());
   return direct;
 }
 
@@ -1210,12 +1240,42 @@ void PDPrefillRunner<T>::set_prefill_etdump_config(
 }
 
 template <typename T>
-Error PDPrefillRunner<T>::export_prefill_handoff(
+Error PDPrefillRunner<T>::export_prefill_memory_handoff(
+    const std::string& prompt,
+    bool tokenized_prompt,
+    int32_t seq_len,
+    MemoryHandoff* memory_handoff) {
+  ET_CHECK_MSG(memory_handoff != nullptr, "PD memory handoff cannot be null");
+  return export_prefill_handoff_impl(
+      prompt, tokenized_prompt, seq_len, "", "", memory_handoff, false);
+}
+
+template <typename T>
+Error PDPrefillRunner<T>::export_prefill_handoff_files(
     const std::string& prompt,
     bool tokenized_prompt,
     int32_t seq_len,
     const std::string& export_dir,
     const std::string& kv_quant_attrs_path) {
+  return export_prefill_handoff_impl(
+      prompt,
+      tokenized_prompt,
+      seq_len,
+      export_dir,
+      kv_quant_attrs_path,
+      nullptr,
+      true);
+}
+
+template <typename T>
+Error PDPrefillRunner<T>::export_prefill_handoff_impl(
+    const std::string& prompt,
+    bool tokenized_prompt,
+    int32_t seq_len,
+    const std::string& export_dir,
+    const std::string& kv_quant_attrs_path,
+    MemoryHandoff* memory_handoff,
+    bool write_files) {
   ET_CHECK_MSG(!prompt.empty(), "prompt cannot be null");
   ET_CHECK_MSG(cur_pos_ == 0, "PD prefill export only supports a fresh context");
   if (!is_loaded()) {
@@ -1286,37 +1346,95 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   const auto quant_attrs_start = SteadyClock::now();
   std::vector<KvQuantAttr> quant_attrs;
   if constexpr (std::is_same_v<T, uint8_t>) {
-    const size_t expected_attr_count = static_cast<size_t>(num_layers_) * 2;
-    ET_CHECK_MSG(
-        !kv_quant_attrs_path.empty(),
-        "8-bit KV PD export requires --kv_quant_attrs_path pointing to prefill_kv_quant_attrs.json");
-    quant_attrs = read_kv_quant_attrs_from_json(kv_quant_attrs_path, expected_attr_count);
-    for (size_t i = 0; i < expected_attr_count; ++i) {
-      ET_CHECK_MSG(quant_attrs.at(i).valid, "Missing kv quant attr %zu", i);
+    if (write_files) {
+      const size_t expected_attr_count = static_cast<size_t>(num_layers_) * 2;
+      ET_CHECK_MSG(
+          !kv_quant_attrs_path.empty(),
+          "8-bit KV PD export requires --kv_quant_attrs_path pointing to prefill_kv_quant_attrs.json");
+      quant_attrs =
+          read_kv_quant_attrs_from_json(kv_quant_attrs_path, expected_attr_count);
+      for (size_t i = 0; i < expected_attr_count; ++i) {
+        ET_CHECK_MSG(quant_attrs.at(i).valid, "Missing kv quant attr %zu", i);
+      }
     }
   }
   const double quant_attrs_ms = elapsed_ms(quant_attrs_start);
 
   const auto kv_layout_start = SteadyClock::now();
-  const std::vector<uint16_t> canonical_kv = build_canonical_kv(
-      kv_manager_.get(),
-      decoder_model_version_,
-      model_path_,
-      num_layers_,
-      num_heads_,
-      head_dim_,
-      num_cached_tokens,
-      prefill_cache_stride_,
-      quant_attrs);
+  std::vector<uint16_t> canonical_kv;
   std::vector<uint8_t> qnn_u8_kv;
-  if constexpr (std::is_same_v<T, uint8_t>) {
-    qnn_u8_kv = build_qnn_u8_kv_handoff(
+  if (write_files) {
+    canonical_kv = build_canonical_kv(
         kv_manager_.get(),
+        decoder_model_version_,
+        model_path_,
         num_layers_,
         num_heads_,
         head_dim_,
         num_cached_tokens,
-        prefill_cache_stride_);
+        prefill_cache_stride_,
+        quant_attrs);
+    if constexpr (std::is_same_v<T, uint8_t>) {
+      qnn_u8_kv = build_qnn_u8_kv_handoff(
+          kv_manager_.get(),
+          num_layers_,
+          num_heads_,
+          head_dim_,
+          num_cached_tokens,
+          prefill_cache_stride_);
+    }
+  }
+  if (memory_handoff != nullptr) {
+    if constexpr (std::is_same_v<T, uint8_t>) {
+      const size_t prompt_bytes =
+          cached_prompt_tokens.size() * sizeof(uint64_t);
+      const size_t kv_bytes =
+          static_cast<size_t>(num_layers_) * num_heads_ * num_cached_tokens *
+          head_dim_ * 2;
+      const size_t total_bytes = prompt_bytes + kv_bytes;
+      const int fd = static_cast<int>(
+          syscall(SYS_memfd_create, "pd-kv-handoff", 0));
+      ET_CHECK_MSG(fd >= 0, "memfd_create failed: %s", std::strerror(errno));
+      ET_CHECK_MSG(
+          ftruncate(fd, static_cast<off_t>(total_bytes)) == 0,
+          "ftruncate for PD memory handoff failed: %s",
+          std::strerror(errno));
+      void* mapping = mmap(
+          nullptr,
+          total_bytes,
+          PROT_READ | PROT_WRITE,
+          MAP_SHARED,
+          fd,
+          0);
+      ET_CHECK_MSG(
+          mapping != MAP_FAILED,
+          "mmap for PD memory handoff failed: %s",
+          std::strerror(errno));
+      std::memcpy(mapping, cached_prompt_tokens.data(), prompt_bytes);
+      build_qnn_u8_kv_handoff(
+          kv_manager_.get(),
+          num_layers_,
+          num_heads_,
+          head_dim_,
+          num_cached_tokens,
+          prefill_cache_stride_,
+          static_cast<uint8_t*>(mapping) + prompt_bytes,
+          kv_bytes);
+      ET_CHECK_MSG(
+          munmap(mapping, total_bytes) == 0,
+          "munmap for PD memory handoff failed: %s",
+          std::strerror(errno));
+      memory_handoff->fd = fd;
+      memory_handoff->size_bytes = total_bytes;
+      memory_handoff->prompt_length = num_cached_tokens;
+      memory_handoff->num_layers = static_cast<int32_t>(num_layers_);
+      memory_handoff->num_kv_heads = static_cast<int32_t>(num_heads_);
+      memory_handoff->head_dim = static_cast<int32_t>(head_dim_);
+      memory_handoff->first_token = first_token;
+      memory_handoff->first_token_is_prompt_tail = bridge_prompt_tail;
+    } else {
+      ET_CHECK_MSG(false, "PD memory handoff requires UINT8 KV");
+    }
   }
   const double kv_layout_ms = elapsed_ms(kv_layout_start);
   const size_t canonical_kv_bytes = canonical_kv.size() * sizeof(uint16_t);
@@ -1324,29 +1442,33 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   const bool export_undo_r3 = should_undo_r3_on_export(
       decoder_model_version_, model_path_, num_layers_, num_heads_, head_dim_);
 
-  fs::create_directories(export_dir);
   const fs::path export_path(export_dir);
   const auto metadata_files_start = SteadyClock::now();
-  write_binary(
-      export_path / "prompt_tokens.bin",
-      cached_prompt_tokens.data(),
-      cached_prompt_tokens.size() * sizeof(uint64_t));
-  write_binary(
-      export_path / "first_token.bin",
-      &first_token,
-      sizeof(first_token));
+  if (write_files) {
+    fs::create_directories(export_dir);
+    write_binary(
+        export_path / "prompt_tokens.bin",
+        cached_prompt_tokens.data(),
+        cached_prompt_tokens.size() * sizeof(uint64_t));
+    write_binary(
+        export_path / "first_token.bin",
+        &first_token,
+        sizeof(first_token));
+  }
   const double metadata_files_ms = elapsed_ms(metadata_files_start);
 
   const auto kv_write_start = SteadyClock::now();
-  write_binary(
-      export_path / "kv.bin",
-      canonical_kv.data(),
-      canonical_kv_bytes);
-  if constexpr (std::is_same_v<T, uint8_t>) {
+  if (write_files) {
     write_binary(
-        export_path / "kv_qnn_u8.bin",
-        qnn_u8_kv.data(),
-        qnn_u8_kv_bytes);
+        export_path / "kv.bin",
+        canonical_kv.data(),
+        canonical_kv_bytes);
+    if constexpr (std::is_same_v<T, uint8_t>) {
+      write_binary(
+          export_path / "kv_qnn_u8.bin",
+          qnn_u8_kv.data(),
+          qnn_u8_kv_bytes);
+    }
   }
   const double kv_write_ms = elapsed_ms(kv_write_start);
 
@@ -1390,8 +1512,10 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   manifest["first_token_owner"] =
       bridge_prompt_tail ? "prompt_tail_bridge" : "executorch";
   const auto fingerprint_start = SteadyClock::now();
-  manifest["pte_fingerprint"] = make_file_fingerprint(model_path_);
-  manifest["tokenizer_fingerprint"] = make_file_fingerprint(tokenizer_path_);
+  if (write_files) {
+    manifest["pte_fingerprint"] = make_file_fingerprint(model_path_);
+    manifest["tokenizer_fingerprint"] = make_file_fingerprint(tokenizer_path_);
+  }
   const double fingerprint_ms = elapsed_ms(fingerprint_start);
   manifest["rope"] = {
       {"freq_base", nullptr},
@@ -1411,14 +1535,16 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
   }
 
   const auto manifest_write_start = SteadyClock::now();
-  std::ofstream manifest_out(export_path / "manifest.json");
-  ET_CHECK_MSG(
-      manifest_out.is_open(),
-      "Unable to write manifest: %s",
-      (export_path / "manifest.json").c_str());
-  manifest_out << manifest.dump(2) << "\n";
-  manifest_out.flush();
-  ET_CHECK_MSG(manifest_out.good(), "Failed to write PD manifest");
+  if (write_files) {
+    std::ofstream manifest_out(export_path / "manifest.json");
+    ET_CHECK_MSG(
+        manifest_out.is_open(),
+        "Unable to write manifest: %s",
+        (export_path / "manifest.json").c_str());
+    manifest_out << manifest.dump(2) << "\n";
+    manifest_out.flush();
+    ET_CHECK_MSG(manifest_out.good(), "Failed to write PD manifest");
+  }
   const double manifest_write_ms = elapsed_ms(manifest_write_start);
   const double handoff_total_ms = elapsed_ms(handoff_start);
   last_runtime_stats_.handoff_total_ms = handoff_total_ms;
@@ -1437,15 +1563,27 @@ Error PDPrefillRunner<T>::export_prefill_handoff(
       fingerprint_ms,
       manifest_write_ms,
       handoff_total_ms);
-  ET_LOG(
-      Info,
-      "PD handoff exported: dir=%s prompt_len=%d cached_prompt_len=%d kv_bytes=%zu first_token=%llu bridge_prompt_tail=%d",
-      export_dir.c_str(),
-      num_prompt_tokens,
-      num_cached_tokens,
-      canonical_kv_bytes,
-      static_cast<unsigned long long>(first_token),
-      static_cast<int>(bridge_prompt_tail));
+  if (memory_handoff != nullptr) {
+    ET_LOG(
+        Info,
+        "PD memory handoff ready: prompt_len=%d cached_prompt_len=%d kv_bytes=%zu first_token=%llu bridge_prompt_tail=%d",
+        num_prompt_tokens,
+        num_cached_tokens,
+        memory_handoff->size_bytes -
+            cached_prompt_tokens.size() * sizeof(uint64_t),
+        static_cast<unsigned long long>(first_token),
+        static_cast<int>(bridge_prompt_tail));
+  } else {
+    ET_LOG(
+        Info,
+        "PD diagnostic handoff files exported: dir=%s prompt_len=%d cached_prompt_len=%d kv_bytes=%zu first_token=%llu bridge_prompt_tail=%d",
+        export_dir.c_str(),
+        num_prompt_tokens,
+        num_cached_tokens,
+        canonical_kv_bytes,
+        static_cast<unsigned long long>(first_token),
+        static_cast<int>(bridge_prompt_tail));
+  }
   return Error::Ok;
 }
 

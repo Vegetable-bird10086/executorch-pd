@@ -101,14 +101,6 @@ DEFINE_int32(
     0,
     "Explicit QNN logits zero point for manifest-only WikiText PPL.");
 DEFINE_string(
-    prefill_export_dir,
-    "",
-    "Optional output directory for PD handoff export. When omitted, a temporary directory is created.");
-DEFINE_string(
-    kv_quant_attrs_path,
-    "",
-    "Required KV quant attrs JSON for 8-bit KV PD export. Use the Prefill-side file such as prefill_kv_quant_attrs.json.");
-DEFINE_string(
     attention_sink_rope_path,
     "",
     "Attention sink rope PTE. Not supported in PD v1 export.");
@@ -128,7 +120,7 @@ DEFINE_bool(
 DEFINE_bool(
     prefill_only,
     false,
-    "Only export the PD handoff and skip llama.cpp decode.");
+    "Run QNN Prefill only, release its in-memory handoff, and skip Decode.");
 DEFINE_bool(
     prefill_shard_pipeline,
     false,
@@ -187,7 +179,7 @@ DEFINE_string(
     "Path to separate_embed_matrix.bin when --prefill_separate_embed=true.");
 DEFINE_bool(
     prefill_embedding_resident,
-    true,
+    false,
     "Keep separate embedding matrix resident in memory; false uses row-on-demand file reads.");
 DEFINE_string(
     llama_pd_cli_path,
@@ -233,18 +225,6 @@ DEFINE_bool(
     decode_import_ro,
     false,
     "Only validate/import the PD handoff in llama.cpp without continuing decode.");
-DEFINE_bool(
-    decode_roundtrip_check,
-    false,
-    "Ask llama-pd-cli to re-serialize the imported KV sequence and compare it byte-for-byte with the imported PD blob.");
-DEFINE_bool(
-    decode_native_compare,
-    false,
-    "Ask llama-pd-cli to compare imported-KV resume logits against a native GGUF prefill resume on the same prompt tokens.");
-DEFINE_bool(
-    decode_native_first_token,
-    false,
-    "Ask llama-pd-cli to choose the first continuation token from a native GGUF prompt prefill instead of the QNN prefill logits.");
 
 namespace fs = std::filesystem;
 
@@ -263,8 +243,8 @@ struct ProcessMemorySnapshot {
   uint64_t hwm_bytes{0};
 };
 
-uint64_t read_proc_status_bytes(const char* field) {
-  std::ifstream status("/proc/self/status");
+uint64_t read_proc_status_bytes(const std::string& path, const char* field) {
+  std::ifstream status(path);
   std::string line;
   while (std::getline(status, line)) {
     if (line.rfind(field, 0) != 0) {
@@ -280,8 +260,16 @@ uint64_t read_proc_status_bytes(const char* field) {
 
 ProcessMemorySnapshot process_memory_snapshot() {
   return {
-      read_proc_status_bytes("VmRSS:"),
-      read_proc_status_bytes("VmHWM:"),
+      read_proc_status_bytes("/proc/self/status", "VmRSS:"),
+      read_proc_status_bytes("/proc/self/status", "VmHWM:"),
+  };
+}
+
+ProcessMemorySnapshot process_memory_snapshot(pid_t pid) {
+  const std::string path = "/proc/" + std::to_string(pid) + "/status";
+  return {
+      read_proc_status_bytes(path, "VmRSS:"),
+      read_proc_status_bytes(path, "VmHWM:"),
   };
 }
 
@@ -300,6 +288,8 @@ struct PdE2ERuntimeStats {
   ProcessMemorySnapshot before_runner;
   ProcessMemorySnapshot after_runner;
   ProcessMemorySnapshot after_export;
+  std::string shared_embedding_matrix_path;
+  example::PDPrefillRunner<uint8_t>::MemoryHandoff memory_handoff;
 };
 
 struct DecodeProcessResult {
@@ -307,6 +297,8 @@ struct DecodeProcessResult {
   double wall_ms{0.0};
   ProcessMemorySnapshot before;
   ProcessMemorySnapshot after;
+  ProcessMemorySnapshot child_peak;
+  uint64_t process_tree_peak_rss_bytes{0};
 };
 
 void log_pd_e2e_runtime_summary(
@@ -388,10 +380,11 @@ void log_pd_e2e_runtime_summary(
       total_ms);
   ET_LOG(
       Info,
-      "PD E2E handoff detail: kv_layout_ms=%.3f kv_write_ms=%.3f fingerprint_ms=%.3f",
+      "PD E2E memory handoff: kv_pack_ms=%.3f size_bytes=%zu",
       prefill.prefill.kv_layout_ms,
-      prefill.prefill.kv_write_ms,
-      prefill.prefill.fingerprint_ms);
+      prefill.memory_handoff.size_bytes -
+          static_cast<size_t>(prefill.memory_handoff.prompt_length) *
+              sizeof(uint64_t));
   ET_LOG(
       Info,
       "PD E2E parent memory MiB: before_runner_rss=%.2f after_runner_rss=%.2f "
@@ -401,6 +394,13 @@ void log_pd_e2e_runtime_summary(
       bytes_to_mib(prefill.after_export.rss_bytes),
       bytes_to_mib(decode.after.rss_bytes),
       bytes_to_mib(std::max(prefill.after_export.hwm_bytes, decode.after.hwm_bytes)));
+  ET_LOG(
+      Info,
+      "PD E2E decode memory MiB: child_peak_rss=%.2f child_hwm=%.2f "
+      "process_tree_peak_rss=%.2f poll_interval_ms=5",
+      bytes_to_mib(decode.child_peak.rss_bytes),
+      bytes_to_mib(decode.child_peak.hwm_bytes),
+      bytes_to_mib(decode.process_tree_peak_rss_bytes));
   for (size_t i = 0; i < prefill.shard_stats.size(); ++i) {
     const auto& shard = prefill.shard_stats[i];
     ET_LOG(
@@ -737,7 +737,9 @@ PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
   ET_LOG(
       Info,
       "loaded qnn_compile_spec from shard manifest: bytes=%zu",
-      files.qnn_compile_spec_bytes->size());
+      files.qnn_compile_spec_bytes == nullptr
+          ? 0
+          : files.qnn_compile_spec_bytes->size());
   files.outputs_logits =
       read_bool_field_or(manifest, 0, "prefill_outputs_logits", files.outputs_logits);
   files.use_separate_embed =
@@ -997,7 +999,7 @@ std::string get_formatted_prompt(
         formatted_prompt.append(system_prompt);
         formatted_prompt.append("<|im_end|>\n");
       }
-      formatted_prompt.append("<|im_start|>assistant");
+      formatted_prompt.append("<|im_start|>assistant\n");
       break;
     case example::DecoderModelVersion::kSmollm2_135m:
       if (!system_prompt.empty()) {
@@ -1037,15 +1039,6 @@ std::string get_formatted_prompt(
   return formatted_prompt;
 }
 
-std::string create_temp_handoff_dir() {
-  std::string pattern = "/tmp/qnn_pd_handoff_XXXXXX";
-  std::vector<char> writable(pattern.begin(), pattern.end());
-  writable.push_back('\0');
-  char* created = mkdtemp(writable.data());
-  ET_CHECK_MSG(created != nullptr, "mkdtemp failed: %s", std::strerror(errno));
-  return std::string(created);
-}
-
 std::string resolve_decode_gguf_path() {
   if (!FLAGS_decode_gguf_path.empty()) {
     return FLAGS_decode_gguf_path;
@@ -1075,8 +1068,8 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   if (has_gguf) {
     config.source_kind =
         example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::Gguf;
-    config.source_bytes =
-        std::make_shared<std::vector<uint8_t>>(read_binary_file(FLAGS_gguf_model_path));
+    config.mapped_source_bytes =
+        example::ReadOnlyMappedFile::open(FLAGS_gguf_model_path);
   } else if (has_tmac_gguf) {
     config.source_kind =
         example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::TmacGguf;
@@ -1112,12 +1105,15 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
       Info,
       "PD shard rebuild source: kind=%d size_bytes=%zu capacity_bytes=%zu",
       static_cast<int>(config.source_kind),
-      config.source_bytes->size(),
-      config.source_bytes->capacity());
+      config.mapped_source_bytes ? config.mapped_source_bytes->size()
+                                 : config.source_bytes->size(),
+      config.mapped_source_bytes ? size_t{0} : config.source_bytes->capacity());
   return config;
 }
 
-DecodeProcessResult run_decode_process(const std::string& handoff_dir) {
+DecodeProcessResult run_decode_process(
+    const example::PDPrefillRunner<uint8_t>::MemoryHandoff& memory_handoff,
+    const std::string& shared_embedding_matrix_path) {
   ET_CHECK_MSG(
       !FLAGS_llama_pd_cli_path.empty(),
       "--llama_pd_cli_path is required unless --prefill_only=true");
@@ -1125,25 +1121,57 @@ DecodeProcessResult run_decode_process(const std::string& handoff_dir) {
   ET_CHECK_MSG(
       !decode_gguf_path.empty(),
       "Provide --decode_gguf_path, --gguf_model_path, or --tmac_model_path for decode");
+  ET_CHECK_MSG(
+      memory_handoff.fd >= 0,
+      "E2E Decode requires an in-memory UINT8 KV handoff");
 
   std::vector<std::string> args = {
       FLAGS_llama_pd_cli_path,
-      "--pd-import",
-      handoff_dir,
       "-m",
       decode_gguf_path,
       "-n",
       std::to_string(FLAGS_decode_n_predict),
       "-c",
       std::to_string(FLAGS_decode_ctx),
+      // PD Decode evaluates exactly one token at a time. Keeping llama.cpp's
+      // general-purpose batch defaults would reserve graph/work buffers for
+      // thousands of tokens and needlessly consume hundreds of MiB.
+      "-b",
+      "1",
+      "-ub",
+      "1",
       "-ngl",
       std::to_string(FLAGS_decode_ngl),
       "--temp",
       std::to_string(FLAGS_decode_temp),
   };
+  args.insert(
+      args.begin() + 1,
+      {
+          "--pd-memory-fd",
+          std::to_string(memory_handoff.fd),
+          "--pd-memory-size",
+          std::to_string(memory_handoff.size_bytes),
+          "--pd-prompt-length",
+          std::to_string(memory_handoff.prompt_length),
+          "--pd-num-layers",
+          std::to_string(memory_handoff.num_layers),
+          "--pd-num-kv-heads",
+          std::to_string(memory_handoff.num_kv_heads),
+          "--pd-head-dim",
+          std::to_string(memory_handoff.head_dim),
+          "--pd-first-token",
+          std::to_string(memory_handoff.first_token),
+          "--pd-first-token-is-prompt-tail",
+          memory_handoff.first_token_is_prompt_tail ? "1" : "0",
+      });
   if (FLAGS_decode_threads > 0) {
     args.push_back("-t");
     args.push_back(std::to_string(FLAGS_decode_threads));
+  }
+  if (!shared_embedding_matrix_path.empty()) {
+    args.push_back("--pd-disk-embedding");
+    args.push_back(shared_embedding_matrix_path);
   }
   if (!FLAGS_decode_ppl_tokens_path.empty()) {
     args.push_back("--pd-ppl-tokens");
@@ -1159,15 +1187,6 @@ DecodeProcessResult run_decode_process(const std::string& handoff_dir) {
   }
   if (FLAGS_decode_import_ro) {
     args.push_back("--pd-import-ro");
-  }
-  if (FLAGS_decode_roundtrip_check) {
-    args.push_back("--pd-roundtrip-check");
-  }
-  if (FLAGS_decode_native_compare) {
-    args.push_back("--pd-native-compare");
-  }
-  if (FLAGS_decode_native_first_token) {
-    args.push_back("--pd-native-first-token");
   }
 
   ET_LOG(Info, "Launching decode via llama-pd-cli");
@@ -1198,7 +1217,27 @@ DecodeProcessResult run_decode_process(const std::string& handoff_dir) {
   }
 
   int status = 0;
-  ET_CHECK_MSG(waitpid(pid, &status, 0) == pid, "waitpid failed: %s", std::strerror(errno));
+  while (true) {
+    const pid_t wait_result = waitpid(pid, &status, WNOHANG);
+    ET_CHECK_MSG(
+        wait_result >= 0,
+        "waitpid failed: %s",
+        std::strerror(errno));
+    if (wait_result == pid) {
+      break;
+    }
+    const auto child_memory = process_memory_snapshot(pid);
+    const auto parent_memory = process_memory_snapshot();
+    if (child_memory.rss_bytes > result.child_peak.rss_bytes) {
+      result.child_peak.rss_bytes = child_memory.rss_bytes;
+    }
+    result.child_peak.hwm_bytes =
+        std::max(result.child_peak.hwm_bytes, child_memory.hwm_bytes);
+    result.process_tree_peak_rss_bytes = std::max(
+        result.process_tree_peak_rss_bytes,
+        parent_memory.rss_bytes + child_memory.rss_bytes);
+    usleep(5000);
+  }
   result.wall_ms = elapsed_ms(decode_start);
   result.after = process_memory_snapshot();
   if (WIFEXITED(status)) {
@@ -1302,7 +1341,6 @@ PdE2ERuntimeStats run_pd_e2e(
     ModuleBundle module_bundle,
     const std::string& prompt_input,
     bool tokenized_prompt,
-    const std::string& handoff_dir,
     PrefillShardFiles prefill_shard_files,
     example::DecoderRunner::PrefillShardRebuildConfig prefill_shard_rebuild,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
@@ -1321,6 +1359,10 @@ PdE2ERuntimeStats run_pd_e2e(
   ET_CHECK_MSG(
       !effective_separate_embed || !effective_embedding_matrix_path.empty(),
       "Separate prefill embedding requires --prefill_embedding_matrix_path or separate_embed_matrix in the shard manifest");
+  ET_CHECK_MSG(
+      !effective_separate_embed || !FLAGS_prefill_embedding_resident,
+      "Separate embedding must remain non-resident in the PD pipeline; "
+      "--prefill_embedding_resident=true is not supported");
 
   typename example::PDPrefillRunner<T>::StaticMetadata static_metadata;
   if (prefill_shard_files.qwen3_static_plan) {
@@ -1338,10 +1380,13 @@ PdE2ERuntimeStats run_pd_e2e(
     static_metadata.outputs_logits = effective_outputs_logits;
     static_metadata.use_separate_embed = effective_separate_embed;
     static_metadata.embedding_matrix_path = effective_embedding_matrix_path;
-    static_metadata.resident_embedding = FLAGS_prefill_embedding_resident;
+    static_metadata.resident_embedding = false;
   }
 
   PdE2ERuntimeStats stats;
+  stats.shared_embedding_matrix_path = effective_separate_embed
+      ? effective_embedding_matrix_path
+      : std::string{};
   stats.before_runner = process_memory_snapshot();
   const auto runner_setup_start = SteadyClock::now();
   example::PDPrefillRunner<T> runner(
@@ -1387,12 +1432,11 @@ PdE2ERuntimeStats run_pd_e2e(
       : get_formatted_prompt(prompt_input, FLAGS_system_prompt, decoder_version);
   const auto qnn_export_start = SteadyClock::now();
   ET_CHECK_MSG(
-      runner.export_prefill_handoff(
+      runner.export_prefill_memory_handoff(
           formatted_prompt,
           tokenized_prompt,
           FLAGS_seq_len,
-          handoff_dir,
-          FLAGS_kv_quant_attrs_path) == executorch::runtime::Error::Ok,
+          &stats.memory_handoff) == executorch::runtime::Error::Ok,
       "PD prefill export failed");
   stats.qnn_export_total_ms = elapsed_ms(qnn_export_start);
   const auto runner_stats = runner.last_runtime_stats();
@@ -1536,41 +1580,26 @@ int main(int argc, char** argv) {
   }
 
   const auto e2e_start = SteadyClock::now();
-  const std::string handoff_dir = FLAGS_prefill_export_dir.empty()
-      ? create_temp_handoff_dir()
-      : FLAGS_prefill_export_dir;
-  fs::create_directories(handoff_dir);
-  ET_LOG(Info, "Using PD handoff directory: %s", handoff_dir.c_str());
+  ET_CHECK_MSG(
+      module_meta.kv_bitwidth == example::KvBitWidth::kWidth8,
+      "PD E2E requires UINT8 KV");
+  ET_LOG(Info, "Using in-memory PD handoff");
 
   const std::string prompt_input =
       use_tokenized_prompt ? FLAGS_tokenized_prompt : prompts.front();
-  PdE2ERuntimeStats prefill_runtime;
-  if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth8) {
-    prefill_runtime = run_pd_e2e<uint8_t>(
-        std::move(module_bundle),
-        prompt_input,
-        use_tokenized_prompt,
-        handoff_dir,
-        prefill_shard_files,
-        prefill_shard_rebuild,
-        std::move(attention_sink_rope_module));
-  } else if (module_meta.kv_bitwidth == example::KvBitWidth::kWidth16) {
-    prefill_runtime = run_pd_e2e<uint16_t>(
-        std::move(module_bundle),
-        prompt_input,
-        use_tokenized_prompt,
-        handoff_dir,
-        prefill_shard_files,
-        prefill_shard_rebuild,
-        std::move(attention_sink_rope_module));
-  } else {
-    ET_CHECK_MSG(
-        false,
-        "Unsupported kv bitwidth: %ld",
-        static_cast<int64_t>(module_meta.kv_bitwidth));
-  }
+  PdE2ERuntimeStats prefill_runtime = run_pd_e2e<uint8_t>(
+      std::move(module_bundle),
+      prompt_input,
+      use_tokenized_prompt,
+      prefill_shard_files,
+      prefill_shard_rebuild,
+      std::move(attention_sink_rope_module));
 
   if (FLAGS_prefill_only) {
+    if (prefill_runtime.memory_handoff.fd >= 0) {
+      close(prefill_runtime.memory_handoff.fd);
+      prefill_runtime.memory_handoff.fd = -1;
+    }
     DecodeProcessResult no_decode;
     no_decode.before = process_memory_snapshot();
     no_decode.after = no_decode.before;
@@ -1578,11 +1607,18 @@ int main(int argc, char** argv) {
         prefill_runtime,
         no_decode,
         elapsed_ms(e2e_start));
-    ET_LOG(Info, "Prefill completed; handoff is ready at %s", handoff_dir.c_str());
+    ET_LOG(Info, "Prefill completed; in-memory handoff released");
     return 0;
   }
 
-  const DecodeProcessResult decode = run_decode_process(handoff_dir);
+  const DecodeProcessResult decode =
+      run_decode_process(
+          prefill_runtime.memory_handoff,
+          prefill_runtime.shared_embedding_matrix_path);
+  if (prefill_runtime.memory_handoff.fd >= 0) {
+    close(prefill_runtime.memory_handoff.fd);
+    prefill_runtime.memory_handoff.fd = -1;
+  }
   ET_CHECK_MSG(
       decode.exit_code == 0,
       "llama-pd-cli exited with code %d",

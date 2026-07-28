@@ -21,6 +21,17 @@ namespace example {
 template <typename T>
 class PDPrefillRunner {
  public:
+  struct MemoryHandoff {
+    int fd{-1};
+    uint64_t size_bytes{0};
+    int32_t prompt_length{0};
+    int32_t num_layers{0};
+    int32_t num_kv_heads{0};
+    int32_t head_dim{0};
+    uint64_t first_token{0};
+    bool first_token_is_prompt_tail{false};
+  };
+
   struct StaticMetadata {
     bool enabled{false};
     int32_t context_len{0};
@@ -84,7 +95,13 @@ class PDPrefillRunner {
   bool prefill_qnn_backend_prewarmed() const;
   void set_prefill_etdump_config(DecoderRunner::PrefillEtDumpConfig config);
 
-  executorch::runtime::Error export_prefill_handoff(
+  executorch::runtime::Error export_prefill_memory_handoff(
+      const std::string& prompt,
+      bool tokenized_prompt,
+      int32_t seq_len,
+      MemoryHandoff* memory_handoff);
+
+  executorch::runtime::Error export_prefill_handoff_files(
       const std::string& prompt,
       bool tokenized_prompt,
       int32_t seq_len,
@@ -101,6 +118,15 @@ class PDPrefillRunner {
       int64_t* scored_tokens_out = nullptr);
 
  private:
+  executorch::runtime::Error export_prefill_handoff_impl(
+      const std::string& prompt,
+      bool tokenized_prompt,
+      int32_t seq_len,
+      const std::string& export_dir,
+      const std::string& kv_quant_attrs_path,
+      MemoryHandoff* memory_handoff,
+      bool write_files);
+
   enum EvalMode {
     kKVCached = 0,
     kHybrid,

@@ -22,13 +22,72 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <fcntl.h>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unordered_map>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
 namespace example {
+
+ReadOnlyMappedFile::ReadOnlyMappedFile(
+    int fd,
+    const uint8_t* data,
+    size_t size)
+    : fd_(fd), data_(data), size_(size) {}
+
+std::shared_ptr<ReadOnlyMappedFile> ReadOnlyMappedFile::open(
+    const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    throw std::runtime_error("Failed to open read-only source: " + path);
+  }
+  struct stat metadata {};
+  if (::fstat(fd, &metadata) != 0 || metadata.st_size <= 0) {
+    ::close(fd);
+    throw std::runtime_error("Failed to stat read-only source: " + path);
+  }
+  const size_t size = static_cast<size_t>(metadata.st_size);
+  void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (mapping == MAP_FAILED) {
+    ::close(fd);
+    throw std::runtime_error("Failed to mmap read-only source: " + path);
+  }
+  (void)::madvise(mapping, size, MADV_RANDOM);
+  return std::shared_ptr<ReadOnlyMappedFile>(new ReadOnlyMappedFile(
+      fd, static_cast<const uint8_t*>(mapping), size));
+}
+
+ReadOnlyMappedFile::~ReadOnlyMappedFile() {
+  if (data_ != nullptr && size_ > 0) {
+    ::munmap(const_cast<uint8_t*>(data_), size_);
+  }
+  if (fd_ >= 0) {
+    ::close(fd_);
+  }
+}
+
+const uint8_t* ReadOnlyMappedFile::data() const {
+  return data_;
+}
+
+size_t ReadOnlyMappedFile::size() const {
+  return size_;
+}
+
+bool ReadOnlyMappedFile::empty() const {
+  return size_ == 0;
+}
+
+void ReadOnlyMappedFile::discard_resident_pages() const {
+  if (data_ != nullptr && size_ > 0) {
+    (void)::madvise(const_cast<uint8_t*>(data_), size_, MADV_DONTNEED);
+  }
+}
 
 PteRebuildBuffer::PteRebuildBuffer(size_t capacity) {
   resize_uninitialized(capacity);
@@ -240,18 +299,18 @@ size_t align_up(size_t value, size_t alignment) {
 }
 
 std::string read_gguf_string(
-    const std::vector<uint8_t>& bytes,
+    const uint8_t* bytes,
     size_t* cursor) {
-  const size_t len = static_cast<size_t>(read_u64_le(bytes.data() + *cursor));
+  const size_t len = static_cast<size_t>(read_u64_le(bytes + *cursor));
   *cursor += sizeof(uint64_t);
   std::string value(
-      reinterpret_cast<const char*>(bytes.data() + *cursor), len);
+      reinterpret_cast<const char*>(bytes + *cursor), len);
   *cursor += len;
   return value;
 }
 
 void skip_gguf_value(
-    const std::vector<uint8_t>& bytes,
+    const uint8_t* bytes,
     size_t* cursor,
     GgufValueType type) {
   if (type == GgufValueType::STRING) {
@@ -261,9 +320,9 @@ void skip_gguf_value(
 
   if (type == GgufValueType::ARRAY) {
     const auto item_type =
-        static_cast<GgufValueType>(read_u32_le(bytes.data() + *cursor));
+        static_cast<GgufValueType>(read_u32_le(bytes + *cursor));
     *cursor += sizeof(uint32_t);
-    const size_t count = static_cast<size_t>(read_u64_le(bytes.data() + *cursor));
+    const size_t count = static_cast<size_t>(read_u64_le(bytes + *cursor));
     *cursor += sizeof(uint64_t);
     for (size_t i = 0; i < count; ++i) {
       skip_gguf_value(bytes, cursor, item_type);
@@ -349,6 +408,7 @@ struct GgufTensorInfo {
 
 struct GgufView {
   uint32_t alignment{32};
+  bool gptq2_32_gs32_source{false};
   std::unordered_map<std::string, GgufTensorInfo> tensors;
 };
 
@@ -403,6 +463,7 @@ struct DirectGptq2TensorView {
   size_t source_group_bytes{0};
   size_t num_source_groups{0};
   const uint8_t* data{nullptr};
+  bool gs32_source_layout{false};
 };
 
 const TensorView& require_tensor(const SafeTensorsView& view, const std::string& name);
@@ -472,7 +533,7 @@ const TensorView& require_tensor(
   return it->second;
 }
 
-GgufView parse_gguf(const std::vector<uint8_t>& gguf_bytes) {
+GgufView parse_gguf(const uint8_t* gguf_data, size_t gguf_size) {
   size_t cursor = 0;
   /* if (gguf_bytes.size() < 24) {
     throw std::runtime_error("GGUF file too small");
@@ -481,7 +542,7 @@ GgufView parse_gguf(const std::vector<uint8_t>& gguf_bytes) {
     throw std::runtime_error("GGUF magic mismatch");
   } */
   cursor += sizeof(uint32_t); // magic
-  const uint32_t version = read_u32_le(gguf_bytes.data() + cursor);
+  const uint32_t version = read_u32_le(gguf_data + cursor);
   cursor += sizeof(uint32_t);
   /* if (version != 3) {
     throw std::runtime_error("Unsupported GGUF version");
@@ -489,42 +550,51 @@ GgufView parse_gguf(const std::vector<uint8_t>& gguf_bytes) {
   (void)version;
 
   const size_t tensor_count =
-      static_cast<size_t>(read_u64_le(gguf_bytes.data() + cursor));
+      static_cast<size_t>(read_u64_le(gguf_data + cursor));
   cursor += sizeof(uint64_t);
   const size_t kv_count =
-      static_cast<size_t>(read_u64_le(gguf_bytes.data() + cursor));
+      static_cast<size_t>(read_u64_le(gguf_data + cursor));
   cursor += sizeof(uint64_t);
 
   GgufView out;
   for (size_t i = 0; i < kv_count; ++i) {
-    const std::string key = read_gguf_string(gguf_bytes, &cursor);
+    const std::string key = read_gguf_string(gguf_data, &cursor);
     const auto value_type =
-        static_cast<GgufValueType>(read_u32_le(gguf_bytes.data() + cursor));
+        static_cast<GgufValueType>(read_u32_le(gguf_data + cursor));
     cursor += sizeof(uint32_t);
     if (key == "general.alignment" && value_type == GgufValueType::UINT32) {
-      out.alignment = read_u32_le(gguf_bytes.data() + cursor);
+      out.alignment = read_u32_le(gguf_data + cursor);
     }
-    skip_gguf_value(gguf_bytes, &cursor, value_type);
+    if (key == "general.gptq2_32.layout" &&
+        value_type == GgufValueType::STRING) {
+      const std::string layout = read_gguf_string(gguf_data, &cursor);
+      if (layout != "gs32_source_v1") {
+        throw std::runtime_error("Unsupported GPTQ2_32 GGUF source layout");
+      }
+      out.gptq2_32_gs32_source = true;
+      continue;
+    }
+    skip_gguf_value(gguf_data, &cursor, value_type);
   }
 
   std::vector<GgufTensorStub> tensors;
   tensors.reserve(tensor_count);
   for (size_t i = 0; i < tensor_count; ++i) {
     GgufTensorStub stub;
-    stub.name = read_gguf_string(gguf_bytes, &cursor);
+    stub.name = read_gguf_string(gguf_data, &cursor);
     const size_t ndim =
-        static_cast<size_t>(read_u32_le(gguf_bytes.data() + cursor));
+        static_cast<size_t>(read_u32_le(gguf_data + cursor));
     cursor += sizeof(uint32_t);
     stub.shape.reserve(ndim);
     for (size_t dim = 0; dim < ndim; ++dim) {
-      stub.shape.push_back(read_u64_le(gguf_bytes.data() + cursor));
+      stub.shape.push_back(read_u64_le(gguf_data + cursor));
       cursor += sizeof(uint64_t);
     }
     stub.tensor_type =
-        static_cast<GgufTensorType>(read_u32_le(gguf_bytes.data() + cursor));
+        static_cast<GgufTensorType>(read_u32_le(gguf_data + cursor));
     cursor += sizeof(uint32_t);
     stub.offset =
-        static_cast<size_t>(read_u64_le(gguf_bytes.data() + cursor));
+        static_cast<size_t>(read_u64_le(gguf_data + cursor));
     cursor += sizeof(uint64_t);
     tensors.push_back(std::move(stub));
   }
@@ -541,18 +611,22 @@ GgufView parse_gguf(const std::vector<uint8_t>& gguf_bytes) {
   for (size_t i = 0; i < tensors.size(); ++i) {
     const size_t next_offset = (i + 1 < tensors.size())
         ? tensors[i + 1].offset
-        : (gguf_bytes.size() - data_start);
+        : (gguf_size - data_start);
     const size_t num_bytes = next_offset - tensors[i].offset;
     out.tensors.emplace(
         tensors[i].name,
         GgufTensorInfo{
             tensors[i].shape,
             tensors[i].tensor_type,
-            gguf_bytes.data() + data_start + tensors[i].offset,
+            gguf_data + data_start + tensors[i].offset,
             num_bytes});
   }
 
   return out;
+}
+
+GgufView parse_gguf(const std::vector<uint8_t>& gguf_bytes) {
+  return parse_gguf(gguf_bytes.data(), gguf_bytes.size());
 }
 
 const GgufTensorInfo& require_gguf_tensor(
@@ -1007,7 +1081,8 @@ GgufTensorType gptq2_tensor_type_for_group_size(size_t group_size) {
 
 DirectGptq2TensorView parse_direct_gptq2_tensor(
     const GgufTensorInfo& tensor,
-    size_t source_group_size) {
+    size_t source_group_size,
+    bool gs32_source_layout) {
   DirectGptq2TensorView out;
   if (source_group_size == 0 || source_group_size % 32 != 0 ||
       tensor.tensor_type != gptq2_tensor_type_for_group_size(source_group_size) ||
@@ -1042,6 +1117,7 @@ DirectGptq2TensorView parse_direct_gptq2_tensor(
   }
 
   out.data = tensor.data;
+  out.gs32_source_layout = gs32_source_layout;
   return out;
 }
 
@@ -1374,6 +1450,14 @@ void write_int4_block_from_gptq2_direct(
   }
   const size_t source_offset =
       gptq2_source_block_offset(tensor, static_cast<size_t>(block_id));
+  if (tensor.gs32_source_layout) {
+    write_int4_block_from_gptq2_gs32_source(
+        tensor.data + source_offset,
+        tensor.cols,
+        tensor.cols / 32,
+        dst);
+    return;
+  }
   write_int4_block_from_gptq2_block(
       tensor.data + source_offset,
       tensor.cols,
@@ -1943,7 +2027,9 @@ PteRebuildResult rebuild_pte_from_gguf_index(
     if (!have_current_tensor || current_tensor_name != tensor_name) {
       current_tensor =
           parse_direct_gptq2_tensor(
-              require_gguf_tensor(gguf, tensor_name), 32);
+              require_gguf_tensor(gguf, tensor_name),
+              32,
+              gguf.gptq2_32_gs32_source);
       current_tensor_name = tensor_name;
       have_current_tensor = true;
     }
@@ -1985,7 +2071,7 @@ struct PteQatShardRecipe::Impl {
 };
 
 struct PteGgufRebuildContext::Impl {
-  std::shared_ptr<const std::vector<uint8_t>> gguf_bytes;
+  std::shared_ptr<ReadOnlyMappedFile> gguf_bytes;
   GgufView gguf;
 };
 
@@ -2131,7 +2217,7 @@ size_t pte_rebuild_output_size(const PteQatShardRecipe& recipe) {
 }
 
 std::shared_ptr<PteGgufRebuildContext> create_pte_gguf_rebuild_context(
-    const std::shared_ptr<std::vector<uint8_t>>& gguf_bytes) {
+    const std::shared_ptr<ReadOnlyMappedFile>& gguf_bytes) {
   if (!gguf_bytes || gguf_bytes->empty()) {
     throw std::runtime_error("GGUF rebuild source bytes are empty");
   }
@@ -2139,9 +2225,16 @@ std::shared_ptr<PteGgufRebuildContext> create_pte_gguf_rebuild_context(
   auto context = std::make_shared<PteGgufRebuildContext>();
   auto impl = std::make_shared<PteGgufRebuildContext::Impl>();
   impl->gguf_bytes = gguf_bytes;
-  impl->gguf = parse_gguf(*impl->gguf_bytes);
+  impl->gguf = parse_gguf(impl->gguf_bytes->data(), impl->gguf_bytes->size());
   context->impl_ = std::move(impl);
   return context;
+}
+
+void discard_pte_gguf_rebuild_source_pages(
+    const std::shared_ptr<PteGgufRebuildContext>& context) {
+  if (context && context->impl_ && context->impl_->gguf_bytes) {
+    context->impl_->gguf_bytes->discard_resident_pages();
+  }
 }
 
 std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
@@ -2165,6 +2258,11 @@ std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
   impl->source_group_size = static_cast<size_t>(source_group_size);
   impl->parsed_index = parse_binary_index(*index_bytes);
   impl->selected_records = select_records_for_split(impl->parsed_index, -1);
+  if (impl->gguf_context->gguf.gptq2_32_gs32_source &&
+      relayout_kind != PteGgufRecipeRelayoutKind::None) {
+    throw std::runtime_error(
+        "Offline GS32 source GGUF must not use runtime relayout");
+  }
   impl->record_tensors.reserve(impl->selected_records.size());
   std::unordered_map<std::string, DirectGptq2TensorView> tensor_cache;
   for (const auto* rec : impl->selected_records) {
@@ -2179,7 +2277,8 @@ std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
           tensor_name,
           parse_direct_gptq2_tensor(
               require_gguf_tensor(impl->gguf_context->gguf, tensor_name),
-              impl->source_group_size)).first;
+              impl->source_group_size,
+              impl->gguf_context->gguf.gptq2_32_gs32_source)).first;
     }
     impl->record_tensors.push_back(tensor_it->second);
   }

@@ -56,6 +56,7 @@ class DecoderRunner {
     };
     SourceKind source_kind{SourceKind::None};
     std::shared_ptr<std::vector<uint8_t>> source_bytes;
+    std::shared_ptr<ReadOnlyMappedFile> mapped_source_bytes;
     int bits_hint{2};
     int group_size{32};
     std::string qweight_mode{"qweight_minus_qzeros"};

@@ -16,6 +16,27 @@
 
 namespace example {
 
+class ReadOnlyMappedFile {
+ public:
+  static std::shared_ptr<ReadOnlyMappedFile> open(const std::string& path);
+  ~ReadOnlyMappedFile();
+
+  ReadOnlyMappedFile(const ReadOnlyMappedFile&) = delete;
+  ReadOnlyMappedFile& operator=(const ReadOnlyMappedFile&) = delete;
+
+  const uint8_t* data() const;
+  size_t size() const;
+  bool empty() const;
+  void discard_resident_pages() const;
+
+ private:
+  ReadOnlyMappedFile(int fd, const uint8_t* data, size_t size);
+
+  int fd_{-1};
+  const uint8_t* data_{nullptr};
+  size_t size_{0};
+};
+
 class PteRebuildBuffer {
  public:
   explicit PteRebuildBuffer(size_t capacity);
@@ -111,7 +132,10 @@ PteRebuildResult rebuild_pte_from_stripped_checkpoint_recipe(
 size_t pte_rebuild_output_size(const PteQatShardRecipe& recipe);
 
 std::shared_ptr<PteGgufRebuildContext> create_pte_gguf_rebuild_context(
-    const std::shared_ptr<std::vector<uint8_t>>& gguf_bytes);
+    const std::shared_ptr<ReadOnlyMappedFile>& gguf_bytes);
+
+void discard_pte_gguf_rebuild_source_pages(
+    const std::shared_ptr<PteGgufRebuildContext>& context);
 
 std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
     const std::shared_ptr<PteGgufRebuildContext>& context,

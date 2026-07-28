@@ -608,12 +608,12 @@ void DecoderRunner::preload_prefill_shard(PrefillShardPlan& shard) {
     if (prefill_gguf_rebuild_context_ == nullptr) {
       const auto context_start = SteadyClock::now();
       prefill_gguf_rebuild_context_ = create_pte_gguf_rebuild_context(
-          prefill_shard_rebuild_.source_bytes);
+          prefill_shard_rebuild_.mapped_source_bytes);
       shard.runtime_stats.gguf_checkpoint_context_ms += elapsed_ms(context_start);
       ET_LOG(
           Info,
           "prepared shared GGUF rebuild context: gguf_bytes=%zu context_ms=%f",
-          prefill_shard_rebuild_.source_bytes->size(),
+          prefill_shard_rebuild_.mapped_source_bytes->size(),
           shard.runtime_stats.gguf_checkpoint_context_ms);
     }
 
@@ -689,8 +689,12 @@ PteRebuildResult DecoderRunner::rebuild_prefill_shard(
           PrefillShardRebuildConfig::SourceKind::None,
       "Prefill shard index was provided but no rebuild source is configured");
   ET_CHECK_MSG(
-      prefill_shard_rebuild_.source_bytes &&
-          !prefill_shard_rebuild_.source_bytes->empty(),
+      (prefill_shard_rebuild_.source_kind ==
+               PrefillShardRebuildConfig::SourceKind::Gguf
+           ? prefill_shard_rebuild_.mapped_source_bytes &&
+                 !prefill_shard_rebuild_.mapped_source_bytes->empty()
+           : prefill_shard_rebuild_.source_bytes &&
+                 !prefill_shard_rebuild_.source_bytes->empty()),
       "Prefill shard rebuild source bytes are empty");
   ET_CHECK_MSG(
       shard.stripped_pte_bytes && shard.index_bytes,
@@ -718,11 +722,15 @@ PteRebuildResult DecoderRunner::rebuild_prefill_shard(
           shard.gguf_rebuild_recipe != nullptr,
           "GGUF rebuild recipe was not prepared: %s",
           shard.pte_path.c_str());
-      return rebuild_pte_from_stripped_gguf_recipe(
+      {
+        auto result = rebuild_pte_from_stripped_gguf_recipe(
           *shard.stripped_pte_bytes,
           *shard.gguf_rebuild_recipe,
           acquire_prefill_rebuild_buffer(
               pte_rebuild_output_size(*shard.gguf_rebuild_recipe)));
+        discard_pte_gguf_rebuild_source_pages(prefill_gguf_rebuild_context_);
+        return result;
+      }
     case PrefillShardRebuildConfig::SourceKind::None:
       ET_CHECK_MSG(false, "Invalid prefill shard rebuild source");
   }

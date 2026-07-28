@@ -270,7 +270,7 @@ std::string get_formatted_prompt(
         formatted_prompt.append(system_prompt);
         formatted_prompt.append("<|im_end|>\n");
       }
-      formatted_prompt.append("<|im_start|>assistant");
+      formatted_prompt.append("<|im_start|>assistant\n");
       break;
     case example::DecoderModelVersion::kSmollm2_135m:
       if (!system_prompt.empty()) {
@@ -343,7 +343,7 @@ void run_pd_export(
       ? prompt_input
       : get_formatted_prompt(prompt_input, FLAGS_system_prompt, decoder_version);
   ET_CHECK_MSG(
-      runner.export_prefill_handoff(
+      runner.export_prefill_handoff_files(
           formatted_prompt,
           tokenized_prompt,
           FLAGS_seq_len,

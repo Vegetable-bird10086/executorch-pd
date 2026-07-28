@@ -404,7 +404,7 @@ std::string get_formatted_prompt(
         formatted_prompt.append(system_prompt);
         formatted_prompt.append("<|im_end|>\n");
       }
-      formatted_prompt.append("<|im_start|>assistant");
+      formatted_prompt.append("<|im_start|>assistant\n");
       break;
     case example::DecoderModelVersion::kSmollm2_135m:
       if (!system_prompt.empty()) {

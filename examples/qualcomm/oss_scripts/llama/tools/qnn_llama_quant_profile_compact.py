@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+from qnn_llama_quant_profile_bin import convert_profile
+
 
 FIXED_POINT_DATA_TYPES = {
     "QNN_DATATYPE_UFIXED_POINT_8",
@@ -324,7 +326,17 @@ def main():
         description="Strip a full QNN shard manifest to the exact runtime U16 ABI."
     )
     parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--gguf", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--bin-out",
+        type=Path,
+        help="mmap runtime profile (default: JSON output with .bin suffix)",
+    )
+    parser.add_argument(
+        "--bin-converter",
+        help="qnn-u16-profile-convert executable",
+    )
     args = parser.parse_args()
 
     with args.manifest.open("r", encoding="utf-8") as source:
@@ -335,12 +347,15 @@ def main():
     with args.out.open("w", encoding="utf-8") as destination:
         json.dump(compact, destination, separators=(",", ":"), sort_keys=True)
         destination.write("\n")
+    binary_out = args.bin_out or args.out.with_suffix(".bin")
+    convert_profile(args.out, args.gguf, binary_out, args.bin_converter)
 
     print(
         "QNN runtime U16 profile: "
         f"verified={json.dumps(statistics, sort_keys=True)} "
         f"shards={len(compact['graphs']['prefill_forward']['llama_qnn_quant_profile']['shards'])} "
-        f"bytes={args.out.stat().st_size} out={args.out}"
+        f"json_bytes={args.out.stat().st_size} json_out={args.out} "
+        f"bin_bytes={binary_out.stat().st_size} bin_out={binary_out}"
     )
 
 

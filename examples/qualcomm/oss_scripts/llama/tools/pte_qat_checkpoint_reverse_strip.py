@@ -110,12 +110,18 @@ class QATWeightSpec:
 
 
 def expected_reverse_names(
-    include_output: bool = True, layer_start: int = 0, layer_end_exclusive: int = DEFAULT_NUM_LAYERS
+    include_output: bool = True,
+    layer_start: int = 0,
+    layer_end_exclusive: int = DEFAULT_NUM_LAYERS,
+    final_layer_kv_only: bool = False,
 ) -> List[str]:
     names: List[str] = ["output.conv"] if include_output else []
     for layer_id in range(layer_end_exclusive - 1, layer_start - 1, -1):
         prefix = f"layers.{layer_id}"
-        for op in REVERSE_LAYER_OPS:
+        layer_ops = REVERSE_LAYER_OPS
+        if final_layer_kv_only and layer_id == layer_end_exclusive - 1:
+            layer_ops = ["attention.wv_conv", "attention.wk_conv"]
+        for op in layer_ops:
             names.append(f"{prefix}.{op}")
     return names
 
@@ -515,11 +521,13 @@ def realtime_delete(
     layer_end_exclusive: int = DEFAULT_NUM_LAYERS,
     split_layer_starts: Optional[List[int]] = None,
     shard_index: Optional[int] = None,
+    final_layer_kv_only: bool = False,
 ) -> Tuple[bytearray, Dict[str, Any], List[str], bytes]:
     order = expected_reverse_names(
         include_output=include_output,
         layer_start=layer_start,
         layer_end_exclusive=layer_end_exclusive,
+        final_layer_kv_only=final_layer_kv_only,
     )
     source_bytes = old_pte.read_bytes()
     old_size = len(source_bytes)
@@ -1262,10 +1270,18 @@ def main() -> None:
             f"invalid layer range: [{layer_start}, {layer_end_exclusive}) for num_layers={num_layers}"
         )
 
-    include_output = not args.keep_output and not args.no_output
+    prefill_has_no_output = args.no_output or (
+        manifest_shard is not None
+        and not manifest_shard["prefill_outputs_logits"]
+    )
+    include_output = not args.keep_output and not prefill_has_no_output
     if manifest_shard is not None and not manifest_shard["prefill_outputs_logits"]:
         include_output = False
         print("manifest declares prefill_outputs_logits=false; skipping output.conv strip")
+    final_layer_kv_only = (
+        prefill_has_no_output
+        and layer_end_exclusive == num_layers
+    )
 
     qat_sd = load_file(str(qat_checkpoint))
     specs_by_name = build_qat_specs(
@@ -1296,6 +1312,7 @@ def main() -> None:
         shard_index=(
             manifest_shard["shard_index"] if manifest_shard is not None else None
         ),
+        final_layer_kv_only=final_layer_kv_only,
     )
     qnn_compile_spec_bytes = extract_qnn_compile_spec_from_complete_pte(
         complete_pte_bytes
