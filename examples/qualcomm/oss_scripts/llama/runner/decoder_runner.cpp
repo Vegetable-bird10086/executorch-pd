@@ -28,6 +28,7 @@
 #include <numeric>
 #include <limits>
 #include <sstream>
+#include <utility>
 using executorch::aten::Tensor;
 using executorch::extension::Module;
 using executorch::extension::llm::Sampler;
@@ -1596,6 +1597,59 @@ bool DecoderRunner::uses_prefill_shard_stage_major() const {
       prefill_qwen3_static_plan_ && !prefill_shards_.empty();
 }
 
+void DecoderRunner::prepare_final_prefill_shard_overlap() {
+  ET_CHECK_MSG(
+      uses_prefill_shard_stage_major() && !prefill_shards_.empty(),
+      "Final-shard overlap preparation requires stage-major prefill");
+
+  // end_prefill_shard_stage() waits for the following shard to finish loading,
+  // so at this point the final PTE no longer depends on the GGUF rebuild source.
+  const auto release_start = SteadyClock::now();
+  const auto memory_before = process_memory_snapshot();
+  std::vector<std::shared_ptr<PteRebuildBuffer>> idle_rebuild_buffers;
+  {
+    std::lock_guard<std::mutex> lock(prefill_rebuild_buffer_pool_mutex_);
+    idle_rebuild_buffers.swap(prefill_rebuild_buffer_pool_);
+  }
+  const size_t released_rebuild_capacity = std::accumulate(
+      idle_rebuild_buffers.begin(),
+      idle_rebuild_buffers.end(),
+      size_t{0},
+      [](size_t total, const std::shared_ptr<PteRebuildBuffer>& buffer) {
+        return total + (buffer ? buffer->capacity() : 0);
+      });
+  idle_rebuild_buffers.clear();
+
+  prefill_gguf_rebuild_context_.reset();
+  prefill_shard_rebuild_.mapped_source_bytes.reset();
+  prefill_shard_rebuild_.source_bytes.reset();
+  for (auto& shard : prefill_shards_) {
+    shard.stripped_pte_bytes.reset();
+    shard.index_bytes.reset();
+    shard.gguf_rebuild_recipe.reset();
+  }
+  const auto memory_after = process_memory_snapshot();
+
+  ET_LOG(
+      Info,
+      "final prefill shard overlap ready: released_idle_rebuild_capacity=%zu "
+      "release_ms=%.3f rss_before_mib=%.2f rss_after_mib=%.2f",
+      released_rebuild_capacity,
+      elapsed_ms(release_start),
+      memory_before.rss_bytes / (1024.0 * 1024.0),
+      memory_after.rss_bytes / (1024.0 * 1024.0));
+  if (prefill_shard_rebuild_.final_shard_overlap_callback) {
+    auto callback = std::exchange(
+        prefill_shard_rebuild_.final_shard_overlap_callback, {});
+    callback();
+  }
+}
+
+void DecoderRunner::set_prefill_shard_release_callback(
+    std::function<void(size_t, size_t, size_t)> callback) {
+  prefill_shard_release_callback_ = std::move(callback);
+}
+
 size_t DecoderRunner::prefill_shard_count() const {
   return prefill_shards_.size();
 }
@@ -2011,6 +2065,10 @@ Error DecoderRunner::end_prefill_shard_stage(size_t shard_index) {
   const auto release_start = SteadyClock::now();
   release_prefill_shard(shard);
   shard.runtime_stats.release_ms += elapsed_ms(release_start);
+  if (prefill_shard_release_callback_) {
+    prefill_shard_release_callback_(
+        shard_index, shard.layer_offset, shard.layer_count);
+  }
   const auto memory_after_release = process_memory_snapshot();
   record_memory_peak(
       &shard.runtime_stats.rss_after_release_bytes,
@@ -2018,6 +2076,21 @@ Error DecoderRunner::end_prefill_shard_stage(size_t shard_index) {
   record_memory_peak(
       &shard.runtime_stats.hwm_after_release_bytes,
       memory_after_release.hwm_bytes);
+  constexpr size_t decode_prepare_overlap_shards = 5;
+  if (prefill_shard_rebuild_.final_shard_overlap_callback &&
+      shard_index + 1 + decode_prepare_overlap_shards >=
+          prefill_shards_.size()) {
+    ET_LOG(
+        Info,
+        "starting Decode runtime preparation after shard %zu release; "
+        "remaining_prefill_shards=%zu rss_mib=%.2f",
+        shard_index,
+        prefill_shards_.size() - shard_index - 1,
+        memory_after_release.rss_bytes / (1024.0 * 1024.0));
+    auto callback = std::exchange(
+        prefill_shard_rebuild_.final_shard_overlap_callback, {});
+    callback();
+  }
   shard.runtime_stats.total_ms += elapsed_ms(prefill_shard_stage_starts_[shard_index]);
   ET_LOG(
       Info,

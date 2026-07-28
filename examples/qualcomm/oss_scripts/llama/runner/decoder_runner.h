@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -65,6 +66,9 @@ class DecoderRunner {
     bool pipeline_rebuild{false};
     bool pipeline_qnn_load{false};
     bool stage_major_execution{false};
+    // Called once, after all rebuild inputs and idle rebuild buffers have been
+    // released, immediately before the final shard starts executing.
+    std::function<void()> final_shard_overlap_callback;
     bool prewarm_qnn_backend{false};
     // Raw qnn_compile_spec copied from a complete, unstripped PTE. Stripped
     // PTEs are not valid FlatBuffers and must never be parsed for this.
@@ -149,6 +153,9 @@ class DecoderRunner {
   size_t prefill_shard_layer_offset(size_t shard_index) const;
   size_t prefill_shard_layer_count(size_t shard_index) const;
   executorch::runtime::Error begin_prefill_shard_stage(size_t shard_index);
+  void prepare_final_prefill_shard_overlap();
+  void set_prefill_shard_release_callback(
+      std::function<void(size_t, size_t, size_t)> callback);
   executorch::runtime::Result<PrefillShardStageState> step_prefill_shard_stage(
       size_t shard_index,
       std::vector<executorch::runtime::EValue>& inputs,
@@ -355,6 +362,8 @@ class DecoderRunner {
   std::vector<std::string> prefill_shard_paths_;
   std::vector<std::string> prefill_shard_index_paths_;
   PrefillShardRebuildConfig prefill_shard_rebuild_;
+  std::function<void(size_t, size_t, size_t)>
+      prefill_shard_release_callback_;
   std::shared_ptr<PteQatRebuildContext> prefill_qat_rebuild_context_;
   std::shared_ptr<PteGgufRebuildContext> prefill_gguf_rebuild_context_;
   double prefill_qnn_backend_prewarm_ms_{0.0};

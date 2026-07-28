@@ -555,6 +555,9 @@ Result<uint64_t> PromptProcessor<T>::prefill(
         num_iters);
 
     for (size_t shard_index = 0; shard_index < shard_count; ++shard_index) {
+      if (shard_index + 1 == shard_count) {
+        decoder_runner_->prepare_final_prefill_shard_overlap();
+      }
       ET_CHECK_OK_OR_RETURN_ERROR(
           decoder_runner_->begin_prefill_shard_stage(shard_index));
       const int32_t layer_begin = static_cast<int32_t>(

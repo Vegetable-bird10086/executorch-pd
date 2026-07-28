@@ -52,7 +52,10 @@ std::shared_ptr<ReadOnlyMappedFile> ReadOnlyMappedFile::open(
     throw std::runtime_error("Failed to stat read-only source: " + path);
   }
   const size_t size = static_cast<size_t>(metadata.st_size);
-  void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  // Decode and Prefill intentionally map the same immutable GGUF inode.
+  // MAP_SHARED makes the single page-cache backing explicit and prevents a
+  // model-sized anonymous/COW copy from appearing in either process.
+  void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
   if (mapping == MAP_FAILED) {
     ::close(fd);
     throw std::runtime_error("Failed to mmap read-only source: " + path);

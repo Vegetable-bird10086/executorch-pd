@@ -19,11 +19,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -32,8 +35,13 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <type_traits>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 using executorch::extension::llm::time_in_ms;
 using executorch::runtime::Error;
@@ -719,7 +727,73 @@ std::vector<uint16_t> build_canonical_kv(
   return canonical;
 }
 
-void build_qnn_u8_kv_handoff(
+void transpose_qnn_u8_k_head(
+    const uint8_t* source,
+    uint8_t* destination,
+    int64_t head_dim,
+    int32_t token_count,
+    int32_t source_token_stride) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+  if (head_dim % 8 == 0) {
+    int32_t token = 0;
+    for (; token + 8 <= token_count; token += 8) {
+      for (int64_t dim = 0; dim < head_dim; dim += 8) {
+        const uint8x8_t r0 =
+            vld1_u8(source + (dim + 0) * source_token_stride + token);
+        const uint8x8_t r1 =
+            vld1_u8(source + (dim + 1) * source_token_stride + token);
+        const uint8x8_t r2 =
+            vld1_u8(source + (dim + 2) * source_token_stride + token);
+        const uint8x8_t r3 =
+            vld1_u8(source + (dim + 3) * source_token_stride + token);
+        const uint8x8_t r4 =
+            vld1_u8(source + (dim + 4) * source_token_stride + token);
+        const uint8x8_t r5 =
+            vld1_u8(source + (dim + 5) * source_token_stride + token);
+        const uint8x8_t r6 =
+            vld1_u8(source + (dim + 6) * source_token_stride + token);
+        const uint8x8_t r7 =
+            vld1_u8(source + (dim + 7) * source_token_stride + token);
+        const uint8x8x2_t z20 = vzip_u8(r0, r4);
+        const uint8x8x2_t z21 = vzip_u8(r1, r5);
+        const uint8x8x2_t z22 = vzip_u8(r2, r6);
+        const uint8x8x2_t z23 = vzip_u8(r3, r7);
+        const uint8x8x2_t z10 = vzip_u8(z20.val[0], z22.val[0]);
+        const uint8x8x2_t z11 = vzip_u8(z20.val[1], z22.val[1]);
+        const uint8x8x2_t z12 = vzip_u8(z21.val[0], z23.val[0]);
+        const uint8x8x2_t z13 = vzip_u8(z21.val[1], z23.val[1]);
+        const uint8x8x2_t z00 = vzip_u8(z10.val[0], z12.val[0]);
+        const uint8x8x2_t z01 = vzip_u8(z10.val[1], z12.val[1]);
+        const uint8x8x2_t z02 = vzip_u8(z11.val[0], z13.val[0]);
+        const uint8x8x2_t z03 = vzip_u8(z11.val[1], z13.val[1]);
+        vst1_u8(destination + (token + 0) * head_dim + dim, z00.val[0]);
+        vst1_u8(destination + (token + 1) * head_dim + dim, z00.val[1]);
+        vst1_u8(destination + (token + 2) * head_dim + dim, z01.val[0]);
+        vst1_u8(destination + (token + 3) * head_dim + dim, z01.val[1]);
+        vst1_u8(destination + (token + 4) * head_dim + dim, z02.val[0]);
+        vst1_u8(destination + (token + 5) * head_dim + dim, z02.val[1]);
+        vst1_u8(destination + (token + 6) * head_dim + dim, z03.val[0]);
+        vst1_u8(destination + (token + 7) * head_dim + dim, z03.val[1]);
+      }
+    }
+    for (; token < token_count; ++token) {
+      for (int64_t dim = 0; dim < head_dim; ++dim) {
+        destination[static_cast<size_t>(token) * head_dim + dim] =
+            source[static_cast<size_t>(dim) * source_token_stride + token];
+      }
+    }
+    return;
+  }
+#endif
+  for (int32_t token = 0; token < token_count; ++token) {
+    for (int64_t dim = 0; dim < head_dim; ++dim) {
+      destination[static_cast<size_t>(token) * head_dim + dim] =
+          source[static_cast<size_t>(dim) * source_token_stride + token];
+    }
+  }
+}
+
+void copy_qnn_u8_kv_handoff_layers(
     KVManager<uint8_t>* kv_manager,
     int64_t num_layers,
     int64_t num_heads,
@@ -727,7 +801,9 @@ void build_qnn_u8_kv_handoff(
     int32_t prompt_len,
     int32_t max_cache_len,
     uint8_t* direct,
-    size_t direct_size) {
+    size_t direct_size,
+    int64_t layer_begin,
+    int64_t layer_end) {
   ET_CHECK_MSG(kv_manager != nullptr, "QNN U8 KV manager cannot be null");
   const auto& k_cache = kv_manager->get_k_cache_();
   const auto& v_cache = kv_manager->get_v_cache_();
@@ -737,27 +813,71 @@ void build_qnn_u8_kv_handoff(
   ET_CHECK_MSG(
       direct != nullptr && direct_size == per_kind_count * 2,
       "QNN U8 KV handoff buffer has an unexpected size");
+  ET_CHECK_MSG(
+      layer_begin >= 0 && layer_begin <= layer_end &&
+          layer_end <= num_layers,
+      "QNN U8 KV handoff layer range is invalid");
   uint8_t* direct_k = direct;
   uint8_t* direct_v = direct + per_kind_count;
 
-  for (int64_t layer = 0; layer < num_layers; ++layer) {
+  for (int64_t layer = layer_begin; layer < layer_end; ++layer) {
     const auto& layer_k = k_cache.at(static_cast<size_t>(layer));
     const auto& layer_v = v_cache.at(static_cast<size_t>(layer));
+    uint8_t* layer_k_out =
+        direct_k + static_cast<size_t>(layer) * per_layer_count;
+    uint8_t* layer_v_out =
+        direct_v + static_cast<size_t>(layer) * per_layer_count;
     for (int64_t head = 0; head < num_heads; ++head) {
-      for (int32_t seq = 0; seq < prompt_len; ++seq) {
-        const size_t dst_base =
-            ((static_cast<size_t>(layer) * num_heads + head) * prompt_len + seq) *
-            head_dim;
-        const size_t v_src_base =
-            (static_cast<size_t>(head) * max_cache_len + seq) * head_dim;
-        for (int64_t dim = 0; dim < head_dim; ++dim) {
-          const size_t k_src =
-              (static_cast<size_t>(head) * head_dim + dim) * max_cache_len + seq;
-          direct_k[dst_base + dim] = layer_k.buffer[k_src];
-          direct_v[dst_base + dim] = layer_v.buffer[v_src_base + dim];
-        }
-      }
+      // Prefill K is [head, dim, token], while Decode stores
+      // [head, max_token, dim] for contiguous autoregressive insertion.
+      transpose_qnn_u8_k_head(
+          layer_k.buffer +
+              static_cast<size_t>(head) * head_dim * max_cache_len,
+          layer_k_out +
+              static_cast<size_t>(head) * prompt_len * head_dim,
+          head_dim,
+          prompt_len,
+          max_cache_len);
+
+      // Decode consumes V as [head, token, dim], identical to Prefill.
+      std::memcpy(
+          layer_v_out +
+              static_cast<size_t>(head) * prompt_len * head_dim,
+          layer_v.buffer +
+              static_cast<size_t>(head) * max_cache_len * head_dim,
+          static_cast<size_t>(prompt_len) * head_dim);
     }
+  }
+}
+
+void build_qnn_u8_kv_handoff(
+    KVManager<uint8_t>* kv_manager,
+    int64_t num_layers,
+    int64_t num_heads,
+    int64_t head_dim,
+    int32_t prompt_len,
+    int32_t max_cache_len,
+    uint8_t* direct,
+    size_t direct_size) {
+
+  constexpr int64_t worker_count = 4;
+  const int64_t layers_per_worker =
+      (num_layers + worker_count - 1) / worker_count;
+  std::array<std::thread, worker_count - 1> workers;
+  for (int64_t worker = 1; worker < worker_count; ++worker) {
+    const int64_t begin = std::min(num_layers, worker * layers_per_worker);
+    const int64_t end = std::min(num_layers, begin + layers_per_worker);
+    workers[static_cast<size_t>(worker - 1)] = std::thread(
+        copy_qnn_u8_kv_handoff_layers,
+        kv_manager, num_layers, num_heads, head_dim, prompt_len,
+        max_cache_len, direct, direct_size, begin, end);
+  }
+  copy_qnn_u8_kv_handoff_layers(
+      kv_manager, num_layers, num_heads, head_dim, prompt_len,
+      max_cache_len, direct, direct_size,
+      0, std::min(num_layers, layers_per_worker));
+  for (auto& worker : workers) {
+    worker.join();
   }
 }
 
@@ -1329,20 +1449,160 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
       cur_pos_ + num_cached_tokens < seq_len,
       "sequence length exceeded - please increase seq_len");
 
+  int incremental_handoff_fd = -1;
+  void* incremental_handoff_mapping = MAP_FAILED;
+  size_t incremental_handoff_total_bytes = 0;
+  size_t incremental_handoff_prompt_bytes = 0;
+  size_t incremental_handoff_kv_bytes = 0;
+  double incremental_kv_pack_ms = 0.0;
+  std::vector<bool> incremental_layers_copied(
+      static_cast<size_t>(num_layers_), false);
+  std::mutex incremental_pack_mutex;
+  std::condition_variable incremental_pack_cv;
+  std::deque<std::array<size_t, 3>> incremental_pack_jobs;
+  bool incremental_pack_stop = false;
+  std::thread incremental_pack_worker;
+  if (memory_handoff != nullptr) {
+    if constexpr (std::is_same_v<T, uint8_t>) {
+      incremental_handoff_prompt_bytes =
+          cached_prompt_tokens.size() * sizeof(uint64_t);
+      incremental_handoff_kv_bytes =
+          static_cast<size_t>(num_layers_) * num_heads_ * num_cached_tokens *
+          head_dim_ * 2;
+      incremental_handoff_total_bytes =
+          incremental_handoff_prompt_bytes + incremental_handoff_kv_bytes;
+      incremental_handoff_fd = static_cast<int>(
+          syscall(SYS_memfd_create, "pd-kv-handoff", 0));
+      ET_CHECK_MSG(
+          incremental_handoff_fd >= 0,
+          "memfd_create failed: %s",
+          std::strerror(errno));
+      ET_CHECK_MSG(
+          ftruncate(
+              incremental_handoff_fd,
+              static_cast<off_t>(incremental_handoff_total_bytes)) == 0,
+          "ftruncate for PD memory handoff failed: %s",
+          std::strerror(errno));
+      incremental_handoff_mapping = mmap(
+          nullptr,
+          incremental_handoff_total_bytes,
+          PROT_READ | PROT_WRITE,
+          MAP_SHARED,
+          incremental_handoff_fd,
+          0);
+      ET_CHECK_MSG(
+          incremental_handoff_mapping != MAP_FAILED,
+          "mmap for PD memory handoff failed: %s",
+          std::strerror(errno));
+      std::memcpy(
+          incremental_handoff_mapping,
+          cached_prompt_tokens.data(),
+          incremental_handoff_prompt_bytes);
+      incremental_pack_worker = std::thread([&]() {
+        while (true) {
+          std::array<size_t, 3> job;
+          {
+            std::unique_lock<std::mutex> lock(incremental_pack_mutex);
+            incremental_pack_cv.wait(lock, [&]() {
+              return incremental_pack_stop || !incremental_pack_jobs.empty();
+            });
+            if (incremental_pack_jobs.empty()) {
+              if (incremental_pack_stop) {
+                break;
+              }
+              continue;
+            }
+            job = incremental_pack_jobs.front();
+            incremental_pack_jobs.pop_front();
+          }
+          const size_t shard_index = job[0];
+          const size_t layer_offset = job[1];
+          const size_t layer_end = job[2];
+          const auto pack_start = SteadyClock::now();
+          copy_qnn_u8_kv_handoff_layers(
+              kv_manager_.get(),
+              num_layers_,
+              num_heads_,
+              head_dim_,
+              num_cached_tokens,
+              prefill_cache_stride_,
+              static_cast<uint8_t*>(incremental_handoff_mapping) +
+                  incremental_handoff_prompt_bytes,
+              incremental_handoff_kv_bytes,
+              static_cast<int64_t>(layer_offset),
+              static_cast<int64_t>(layer_end));
+          for (size_t layer = layer_offset; layer < layer_end; ++layer) {
+            incremental_layers_copied[layer] = true;
+          }
+          const double pack_ms = elapsed_ms(pack_start);
+          incremental_kv_pack_ms += pack_ms;
+          ET_LOG(
+              Info,
+              "async KV handoff packed: shard=%zu layers=[%zu,%zu) ms=%.3f",
+              shard_index,
+              layer_offset,
+              layer_end,
+              pack_ms);
+        }
+      });
+      decoder_runner_->set_prefill_shard_release_callback(
+          [&](size_t shard_index, size_t layer_offset, size_t layer_count) {
+            const size_t layer_end = layer_offset + layer_count;
+            ET_CHECK_MSG(
+                layer_end <= static_cast<size_t>(num_layers_),
+                "Prefill shard %zu KV layer range [%zu,%zu) is invalid",
+                shard_index,
+                layer_offset,
+                layer_end);
+            {
+              std::lock_guard<std::mutex> lock(incremental_pack_mutex);
+              incremental_pack_jobs.push_back(
+                  {shard_index, layer_offset, layer_end});
+            }
+            incremental_pack_cv.notify_one();
+            ET_LOG(
+                Info,
+                "async KV handoff queued: shard=%zu layers=[%zu,%zu)",
+                shard_index,
+                layer_offset,
+                layer_end);
+          });
+    } else {
+      ET_CHECK_MSG(false, "PD memory handoff requires UINT8 KV");
+    }
+  }
+
   const auto prefill_start = SteadyClock::now();
   auto prefill_res = prompt_processor_->prefill(
       cached_prompt_tokens,
       cur_pos_,
       false,
       attention_sink_rope_runner_.get());
-  ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+  decoder_runner_->set_prefill_shard_release_callback({});
+  last_runtime_stats_.prefill_ms = elapsed_ms(prefill_start);
+  const auto handoff_start = SteadyClock::now();
+  if (incremental_pack_worker.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(incremental_pack_mutex);
+      incremental_pack_stop = true;
+    }
+    incremental_pack_cv.notify_one();
+    incremental_pack_worker.join();
+  }
+  if (prefill_res.error() != Error::Ok) {
+    if (incremental_handoff_mapping != MAP_FAILED) {
+      munmap(incremental_handoff_mapping, incremental_handoff_total_bytes);
+    }
+    if (incremental_handoff_fd >= 0) {
+      close(incremental_handoff_fd);
+    }
+    return prefill_res.error();
+  }
   if (!bridge_prompt_tail) {
     first_token = prefill_res.get();
   }
-  last_runtime_stats_.prefill_ms = elapsed_ms(prefill_start);
   cur_pos_ += num_cached_tokens;
 
-  const auto handoff_start = SteadyClock::now();
   const auto quant_attrs_start = SteadyClock::now();
   std::vector<KvQuantAttr> quant_attrs;
   if constexpr (std::is_same_v<T, uint8_t>) {
@@ -1386,46 +1646,32 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
   }
   if (memory_handoff != nullptr) {
     if constexpr (std::is_same_v<T, uint8_t>) {
-      const size_t prompt_bytes =
-          cached_prompt_tokens.size() * sizeof(uint64_t);
-      const size_t kv_bytes =
-          static_cast<size_t>(num_layers_) * num_heads_ * num_cached_tokens *
-          head_dim_ * 2;
-      const size_t total_bytes = prompt_bytes + kv_bytes;
-      const int fd = static_cast<int>(
-          syscall(SYS_memfd_create, "pd-kv-handoff", 0));
-      ET_CHECK_MSG(fd >= 0, "memfd_create failed: %s", std::strerror(errno));
+      const bool all_layers_copied = std::all_of(
+          incremental_layers_copied.begin(),
+          incremental_layers_copied.end(),
+          [](bool copied) { return copied; });
+      if (!all_layers_copied) {
+        build_qnn_u8_kv_handoff(
+            kv_manager_.get(),
+            num_layers_,
+            num_heads_,
+            head_dim_,
+            num_cached_tokens,
+            prefill_cache_stride_,
+            static_cast<uint8_t*>(incremental_handoff_mapping) +
+                incremental_handoff_prompt_bytes,
+            incremental_handoff_kv_bytes);
+      }
       ET_CHECK_MSG(
-          ftruncate(fd, static_cast<off_t>(total_bytes)) == 0,
-          "ftruncate for PD memory handoff failed: %s",
-          std::strerror(errno));
-      void* mapping = mmap(
-          nullptr,
-          total_bytes,
-          PROT_READ | PROT_WRITE,
-          MAP_SHARED,
-          fd,
-          0);
-      ET_CHECK_MSG(
-          mapping != MAP_FAILED,
-          "mmap for PD memory handoff failed: %s",
-          std::strerror(errno));
-      std::memcpy(mapping, cached_prompt_tokens.data(), prompt_bytes);
-      build_qnn_u8_kv_handoff(
-          kv_manager_.get(),
-          num_layers_,
-          num_heads_,
-          head_dim_,
-          num_cached_tokens,
-          prefill_cache_stride_,
-          static_cast<uint8_t*>(mapping) + prompt_bytes,
-          kv_bytes);
-      ET_CHECK_MSG(
-          munmap(mapping, total_bytes) == 0,
+          munmap(
+              incremental_handoff_mapping,
+              incremental_handoff_total_bytes) == 0,
           "munmap for PD memory handoff failed: %s",
           std::strerror(errno));
-      memory_handoff->fd = fd;
-      memory_handoff->size_bytes = total_bytes;
+      incremental_handoff_mapping = MAP_FAILED;
+      memory_handoff->fd = incremental_handoff_fd;
+      incremental_handoff_fd = -1;
+      memory_handoff->size_bytes = incremental_handoff_total_bytes;
       memory_handoff->prompt_length = num_cached_tokens;
       memory_handoff->num_layers = static_cast<int32_t>(num_layers_);
       memory_handoff->num_kv_heads = static_cast<int32_t>(num_heads_);
@@ -1437,6 +1683,14 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
     }
   }
   const double kv_layout_ms = elapsed_ms(kv_layout_start);
+  if (memory_handoff != nullptr) {
+    ET_LOG(
+        Info,
+        "incremental KV handoff complete: packed_during_prefill_ms=%.3f "
+        "boundary_finalize_ms=%.3f",
+        incremental_kv_pack_ms,
+        kv_layout_ms);
+  }
   const size_t canonical_kv_bytes = canonical_kv.size() * sizeof(uint16_t);
   const size_t qnn_u8_kv_bytes = qnn_u8_kv.size();
   const bool export_undo_r3 = should_undo_r3_on_export(
@@ -1504,7 +1758,9 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
     manifest["qnn_u8_kv_dtype"] = "uint8";
     manifest["qnn_u8_kv_layout"] = {
         {"order", "K_then_V"},
-        {"shape", "[layer,kv_head,seq,head_dim]"},
+        {"k_shape", "[layer,kv_head,seq,head_dim]"},
+        {"v_shape", "[layer,kv_head,seq,head_dim]"},
+        {"consumer", "llama_qnn_u8_decode_cache_v2"},
         {"k_cache_transform", "spinquant_r3"},
         {"endianness", "little"},
     };

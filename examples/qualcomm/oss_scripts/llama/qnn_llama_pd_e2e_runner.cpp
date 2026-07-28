@@ -7,6 +7,7 @@
 #include <gflags/gflags.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -19,8 +20,10 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -241,6 +244,7 @@ double elapsed_ms(
 struct ProcessMemorySnapshot {
   uint64_t rss_bytes{0};
   uint64_t hwm_bytes{0};
+  uint64_t pss_bytes{0};
 };
 
 uint64_t read_proc_status_bytes(const std::string& path, const char* field) {
@@ -262,14 +266,24 @@ ProcessMemorySnapshot process_memory_snapshot() {
   return {
       read_proc_status_bytes("/proc/self/status", "VmRSS:"),
       read_proc_status_bytes("/proc/self/status", "VmHWM:"),
+      read_proc_status_bytes("/proc/self/smaps_rollup", "Pss:"),
   };
 }
 
 ProcessMemorySnapshot process_memory_snapshot(pid_t pid) {
-  const std::string path = "/proc/" + std::to_string(pid) + "/status";
+  const std::string proc = "/proc/" + std::to_string(pid);
   return {
-      read_proc_status_bytes(path, "VmRSS:"),
-      read_proc_status_bytes(path, "VmHWM:"),
+      read_proc_status_bytes(proc + "/status", "VmRSS:"),
+      read_proc_status_bytes(proc + "/status", "VmHWM:"),
+      read_proc_status_bytes(proc + "/smaps_rollup", "Pss:"),
+  };
+}
+
+ProcessMemorySnapshot process_memory_status_snapshot() {
+  return {
+      read_proc_status_bytes("/proc/self/status", "VmRSS:"),
+      read_proc_status_bytes("/proc/self/status", "VmHWM:"),
+      0,
   };
 }
 
@@ -294,11 +308,13 @@ struct PdE2ERuntimeStats {
 
 struct DecodeProcessResult {
   int exit_code{1};
+  double startup_ms{0.0};
   double wall_ms{0.0};
   ProcessMemorySnapshot before;
   ProcessMemorySnapshot after;
   ProcessMemorySnapshot child_peak;
   uint64_t process_tree_peak_rss_bytes{0};
+  uint64_t process_tree_peak_pss_bytes{0};
 };
 
 void log_pd_e2e_runtime_summary(
@@ -370,12 +386,14 @@ void log_pd_e2e_runtime_summary(
   ET_LOG(
       Info,
       "PD E2E timing: runner_setup_ms=%.3f tokenize_ms=%.3f qnn_prefill_ms=%.3f "
-      "handoff_ms=%.3f qnn_export_total_ms=%.3f decode_process_ms=%.3f e2e_total_ms=%.3f",
+      "handoff_ms=%.3f qnn_export_total_ms=%.3f decode_startup_ms=%.3f "
+      "decode_process_ms=%.3f e2e_total_ms=%.3f",
       prefill.runner_setup_ms,
       prefill.prefill.tokenize_ms,
       prefill.prefill.prefill_ms,
       prefill.prefill.handoff_total_ms,
       prefill.qnn_export_total_ms,
+      decode.startup_ms,
       decode.wall_ms,
       total_ms);
   ET_LOG(
@@ -397,10 +415,11 @@ void log_pd_e2e_runtime_summary(
   ET_LOG(
       Info,
       "PD E2E decode memory MiB: child_peak_rss=%.2f child_hwm=%.2f "
-      "process_tree_peak_rss=%.2f poll_interval_ms=5",
+      "process_tree_peak_rss=%.2f process_tree_peak_pss=%.2f poll_interval_ms=5",
       bytes_to_mib(decode.child_peak.rss_bytes),
       bytes_to_mib(decode.child_peak.hwm_bytes),
-      bytes_to_mib(decode.process_tree_peak_rss_bytes));
+      bytes_to_mib(decode.process_tree_peak_rss_bytes),
+      bytes_to_mib(decode.process_tree_peak_pss_bytes));
   for (size_t i = 0; i < prefill.shard_stats.size(); ++i) {
     const auto& shard = prefill.shard_stats[i];
     ET_LOG(
@@ -1111,8 +1130,43 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   return config;
 }
 
-DecodeProcessResult run_decode_process(
-    const example::PDPrefillRunner<uint8_t>::MemoryHandoff& memory_handoff,
+constexpr uint32_t PD_RESIDENT_READY_MAGIC = 0x50445259U; // "PDRY"
+constexpr uint32_t PD_RESIDENT_PREPARE_MAGIC = 0x50445052U; // "PDPR"
+constexpr uint32_t PD_RESIDENT_REQUEST_MAGIC = 0x50444b56U; // "PDKV"
+// v5 stores both K and V as [layer, head, token, dim].
+constexpr uint32_t PD_RESIDENT_PROTOCOL_VERSION = 5;
+
+struct PdResidentReady {
+  uint32_t magic{PD_RESIDENT_READY_MAGIC};
+  uint32_t version{PD_RESIDENT_PROTOCOL_VERSION};
+};
+
+struct PdResidentPrepare {
+  uint32_t magic{PD_RESIDENT_PREPARE_MAGIC};
+  uint32_t version{PD_RESIDENT_PROTOCOL_VERSION};
+};
+
+struct PdResidentRequest {
+  uint32_t magic{PD_RESIDENT_REQUEST_MAGIC};
+  uint32_t version{PD_RESIDENT_PROTOCOL_VERSION};
+  uint64_t memory_size{0};
+  int32_t prompt_length{0};
+  int32_t num_layers{0};
+  int32_t num_kv_heads{0};
+  int32_t head_dim{0};
+  int32_t first_token{-1};
+  uint32_t first_token_is_prompt_tail{0};
+};
+
+struct ResidentDecodeProcess {
+  pid_t pid{-1};
+  int control_fd{-1};
+  bool runtime_prepare_sent{false};
+  SteadyClock::time_point start{};
+  DecodeProcessResult result{};
+};
+
+ResidentDecodeProcess start_resident_decode_process(
     const std::string& shared_embedding_matrix_path) {
   ET_CHECK_MSG(
       !FLAGS_llama_pd_cli_path.empty(),
@@ -1121,21 +1175,23 @@ DecodeProcessResult run_decode_process(
   ET_CHECK_MSG(
       !decode_gguf_path.empty(),
       "Provide --decode_gguf_path, --gguf_model_path, or --tmac_model_path for decode");
+
+  int sockets[2] = {-1, -1};
   ET_CHECK_MSG(
-      memory_handoff.fd >= 0,
-      "E2E Decode requires an in-memory UINT8 KV handoff");
+      socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets) == 0,
+      "resident Decode socketpair failed: %s",
+      std::strerror(errno));
 
   std::vector<std::string> args = {
       FLAGS_llama_pd_cli_path,
+      "--pd-control-fd",
+      std::to_string(sockets[1]),
       "-m",
       decode_gguf_path,
       "-n",
       std::to_string(FLAGS_decode_n_predict),
       "-c",
       std::to_string(FLAGS_decode_ctx),
-      // PD Decode evaluates exactly one token at a time. Keeping llama.cpp's
-      // general-purpose batch defaults would reserve graph/work buffers for
-      // thousands of tokens and needlessly consume hundreds of MiB.
       "-b",
       "1",
       "-ub",
@@ -1145,26 +1201,6 @@ DecodeProcessResult run_decode_process(
       "--temp",
       std::to_string(FLAGS_decode_temp),
   };
-  args.insert(
-      args.begin() + 1,
-      {
-          "--pd-memory-fd",
-          std::to_string(memory_handoff.fd),
-          "--pd-memory-size",
-          std::to_string(memory_handoff.size_bytes),
-          "--pd-prompt-length",
-          std::to_string(memory_handoff.prompt_length),
-          "--pd-num-layers",
-          std::to_string(memory_handoff.num_layers),
-          "--pd-num-kv-heads",
-          std::to_string(memory_handoff.num_kv_heads),
-          "--pd-head-dim",
-          std::to_string(memory_handoff.head_dim),
-          "--pd-first-token",
-          std::to_string(memory_handoff.first_token),
-          "--pd-first-token-is-prompt-tail",
-          memory_handoff.first_token_is_prompt_tail ? "1" : "0",
-      });
   if (FLAGS_decode_threads > 0) {
     args.push_back("-t");
     args.push_back(std::to_string(FLAGS_decode_threads));
@@ -1189,7 +1225,7 @@ DecodeProcessResult run_decode_process(
     args.push_back("--pd-import-ro");
   }
 
-  ET_LOG(Info, "Launching decode via llama-pd-cli");
+  ET_LOG(Info, "Starting resident Decode before Prefill");
   for (const auto& arg : args) {
     ET_LOG(Info, "  arg: %s", arg.c_str());
   }
@@ -1201,12 +1237,13 @@ DecodeProcessResult run_decode_process(
   }
   argv.push_back(nullptr);
 
-  DecodeProcessResult result;
-  result.before = process_memory_snapshot();
-  const auto decode_start = SteadyClock::now();
-  const pid_t pid = fork();
-  ET_CHECK_MSG(pid >= 0, "fork failed: %s", std::strerror(errno));
-  if (pid == 0) {
+  ResidentDecodeProcess resident;
+  resident.result.before = process_memory_snapshot();
+  resident.start = SteadyClock::now();
+  resident.pid = fork();
+  ET_CHECK_MSG(resident.pid >= 0, "fork failed: %s", std::strerror(errno));
+  if (resident.pid == 0) {
+    close(sockets[0]);
     execvp(argv[0], argv.data());
     std::fprintf(
         stderr,
@@ -1215,37 +1252,142 @@ DecodeProcessResult run_decode_process(
         std::strerror(errno));
     _exit(127);
   }
+  close(sockets[1]);
+  resident.control_fd = sockets[0];
+
+  PdResidentReady ready;
+  ssize_t received;
+  do {
+    received = recv(resident.control_fd, &ready, sizeof(ready), 0);
+  } while (received < 0 && errno == EINTR);
+  ET_CHECK_MSG(
+      received == static_cast<ssize_t>(sizeof(ready)) &&
+          ready.magic == PD_RESIDENT_READY_MAGIC &&
+          ready.version == PD_RESIDENT_PROTOCOL_VERSION,
+      "resident Decode failed before ready (recv=%zd errno=%s)",
+      received,
+      std::strerror(errno));
+  resident.result.child_peak = process_memory_snapshot(resident.pid);
+  resident.result.startup_ms = elapsed_ms(resident.start);
+  resident.result.process_tree_peak_rss_bytes =
+      resident.result.before.rss_bytes + resident.result.child_peak.rss_bytes;
+  resident.result.process_tree_peak_pss_bytes =
+      resident.result.before.pss_bytes + resident.result.child_peak.pss_bytes;
+  ET_LOG(
+      Info,
+      "Resident Decode ready before Prefill: pid=%d startup_ms=%.3f child_rss_mib=%.2f",
+      static_cast<int>(resident.pid),
+      elapsed_ms(resident.start),
+      bytes_to_mib(resident.result.child_peak.rss_bytes));
+  return resident;
+}
+
+void start_resident_decode_runtime_prepare(int control_fd) {
+  const PdResidentPrepare request;
+  ssize_t sent;
+  do {
+    sent = send(control_fd, &request, sizeof(request), MSG_NOSIGNAL);
+  } while (sent < 0 && errno == EINTR);
+  ET_CHECK_MSG(
+      sent == static_cast<ssize_t>(sizeof(request)),
+      "failed to start resident Decode runtime preparation: %s",
+      std::strerror(errno));
+  ET_LOG(
+      Info,
+      "Prefill released rebuild inputs; Decode metadata/context/KV preparation started asynchronously");
+}
+
+void send_resident_handoff(
+    int control_fd,
+    const example::PDPrefillRunner<uint8_t>::MemoryHandoff& memory_handoff) {
+  ET_CHECK_MSG(
+      memory_handoff.fd >= 0,
+      "resident Decode requires an in-memory UINT8 KV handoff");
+  PdResidentRequest request;
+  request.memory_size = memory_handoff.size_bytes;
+  request.prompt_length = memory_handoff.prompt_length;
+  request.num_layers = memory_handoff.num_layers;
+  request.num_kv_heads = memory_handoff.num_kv_heads;
+  request.head_dim = memory_handoff.head_dim;
+  request.first_token = memory_handoff.first_token;
+  request.first_token_is_prompt_tail =
+      memory_handoff.first_token_is_prompt_tail ? 1U : 0U;
+
+  iovec iov {};
+  iov.iov_base = &request;
+  iov.iov_len = sizeof(request);
+  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+  msghdr message {};
+  message.msg_iov = &iov;
+  message.msg_iovlen = 1;
+  message.msg_control = control;
+  message.msg_controllen = sizeof(control);
+  cmsghdr* cmsg = CMSG_FIRSTHDR(&message);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  std::memcpy(CMSG_DATA(cmsg), &memory_handoff.fd, sizeof(int));
+
+  ssize_t sent;
+  do {
+    sent = sendmsg(control_fd, &message, MSG_NOSIGNAL);
+  } while (sent < 0 && errno == EINTR);
+  ET_CHECK_MSG(
+      sent == static_cast<ssize_t>(sizeof(request)),
+      "failed to send resident Decode handoff: %s",
+      std::strerror(errno));
+}
+
+DecodeProcessResult finish_resident_decode_process(
+    ResidentDecodeProcess resident) {
+  const auto decode_start = SteadyClock::now();
+  ET_CHECK_MSG(
+      resident.control_fd < 0,
+      "resident Decode handoff must be sent before waiting for completion");
 
   int status = 0;
   while (true) {
-    const pid_t wait_result = waitpid(pid, &status, WNOHANG);
-    ET_CHECK_MSG(
-        wait_result >= 0,
-        "waitpid failed: %s",
-        std::strerror(errno));
-    if (wait_result == pid) {
+    const pid_t wait_result = waitpid(resident.pid, &status, WNOHANG);
+    ET_CHECK_MSG(wait_result >= 0, "waitpid failed: %s", std::strerror(errno));
+    if (wait_result == resident.pid) {
       break;
     }
-    const auto child_memory = process_memory_snapshot(pid);
+    const auto child_memory = process_memory_snapshot(resident.pid);
     const auto parent_memory = process_memory_snapshot();
-    if (child_memory.rss_bytes > result.child_peak.rss_bytes) {
-      result.child_peak.rss_bytes = child_memory.rss_bytes;
+    if (child_memory.rss_bytes > resident.result.child_peak.rss_bytes) {
+      resident.result.child_peak.rss_bytes = child_memory.rss_bytes;
     }
-    result.child_peak.hwm_bytes =
-        std::max(result.child_peak.hwm_bytes, child_memory.hwm_bytes);
-    result.process_tree_peak_rss_bytes = std::max(
-        result.process_tree_peak_rss_bytes,
+    resident.result.child_peak.hwm_bytes = std::max(
+        resident.result.child_peak.hwm_bytes, child_memory.hwm_bytes);
+    resident.result.process_tree_peak_rss_bytes = std::max(
+        resident.result.process_tree_peak_rss_bytes,
         parent_memory.rss_bytes + child_memory.rss_bytes);
+    resident.result.process_tree_peak_pss_bytes = std::max(
+        resident.result.process_tree_peak_pss_bytes,
+        parent_memory.pss_bytes + child_memory.pss_bytes);
     usleep(5000);
   }
-  result.wall_ms = elapsed_ms(decode_start);
-  result.after = process_memory_snapshot();
+  resident.result.wall_ms = elapsed_ms(decode_start);
+  resident.result.after = process_memory_snapshot();
   if (WIFEXITED(status)) {
-    result.exit_code = WEXITSTATUS(status);
+    resident.result.exit_code = WEXITSTATUS(status);
   } else if (WIFSIGNALED(status)) {
-    result.exit_code = 128 + WTERMSIG(status);
+    resident.result.exit_code = 128 + WTERMSIG(status);
   }
-  return result;
+  return resident.result;
+}
+
+void begin_resident_decode_handoff(
+    ResidentDecodeProcess& resident,
+    const example::PDPrefillRunner<uint8_t>::MemoryHandoff& memory_handoff) {
+  if (!resident.runtime_prepare_sent) {
+    start_resident_decode_runtime_prepare(resident.control_fd);
+    resident.runtime_prepare_sent = true;
+  }
+  send_resident_handoff(resident.control_fd, memory_handoff);
+  close(resident.control_fd);
+  resident.control_fd = -1;
+  ET_LOG(Info, "Prefill handed KV memfd to already-resident Decode pid=%d", resident.pid);
 }
 
 template <typename T>
@@ -1451,7 +1593,10 @@ PdE2ERuntimeStats run_pd_e2e(
   stats.shard_stats = runner.prefill_shard_runtime_stats();
   stats.qnn_backend_prewarm_ms = runner.prefill_qnn_backend_prewarm_ms();
   stats.qnn_backend_prewarmed = runner.prefill_qnn_backend_prewarmed();
-  stats.after_export = process_memory_snapshot();
+  // The handoff must be sent immediately after Prefill. Reading
+  // smaps_rollup here can stall for tens of milliseconds; the concurrent
+  // dense monitor already records PSS for the full process tree.
+  stats.after_export = process_memory_status_snapshot();
   return stats;
 }
 
@@ -1585,6 +1730,50 @@ int main(int argc, char** argv) {
       "PD E2E requires UINT8 KV");
   ET_LOG(Info, "Using in-memory PD handoff");
 
+  const std::string resident_embedding_matrix_path =
+      effective_prefill_separate_embed
+      ? (!FLAGS_prefill_embedding_matrix_path.empty()
+             ? FLAGS_prefill_embedding_matrix_path
+             : prefill_shard_files.embedding_matrix_path)
+      : std::string{};
+  ResidentDecodeProcess resident_decode;
+  if (!FLAGS_prefill_only) {
+    resident_decode =
+        start_resident_decode_process(resident_embedding_matrix_path);
+    prefill_shard_rebuild.final_shard_overlap_callback =
+        [&resident_decode]() {
+          start_resident_decode_runtime_prepare(resident_decode.control_fd);
+          resident_decode.runtime_prepare_sent = true;
+        };
+  }
+
+  std::atomic<bool> stop_memory_monitor{false};
+  std::thread memory_monitor;
+  if (!FLAGS_prefill_only) {
+    memory_monitor = std::thread([&]() {
+      while (!stop_memory_monitor.load(std::memory_order_relaxed)) {
+        const auto parent_memory = process_memory_snapshot();
+        const auto child_memory = process_memory_snapshot(resident_decode.pid);
+        resident_decode.result.child_peak.rss_bytes = std::max(
+            resident_decode.result.child_peak.rss_bytes,
+            child_memory.rss_bytes);
+        resident_decode.result.child_peak.hwm_bytes = std::max(
+            resident_decode.result.child_peak.hwm_bytes,
+            child_memory.hwm_bytes);
+        resident_decode.result.child_peak.pss_bytes = std::max(
+            resident_decode.result.child_peak.pss_bytes,
+            child_memory.pss_bytes);
+        resident_decode.result.process_tree_peak_rss_bytes = std::max(
+            resident_decode.result.process_tree_peak_rss_bytes,
+            parent_memory.rss_bytes + child_memory.rss_bytes);
+        resident_decode.result.process_tree_peak_pss_bytes = std::max(
+            resident_decode.result.process_tree_peak_pss_bytes,
+            parent_memory.pss_bytes + child_memory.pss_bytes);
+        usleep(5000);
+      }
+    });
+  }
+
   const std::string prompt_input =
       use_tokenized_prompt ? FLAGS_tokenized_prompt : prompts.front();
   PdE2ERuntimeStats prefill_runtime = run_pd_e2e<uint8_t>(
@@ -1611,10 +1800,16 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Send the ready KV immediately. Joining the dense PSS monitor can take
+  // tens of milliseconds on Android and must not sit on the PD boundary.
+  begin_resident_decode_handoff(
+      resident_decode,
+      prefill_runtime.memory_handoff);
+  stop_memory_monitor.store(true, std::memory_order_relaxed);
+  memory_monitor.join();
+
   const DecodeProcessResult decode =
-      run_decode_process(
-          prefill_runtime.memory_handoff,
-          prefill_runtime.shared_embedding_matrix_path);
+      finish_resident_decode_process(std::move(resident_decode));
   if (prefill_runtime.memory_handoff.fd >= 0) {
     close(prefill_runtime.memory_handoff.fd);
     prefill_runtime.memory_handoff.fd = -1;
