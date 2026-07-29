@@ -36,6 +36,9 @@ from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 
 from executorch.backends.qualcomm.utils.constants import (
     QCOM_DTYPE,
+    QCOM_PASS_ACTIVATE_KEY,
+    QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
+    QCOM_QNN_COMPILE_SPEC,
     QCOM_QUANT_ATTRS,
     QCOM_QUANT_MAX,
     QCOM_QUANT_MIN,
@@ -43,8 +46,6 @@ from executorch.backends.qualcomm.utils.constants import (
     QCOM_SCALES,
     QCOM_ZERO_POINT,
     QCOM_ZERO_POINTS,
-    QCOM_PASS_ACTIVATE_KEY,
-    QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
 )
 from executorch.backends.qualcomm.utils.utils import (
     convert_linear_to_conv2d,
@@ -300,6 +301,7 @@ class TextDecoder(Component):
             ),
             "graphs": {},
         }
+        qnn_compile_spec = None
         for graph_name in graph_names:
             exported_program = edge_prog_mgr.exported_program(graph_name)
             graph_code_path = os.path.join(
@@ -313,6 +315,23 @@ class TextDecoder(Component):
                 raise RuntimeError(
                     f"no lowered submodules found for sharded graph {graph_name}"
                 )
+            for _, lowered_module, _ in lowered_submodules:
+                module_compile_specs = [
+                    bytes(spec.value)
+                    for spec in lowered_module.compile_specs
+                    if spec.key == QCOM_QNN_COMPILE_SPEC
+                ]
+                if len(module_compile_specs) != 1 or not module_compile_specs[0]:
+                    raise RuntimeError(
+                        "exported QNN shard must carry exactly one non-empty "
+                        f"{QCOM_QNN_COMPILE_SPEC}: graph={graph_name}"
+                    )
+                if qnn_compile_spec is None:
+                    qnn_compile_spec = module_compile_specs[0]
+                elif module_compile_specs[0] != qnn_compile_spec:
+                    raise RuntimeError(
+                        "QNN compile spec differs between exported decoder shards"
+                    )
             graph_manifest = {
                 "pte_paths": [],
                 "delegate_names": [name for name, _, _ in lowered_submodules],
@@ -496,6 +515,15 @@ class TextDecoder(Component):
                     graph_profile["kv_cache"] = qnn_kv_profiles_by_graph[graph_name]
                 graph_manifest["llama_qnn_quant_profile"] = graph_profile
             shard_manifest["graphs"][graph_name] = graph_manifest
+
+        if qnn_compile_spec is None:
+            raise RuntimeError(
+                "no QNN compile spec found while exporting decoder shards"
+            )
+        # This is a protected runtime field: keep it in the primary export
+        # manifest so every downstream stripped/device manifest can inherit it
+        # without reopening or parsing a complete PTE.
+        shard_manifest["qnn_compile_spec_hex"] = qnn_compile_spec.hex()
 
         if profile_by_scope:
             raise RuntimeError(

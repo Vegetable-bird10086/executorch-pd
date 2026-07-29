@@ -78,3 +78,19 @@ python examples/qualcomm/oss_scripts/llama/tools/pte_qat_checkpoint_reverse_stri
 - The historical experimental copy still exists under
   `/root/autodl-tmp/executorch/llama_qnn/pte_qat_checkpoint_reverse_strip.py`,
   but the tools path above is the maintained location to use going forward.
+
+## Protected PD device manifests
+
+Sharded QNN exports include `qnn_compile_spec_hex` in the primary
+`*.shards.json`. After generating or rewriting a stripped device manifest,
+copy and verify that protected field with:
+
+```bash
+python examples/qualcomm/oss_scripts/llama/tools/protect_pd_device_manifest.py \
+  --source-manifest /path/to/hybrid_llama_qnn.shards.json \
+  --device-manifest /path/to/prefill_stripped.device.json
+```
+
+The update is atomic. Existing mismatched compile specs are rejected; older
+source manifests automatically recover the field from their `combined_pte`.
+Run this as the final manifest step before packaging or deployment.

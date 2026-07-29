@@ -729,7 +729,9 @@ PteRebuildResult DecoderRunner::rebuild_prefill_shard(
           *shard.gguf_rebuild_recipe,
           acquire_prefill_rebuild_buffer(
               pte_rebuild_output_size(*shard.gguf_rebuild_recipe)));
+#ifndef QNN_LLAMA_PD_JOINT
         discard_pte_gguf_rebuild_source_pages(prefill_gguf_rebuild_context_);
+#endif
         return result;
       }
     case PrefillShardRebuildConfig::SourceKind::None:

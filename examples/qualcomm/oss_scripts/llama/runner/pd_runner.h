@@ -22,6 +22,10 @@ template <typename T>
 class PDPrefillRunner {
  public:
   struct MemoryHandoff {
+    // Set by an in-process consumer before export. In this mode bytes owns the
+    // backing allocation and data() is passed directly to Decode.
+    bool direct_pointer{false};
+    std::shared_ptr<std::vector<uint8_t>> bytes;
     int fd{-1};
     uint64_t size_bytes{0};
     int32_t prompt_length{0};
@@ -94,6 +98,7 @@ class PDPrefillRunner {
   double prefill_qnn_backend_prewarm_ms() const;
   bool prefill_qnn_backend_prewarmed() const;
   void set_prefill_etdump_config(DecoderRunner::PrefillEtDumpConfig config);
+  void set_prefill_tokens(std::vector<uint64_t> tokens);
 
   executorch::runtime::Error export_prefill_memory_handoff(
       const std::string& prompt,
@@ -171,6 +176,7 @@ class PDPrefillRunner {
   std::unique_ptr<IMemAlloc> buffer_manager_;
   std::unique_ptr<KVManager<T>> kv_manager_;
   std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
+  std::vector<uint64_t> prefill_tokens_override_;
   std::unique_ptr<DecoderRunner> decoder_runner_;
   std::unique_ptr<AttentionSinkRopeRunner> attention_sink_rope_runner_;
   std::unique_ptr<PromptProcessor<T>> prompt_processor_;

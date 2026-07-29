@@ -993,7 +993,13 @@ template <typename T>
 bool PDPrefillRunner<T>::is_loaded() const {
   const bool module_ready =
       static_metadata_.enabled || (module_ != nullptr && module_->is_loaded());
-  return module_ready && tokenizer_ && decoder_runner_ && prompt_processor_ &&
+  const bool tokenizer_ready =
+#ifdef QNN_LLAMA_PD_JOINT
+      !prefill_tokens_override_.empty();
+#else
+      tokenizer_ != nullptr;
+#endif
+  return module_ready && tokenizer_ready && decoder_runner_ && prompt_processor_ &&
       kv_manager_ && buffer_manager_;
 }
 
@@ -1015,11 +1021,17 @@ Error PDPrefillRunner<T>::load() {
   }
 
   if (tokenizer_ == nullptr) {
+#ifdef QNN_LLAMA_PD_JOINT
+    ET_CHECK_MSG(
+        !prefill_tokens_override_.empty(),
+        "joint PD Prefill requires tokens from the shared llama.cpp tokenizer");
+#else
     tokenizer_ = llm::load_tokenizer(tokenizer_path_);
     if (tokenizer_ == nullptr) {
       ET_LOG(Error, "Failed to load tokenizer with %s", tokenizer_path_.c_str());
       return Error::Internal;
     }
+#endif
   }
 
   bool use_int64_token = false;
@@ -1360,6 +1372,15 @@ void PDPrefillRunner<T>::set_prefill_etdump_config(
 }
 
 template <typename T>
+void PDPrefillRunner<T>::set_prefill_tokens(std::vector<uint64_t> tokens) {
+  ET_CHECK_MSG(
+      decoder_runner_ == nullptr,
+      "Set joint Prefill tokens before PDPrefillRunner::load");
+  ET_CHECK_MSG(!tokens.empty(), "Joint Prefill token array cannot be empty");
+  prefill_tokens_override_ = std::move(tokens);
+}
+
+template <typename T>
 Error PDPrefillRunner<T>::export_prefill_memory_handoff(
     const std::string& prompt,
     bool tokenized_prompt,
@@ -1414,7 +1435,9 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
   int32_t n_bos = (cur_pos_ == 0) ? 1 : 0;
   const auto tokenize_start = SteadyClock::now();
   std::vector<uint64_t> prompt_tokens;
-  if (tokenized_prompt) {
+  if (!prefill_tokens_override_.empty()) {
+    prompt_tokens = prefill_tokens_override_;
+  } else if (tokenized_prompt) {
     std::ifstream in_file(prompt, std::ios::binary);
     ET_CHECK_MSG(in_file.is_open(), "Unable to read tokenized prompt: %s", prompt.c_str());
     in_file.seekg(0, std::ios::end);
@@ -1471,29 +1494,36 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
           head_dim_ * 2;
       incremental_handoff_total_bytes =
           incremental_handoff_prompt_bytes + incremental_handoff_kv_bytes;
-      incremental_handoff_fd = static_cast<int>(
-          syscall(SYS_memfd_create, "pd-kv-handoff", 0));
-      ET_CHECK_MSG(
-          incremental_handoff_fd >= 0,
-          "memfd_create failed: %s",
-          std::strerror(errno));
-      ET_CHECK_MSG(
-          ftruncate(
-              incremental_handoff_fd,
-              static_cast<off_t>(incremental_handoff_total_bytes)) == 0,
-          "ftruncate for PD memory handoff failed: %s",
-          std::strerror(errno));
-      incremental_handoff_mapping = mmap(
-          nullptr,
-          incremental_handoff_total_bytes,
-          PROT_READ | PROT_WRITE,
-          MAP_SHARED,
-          incremental_handoff_fd,
-          0);
-      ET_CHECK_MSG(
-          incremental_handoff_mapping != MAP_FAILED,
-          "mmap for PD memory handoff failed: %s",
-          std::strerror(errno));
+      if (memory_handoff->direct_pointer) {
+        memory_handoff->bytes =
+            std::make_shared<std::vector<uint8_t>>(
+                incremental_handoff_total_bytes);
+        incremental_handoff_mapping = memory_handoff->bytes->data();
+      } else {
+        incremental_handoff_fd = static_cast<int>(
+            syscall(SYS_memfd_create, "pd-kv-handoff", 0));
+        ET_CHECK_MSG(
+            incremental_handoff_fd >= 0,
+            "memfd_create failed: %s",
+            std::strerror(errno));
+        ET_CHECK_MSG(
+            ftruncate(
+                incremental_handoff_fd,
+                static_cast<off_t>(incremental_handoff_total_bytes)) == 0,
+            "ftruncate for PD memory handoff failed: %s",
+            std::strerror(errno));
+        incremental_handoff_mapping = mmap(
+            nullptr,
+            incremental_handoff_total_bytes,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            incremental_handoff_fd,
+            0);
+        ET_CHECK_MSG(
+            incremental_handoff_mapping != MAP_FAILED,
+            "mmap for PD memory handoff failed: %s",
+            std::strerror(errno));
+      }
       std::memcpy(
           incremental_handoff_mapping,
           cached_prompt_tokens.data(),
@@ -1590,7 +1620,8 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
     incremental_pack_worker.join();
   }
   if (prefill_res.error() != Error::Ok) {
-    if (incremental_handoff_mapping != MAP_FAILED) {
+    if (incremental_handoff_mapping != MAP_FAILED &&
+        (memory_handoff == nullptr || !memory_handoff->direct_pointer)) {
       munmap(incremental_handoff_mapping, incremental_handoff_total_bytes);
     }
     if (incremental_handoff_fd >= 0) {
@@ -1662,12 +1693,14 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
                 incremental_handoff_prompt_bytes,
             incremental_handoff_kv_bytes);
       }
-      ET_CHECK_MSG(
-          munmap(
-              incremental_handoff_mapping,
-              incremental_handoff_total_bytes) == 0,
-          "munmap for PD memory handoff failed: %s",
-          std::strerror(errno));
+      if (!memory_handoff->direct_pointer) {
+        ET_CHECK_MSG(
+            munmap(
+                incremental_handoff_mapping,
+                incremental_handoff_total_bytes) == 0,
+            "munmap for PD memory handoff failed: %s",
+            std::strerror(errno));
+      }
       incremental_handoff_mapping = MAP_FAILED;
       memory_handoff->fd = incremental_handoff_fd;
       incremental_handoff_fd = -1;

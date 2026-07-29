@@ -1285,33 +1285,156 @@ void build_gptq2_qzeros_cache(
   }
 }
 
-uint32_t pack_gs32_int4_from_qbytes(uint8_t low_qbyte, uint8_t high_qbyte, uint8_t zp) {
-  static const std::array<std::array<uint32_t, 65536>, 4> kPackedLut = []() {
-    std::array<std::array<uint32_t, 65536>, 4> lut{};
-    static constexpr std::array<int, 8> perm = {4, 0, 5, 1, 6, 2, 7, 3};
-    for (size_t zp = 0; zp < lut.size(); ++zp) {
-      for (size_t key = 0; key < lut[zp].size(); ++key) {
-        const uint8_t qbyte0 = static_cast<uint8_t>(key & 0xFF);
-        const uint8_t qbyte1 = static_cast<uint8_t>((key >> 8) & 0xFF);
-        int values[8];
-        for (size_t i = 0; i < 4; ++i) {
-          values[i] = static_cast<int>((qbyte0 >> (i * 2)) & 0x3) - static_cast<int>(zp);
-          values[4 + i] =
-              static_cast<int>((qbyte1 >> (i * 2)) & 0x3) - static_cast<int>(zp);
-        }
-        uint32_t packed = 0;
-        for (size_t i = 0; i < 4; ++i) {
-          const uint8_t high = static_cast<uint8_t>(values[perm[i * 2]] & 0xF);
-          const uint8_t low = static_cast<uint8_t>(values[perm[i * 2 + 1]] & 0xF);
-          packed |= static_cast<uint32_t>((high << 4) | low) << (i * 8);
-        }
-        lut[zp][key] = packed;
-      }
-    }
-    return lut;
-  }();
-  return kPackedLut[zp][static_cast<uint16_t>(low_qbyte | (static_cast<uint16_t>(high_qbyte) << 8))];
+uint32_t pack_gs32_int4_from_qbytes(
+    uint8_t low_qbyte,
+    uint8_t high_qbyte,
+    uint8_t zp) {
+  uint32_t packed = 0;
+  for (size_t lane = 0; lane < 4; ++lane) {
+    const size_t shift = lane * 2;
+    const uint8_t low = static_cast<uint8_t>(
+        (static_cast<int>((low_qbyte >> shift) & 0x3) -
+         static_cast<int>(zp)) &
+        0xF);
+    const uint8_t high = static_cast<uint8_t>(
+        (static_cast<int>((high_qbyte >> shift) & 0x3) -
+         static_cast<int>(zp)) &
+        0xF);
+    packed |= static_cast<uint32_t>((high << 4) | low) << (lane * 8);
+  }
+  return packed;
 }
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+ET_INLINE float32x4_t fp16_bits_to_f32_neon(uint16x4_t half) {
+  const uint32x4_t bits = vmovl_u16(half);
+  const uint32x4_t sign =
+      vshlq_n_u32(vandq_u32(bits, vdupq_n_u32(0x8000)), 16);
+  const uint32x4_t exponent =
+      vandq_u32(vshrq_n_u32(bits, 10), vdupq_n_u32(0x1F));
+  const uint32x4_t mantissa =
+      vandq_u32(bits, vdupq_n_u32(0x3FF));
+
+  const uint32x4_t normal = vorrq_u32(
+      sign,
+      vorrq_u32(
+          vshlq_n_u32(vaddq_u32(exponent, vdupq_n_u32(112)), 23),
+          vshlq_n_u32(mantissa, 13)));
+
+  // Exact normalization for binary16 subnormals. p is floor(log2(mantissa)).
+  const uint32x4_t p =
+      vsubq_u32(vdupq_n_u32(31), vclzq_u32(mantissa));
+  const int32x4_t normalize_shift = vreinterpretq_s32_u32(
+      vsubq_u32(vdupq_n_u32(23), p));
+  const uint32x4_t normalized_mantissa = vandq_u32(
+      vshlq_u32(mantissa, normalize_shift),
+      vdupq_n_u32(0x7FFFFF));
+  const uint32x4_t subnormal = vorrq_u32(
+      sign,
+      vorrq_u32(
+          vshlq_n_u32(vaddq_u32(p, vdupq_n_u32(103)), 23),
+          normalized_mantissa));
+  const uint32x4_t zero_or_subnormal = vbslq_u32(
+      vceqq_u32(mantissa, vdupq_n_u32(0)),
+      sign,
+      subnormal);
+  const uint32x4_t special = vorrq_u32(
+      sign,
+      vorrq_u32(
+          vdupq_n_u32(0x7F800000),
+          vshlq_n_u32(mantissa, 13)));
+  const uint32x4_t finite = vbslq_u32(
+      vceqq_u32(exponent, vdupq_n_u32(0)),
+      zero_or_subnormal,
+      normal);
+  return vreinterpretq_f32_u32(vbslq_u32(
+      vceqq_u32(exponent, vdupq_n_u32(0x1F)),
+      special,
+      finite));
+}
+
+ET_INLINE uint8x8_t decode_gptq2_qzeros8_neon(const uint8_t* metadata) {
+  const uint16x8x2_t scale_zero =
+      vld2q_u16(reinterpret_cast<const uint16_t*>(metadata));
+  const float32x4_t min_scale = vdupq_n_f32(1.0e-4f);
+  const float32x4_t scale_low = vmaxq_f32(
+      fp16_bits_to_f32_neon(vget_low_u16(scale_zero.val[0])),
+      min_scale);
+  const float32x4_t scale_high = vmaxq_f32(
+      fp16_bits_to_f32_neon(vget_high_u16(scale_zero.val[0])),
+      min_scale);
+  const float32x4_t zero_low =
+      fp16_bits_to_f32_neon(vget_low_u16(scale_zero.val[1]));
+  const float32x4_t zero_high =
+      fp16_bits_to_f32_neon(vget_high_u16(scale_zero.val[1]));
+  const int32x4_t zp_low = vmaxq_s32(
+      vdupq_n_s32(0),
+      vminq_s32(
+          vdupq_n_s32(3),
+          vcvtaq_s32_f32(vdivq_f32(zero_low, scale_low))));
+  const int32x4_t zp_high = vmaxq_s32(
+      vdupq_n_s32(0),
+      vminq_s32(
+          vdupq_n_s32(3),
+          vcvtaq_s32_f32(vdivq_f32(zero_high, scale_high))));
+  return vqmovn_u16(vcombine_u16(
+      vqmovun_s32(zp_low),
+      vqmovun_s32(zp_high)));
+}
+
+template <int Shift>
+ET_INLINE uint8x8_t extract_gptq2_lane_neon(uint8x8_t packed) {
+  static_assert(Shift == 0 || Shift == 2 || Shift == 4 || Shift == 6);
+  const uint8x8_t shifted = [&]() {
+    if constexpr (Shift == 0) {
+      return packed;
+    } else {
+      return vshr_n_u8(packed, Shift);
+    }
+  }();
+  return vand_u8(shifted, vdup_n_u8(0x3));
+}
+
+template <int Shift>
+ET_INLINE uint8x8_t pack_gptq2_lane_neon(
+    uint8x8_t low_qbyte,
+    uint8x8_t high_qbyte,
+    uint8x8_t zp) {
+  const uint8x8_t nibble_mask = vdup_n_u8(0xF);
+  const uint8x8_t low = vand_u8(
+      vsub_u8(extract_gptq2_lane_neon<Shift>(low_qbyte), zp),
+      nibble_mask);
+  const uint8x8_t high = vand_u8(
+      vsub_u8(extract_gptq2_lane_neon<Shift>(high_qbyte), zp),
+      nibble_mask);
+  return vorr_u8(low, vshl_n_u8(high, 4));
+}
+
+ET_INLINE void pack_gptq2_gs32_tile_pair8_neon(
+    const uint8_t* qbytes0,
+    const uint8_t* qbytes1,
+    uint8x8_t zp,
+    uint8_t* dst0,
+    uint8_t* dst1) {
+  // Keep two tiles live together: four qbyte vectors, one shared zp vector,
+  // and eight output vectors. This fills the SIMD register file enough to
+  // overlap loads and bit operations without forcing spills.
+  const uint8x8x2_t q0 = vld2_u8(qbytes0);
+  const uint8x8x2_t q1 = vld2_u8(qbytes1);
+  uint8x8x4_t out0;
+  uint8x8x4_t out1;
+  out0.val[0] = pack_gptq2_lane_neon<0>(q0.val[0], q0.val[1], zp);
+  out0.val[1] = pack_gptq2_lane_neon<2>(q0.val[0], q0.val[1], zp);
+  out0.val[2] = pack_gptq2_lane_neon<4>(q0.val[0], q0.val[1], zp);
+  out0.val[3] = pack_gptq2_lane_neon<6>(q0.val[0], q0.val[1], zp);
+  out1.val[0] = pack_gptq2_lane_neon<0>(q1.val[0], q1.val[1], zp);
+  out1.val[1] = pack_gptq2_lane_neon<2>(q1.val[0], q1.val[1], zp);
+  out1.val[2] = pack_gptq2_lane_neon<4>(q1.val[0], q1.val[1], zp);
+  out1.val[3] = pack_gptq2_lane_neon<6>(q1.val[0], q1.val[1], zp);
+  vst4_u8(dst0, out0);
+  vst4_u8(dst1, out1);
+}
+#endif
 
 void write_int4_block_from_tmac_i2_direct(
     const DirectTmacI2TensorView& tensor,
@@ -1501,6 +1624,7 @@ void write_int4_block_from_gptq2_gs32_source(
   static constexpr size_t kTilesPerGroup = 4;
   static constexpr size_t kQbytesPerTile = 2;
   static constexpr size_t kMetadataBytesPerRow = 4;
+  static constexpr size_t kColsPerGroup = 32;
   const size_t qbytes_per_group =
       kRowsPerBlock * kTilesPerGroup * kQbytesPerTile;
   const size_t metadata_per_group = kRowsPerBlock * kMetadataBytesPerRow;
@@ -1510,37 +1634,71 @@ void write_int4_block_from_gptq2_gs32_source(
     throw std::runtime_error("Invalid GPTQ INT2 GS32 source dimensions");
   }
 
-  std::vector<uint8_t> qzeros_cache;
-  qzeros_cache.assign(num_qnn_groups * kRowsPerBlock, 0);
   for (size_t bc = 0; bc < num_qnn_groups; ++bc) {
+    const uint8_t* group =
+        gs32_source_block + bc * bytes_per_group;
+    const uint8_t* qbytes = group;
     const uint8_t* metadata =
-        gs32_source_block + bc * bytes_per_group + qbytes_per_group;
-    for (size_t row = 0; row < kRowsPerBlock; ++row) {
-      qzeros_cache[bc * kRowsPerBlock + row] =
-          decode_gptq2_qzero_metadata(
-              metadata + row * kMetadataBytesPerRow);
-    }
-  }
-
-  for (size_t bc = 0; bc < num_qnn_groups; ++bc) {
-    const uint8_t* qbytes = gs32_source_block + bc * bytes_per_group;
-    size_t qbytes_offset = 0;
+        group + qbytes_per_group;
+    uint8_t* group_dst =
+        dst + bc * kRowsPerBlock * kColsPerGroup / 2;
     for (size_t br = 0; br < 2; ++br) {
       const size_t r0 = br * 32;
-      for (size_t tile_bc = 0; tile_bc < kTilesPerGroup; ++tile_bc) {
-        for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
-          const size_t rr0 = r0 + tile_br * 8;
+      for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
+        const size_t rr0 = r0 + tile_br * 8;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        const uint8x8_t zp = decode_gptq2_qzeros8_neon(
+            metadata + rr0 * kMetadataBytesPerRow);
+#else
+        uint8_t zps[8];
+        for (size_t r = 0; r < 8; ++r) {
+          zps[r] = decode_gptq2_qzero_metadata(
+              metadata + (rr0 + r) * kMetadataBytesPerRow);
+        }
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        const size_t qbytes_row_offset =
+            (br * kTilesPerGroup * 4 * 8 + tile_br * 8) *
+            kQbytesPerTile;
+        const size_t dst_row_offset =
+            (br * kTilesPerGroup * 4 * 8 + tile_br * 8) * 4;
+        static constexpr size_t kQbytesTileStride =
+            4 * 8 * kQbytesPerTile;
+        static constexpr size_t kDstTileStride = 4 * 8 * 4;
+        pack_gptq2_gs32_tile_pair8_neon(
+            qbytes + qbytes_row_offset,
+            qbytes + qbytes_row_offset + kQbytesTileStride,
+            zp,
+            group_dst + dst_row_offset,
+            group_dst + dst_row_offset + kDstTileStride);
+        pack_gptq2_gs32_tile_pair8_neon(
+            qbytes + qbytes_row_offset + 2 * kQbytesTileStride,
+            qbytes + qbytes_row_offset + 3 * kQbytesTileStride,
+            zp,
+            group_dst + dst_row_offset + 2 * kDstTileStride,
+            group_dst + dst_row_offset + 3 * kDstTileStride);
+#else
+        for (size_t tile_bc = 0; tile_bc < kTilesPerGroup; ++tile_bc) {
+          const size_t row_offset =
+              br * kTilesPerGroup * 4 * 8 +
+              tile_bc * 4 * 8 +
+              tile_br * 8;
+          const uint8_t* tile_qbytes =
+              qbytes + row_offset * kQbytesPerTile;
+          uint8_t* tile_dst = group_dst + row_offset * 4;
           for (size_t r = 0; r < 8; ++r) {
-            const uint8_t qbyte0 = qbytes[qbytes_offset + 0];
-            const uint8_t qbyte1 = qbytes[qbytes_offset + 1];
-            qbytes_offset += kQbytesPerTile;
-            const uint8_t zp = qzeros_cache[bc * kRowsPerBlock + rr0 + r];
             const uint32_t packed_row =
-                pack_gs32_int4_from_qbytes(qbyte0, qbyte1, zp);
-            std::memcpy(dst, &packed_row, sizeof(packed_row));
-            dst += sizeof(packed_row);
+                pack_gs32_int4_from_qbytes(
+                    tile_qbytes[r * kQbytesPerTile],
+                    tile_qbytes[r * kQbytesPerTile + 1],
+                    zps[r]);
+            std::memcpy(
+                tile_dst + r * sizeof(packed_row),
+                &packed_row,
+                sizeof(packed_row));
           }
         }
+#endif
       }
     }
   }

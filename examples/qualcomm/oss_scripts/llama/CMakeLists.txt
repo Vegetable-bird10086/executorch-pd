@@ -222,6 +222,91 @@ set_target_properties(
   qnn_llama_pd_e2e_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
 )
 
+# Single-process PD runner. llama.cpp pd-cli is compiled as a library entry
+# inside this target; no external Decode executable, fork, exec, socket, or FD
+# handoff is used by this variant.
+set(LLAMA_CPP_SOURCE_DIR "" CACHE PATH "Path to the llama.cpp source tree")
+set(EXECUTORCH_SCHEMA_INCLUDE_DIR "" CACHE PATH "Installed Executorch schema include directory")
+if(EXECUTORCH_SCHEMA_INCLUDE_DIR)
+  target_include_directories(
+    qnn_llama_pd_runner PUBLIC ${EXECUTORCH_SCHEMA_INCLUDE_DIR}
+  )
+  target_include_directories(
+    qnn_llama_pd_e2e_runner PUBLIC ${EXECUTORCH_SCHEMA_INCLUDE_DIR}
+  )
+endif()
+if(LLAMA_CPP_SOURCE_DIR)
+  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+  set(_pd_joint_saved_build_shared_libs ${BUILD_SHARED_LIBS})
+  set(BUILD_SHARED_LIBS OFF)
+  add_subdirectory(
+    ${LLAMA_CPP_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}/llama-pd-joint
+    EXCLUDE_FROM_ALL
+  )
+  set(BUILD_SHARED_LIBS ${_pd_joint_saved_build_shared_libs})
+
+  set(_llama_pd_joint_runner__srcs ${_llama_pd_e2e_runner__srcs})
+  list(FILTER _llama_pd_joint_runner__srcs EXCLUDE REGEX ".*runner/runner\\.(cpp|h)")
+  list(FILTER _llama_pd_joint_runner__srcs EXCLUDE REGEX ".*llama_tiktoken\\.cpp")
+  list(
+    PREPEND
+    _llama_pd_joint_runner__srcs
+    ${CMAKE_CURRENT_LIST_DIR}/qnn_llama_pd_joint_runner.cpp
+    ${LLAMA_CPP_SOURCE_DIR}/tools/pd-cli/pd_cli.cpp
+  )
+  add_executable(qnn_llama_pd_joint_runner ${_llama_pd_joint_runner__srcs})
+  target_compile_definitions(
+    qnn_llama_pd_joint_runner PRIVATE
+    QNN_LLAMA_PD_JOINT=1
+    QNN_LLAMA_PD_E2E_NO_MAIN=1
+    LLAMA_PD_CLI_NO_MAIN=1
+  )
+  target_include_directories(
+    qnn_llama_pd_joint_runner PUBLIC
+    ${_common_include_directories}
+    ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
+    ${CMAKE_BINARY_DIR}/../../schema/include
+    ${EXECUTORCH_SCHEMA_INCLUDE_DIR}
+    ${EXECUTORCH_ROOT}/third-party/flatbuffers/include
+    ${LLAMA_CPP_SOURCE_DIR}/include
+    ${LLAMA_CPP_SOURCE_DIR}/common
+    ${LLAMA_CPP_SOURCE_DIR}/src
+    ${LLAMA_CPP_SOURCE_DIR}/tools/pd-cli
+    ${LLAMA_CPP_SOURCE_DIR}/vendor/nlohmann
+  )
+  target_link_libraries(
+    qnn_llama_pd_joint_runner
+    qnn_executorch_backend
+    executorch_core
+    extension_data_loader
+    extension_flat_tensor
+    extension_llm_runner
+    extension_module
+    extension_tensor
+    gflags
+    custom_ops
+    quantized_ops_lib
+    quantized_kernels
+    etdump
+    flatccrt
+    llama-common
+    llama
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_options(
+    qnn_llama_pd_joint_runner PUBLIC ${_common_compile_options}
+  )
+  set_target_properties(
+    qnn_llama_pd_joint_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+  )
+endif()
+
 # build PTE rebuild comparison tool
 add_executable(
   pte_rebuild_compare

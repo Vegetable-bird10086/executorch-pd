@@ -5,6 +5,10 @@
 #include <executorch/extension/data_loader/buffer_data_loader.h>
 #include <executorch/runtime/platform/log.h>
 #include <gflags/gflags.h>
+#ifdef QNN_LLAMA_PD_JOINT
+#include "llama.h"
+#include "pd_cli_inprocess.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -138,7 +142,7 @@ DEFINE_bool(
     "Experimental stage-major pipeline: rebuild(i+2), QNN load(i+1), and execute(i) on separate stages.");
 DEFINE_bool(
     prefill_qnn_backend_prewarm,
-    false,
+    true,
     "Prewarm the process-lifetime QNN backend/device from qnn_compile_spec_hex in the shard manifest without creating a QNN context or graph.");
 DEFINE_string(
     prefill_etdump_dir,
@@ -315,7 +319,11 @@ struct PdE2ERuntimeStats {
 struct DecodeProcessResult {
   int exit_code{1};
   double startup_ms{0.0};
+  double process_wall_ms{0.0};
   double wall_ms{0.0};
+  double boundary_ms{0.0};
+  double generation_ms{0.0};
+  int32_t generated_tokens{0};
   ProcessMemorySnapshot before;
   ProcessMemorySnapshot after;
   ProcessMemorySnapshot child_peak;
@@ -402,6 +410,39 @@ void log_pd_e2e_runtime_summary(
       decode.startup_ms,
       decode.wall_ms,
       total_ms);
+  const double prefill_round_ms =
+      prefill.prefill.tokenize_ms + prefill.prefill.prefill_ms;
+  const double pd_boundary_ms =
+      prefill.prefill.handoff_total_ms + decode.boundary_ms;
+  const double decode_round_ms = pd_boundary_ms + decode.generation_ms;
+  const double decode_round_ms_per_token = decode.generated_tokens > 0
+      ? decode_round_ms / static_cast<double>(decode.generated_tokens)
+      : 0.0;
+  ET_LOG(
+      Info,
+      "PD steady-state timing: initialization_once_ms=%.3f "
+      "prefill_round_ms=%.3f prefill_handoff_ms=%.3f "
+      "decode_boundary_ms=%.3f pd_boundary_ms=%.3f "
+      "decode_generation_ms=%.3f decode_round_ms=%.3f "
+      "decode_generated_tokens=%d decode_round_ms_per_token=%.3f "
+      "qnn_backend_prewarmed=%d",
+      prefill.runner_setup_ms + decode.startup_ms,
+      prefill_round_ms,
+      prefill.prefill.handoff_total_ms,
+      decode.boundary_ms,
+      pd_boundary_ms,
+      decode.generation_ms,
+      decode_round_ms,
+      decode.generated_tokens,
+      decode_round_ms_per_token,
+      static_cast<int>(prefill.qnn_backend_prewarmed));
+  if (!prefill.qnn_backend_prewarmed) {
+    ET_LOG(
+        Error,
+        "PD steady-state Prefill timing is contaminated by first-use QNN "
+        "backend initialization; export qnn_compile_spec_hex and keep "
+        "--prefill_qnn_backend_prewarm enabled");
+  }
   ET_LOG(
       Info,
       "PD E2E memory handoff: kv_pack_ms=%.3f size_bytes=%zu",
@@ -1187,6 +1228,7 @@ struct PdResidentRequest {
   uint32_t first_token_is_prompt_tail{0};
 };
 
+#ifndef QNN_LLAMA_PD_JOINT
 struct ResidentDecodeProcess {
   pid_t pid{-1};
   int control_fd{-1};
@@ -1420,6 +1462,236 @@ void begin_resident_decode_handoff(
   resident.control_fd = -1;
   ET_LOG(Info, "Prefill handed KV memfd to already-resident Decode pid=%d", resident.pid);
 }
+#else
+std::shared_ptr<example::ReadOnlyMappedFile> g_joint_model_source;
+
+std::vector<uint64_t> joint_tokenize_prompt(
+    const std::string& formatted_prompt,
+    bool tokenized_prompt) {
+  if (tokenized_prompt) {
+    const auto bytes = read_binary_file(formatted_prompt);
+    ET_CHECK_MSG(
+        bytes.size() % sizeof(uint64_t) == 0,
+        "tokenized prompt size is not uint64 aligned");
+    std::vector<uint64_t> tokens(bytes.size() / sizeof(uint64_t));
+    std::memcpy(tokens.data(), bytes.data(), bytes.size());
+    return tokens;
+  }
+
+  llama_model_params model_params = llama_model_default_params();
+  model_params.vocab_only = true;
+  std::optional<std::string> deferred_profile_path;
+  if (const char* path = std::getenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+      path != nullptr && path[0] != '\0') {
+    deferred_profile_path = path;
+    unsetenv("LLAMA_QNN_U16_QPARAMS_MANIFEST");
+  }
+  std::unique_ptr<llama_model, decltype(&llama_model_free)> tokenizer_model(
+      llama_model_load_from_buffer(
+          g_joint_model_source->data(),
+          g_joint_model_source->size(),
+          model_params),
+      llama_model_free);
+  if (deferred_profile_path.has_value()) {
+    setenv(
+        "LLAMA_QNN_U16_QPARAMS_MANIFEST",
+        deferred_profile_path->c_str(),
+        1);
+  }
+  ET_CHECK_MSG(
+      tokenizer_model != nullptr,
+      "failed to create shared llama.cpp tokenizer");
+  const llama_vocab* vocab = llama_model_get_vocab(tokenizer_model.get());
+  const int32_t required = -llama_tokenize(
+      vocab,
+      formatted_prompt.data(),
+      static_cast<int32_t>(formatted_prompt.size()),
+      nullptr,
+      0,
+      true,
+      true);
+  ET_CHECK_MSG(required > 0, "shared llama.cpp tokenizer returned no tokens");
+  std::vector<llama_token> llama_tokens(static_cast<size_t>(required));
+  const int32_t count = llama_tokenize(
+      vocab,
+      formatted_prompt.data(),
+      static_cast<int32_t>(formatted_prompt.size()),
+      llama_tokens.data(),
+      required,
+      true,
+      true);
+  ET_CHECK_MSG(count == required, "shared llama.cpp tokenizer size changed");
+  std::vector<uint64_t> tokens;
+  tokens.reserve(llama_tokens.size());
+  for (llama_token token : llama_tokens) {
+    tokens.push_back(static_cast<uint64_t>(token));
+  }
+  ET_LOG(
+      Info,
+      "Joint tokenizer produced %zu tokens from model_ptr=%p",
+      tokens.size(),
+      g_joint_model_source->data());
+  return tokens;
+}
+
+struct ResidentDecodeProcess {
+  pid_t pid{getpid()};
+  int control_fd{-1};
+  bool runtime_prepare_sent{false};
+  std::string shared_embedding_matrix_path;
+  std::vector<std::string> args;
+  llama_pd_inprocess_runtime* runtime{nullptr};
+  DecodeProcessResult result{};
+};
+
+std::vector<std::string> make_joint_decode_args(
+    const std::string& shared_embedding_matrix_path) {
+  std::vector<std::string> args = {
+      "qnn_llama_pd_joint_runner",
+      "-m",
+      "in-process.gguf",
+      "-n",
+      std::to_string(FLAGS_decode_n_predict),
+      "-c",
+      std::to_string(FLAGS_decode_ctx),
+      "-b",
+      "1",
+      "-ub",
+      "1",
+      "-ngl",
+      std::to_string(FLAGS_decode_ngl),
+      "--temp",
+      std::to_string(FLAGS_decode_temp),
+      "-fit",
+      "off",
+  };
+  if (FLAGS_decode_threads > 0) {
+    args.push_back("-t");
+    args.push_back(std::to_string(FLAGS_decode_threads));
+  }
+  if (!shared_embedding_matrix_path.empty()) {
+    args.push_back("--pd-disk-embedding");
+    args.push_back(shared_embedding_matrix_path);
+  }
+  if (!FLAGS_decode_ppl_tokens_path.empty()) {
+    args.push_back("--pd-ppl-tokens");
+    args.push_back(FLAGS_decode_ppl_tokens_path);
+    if (!FLAGS_decode_ppl_output_path.empty()) {
+      args.push_back("--pd-ppl-output");
+      args.push_back(FLAGS_decode_ppl_output_path);
+    }
+    if (FLAGS_decode_ppl_max_tokens > 0) {
+      args.push_back("--pd-ppl-max-tokens");
+      args.push_back(std::to_string(FLAGS_decode_ppl_max_tokens));
+    }
+  }
+  if (FLAGS_decode_import_ro) {
+    args.push_back("--pd-import-ro");
+  }
+  return args;
+}
+
+ResidentDecodeProcess start_resident_decode_process(
+    const std::string& shared_embedding_matrix_path) {
+  ET_CHECK_MSG(
+      g_joint_model_source && !g_joint_model_source->empty(),
+      "joint PD runner requires the Prefill GGUF mapping to remain alive");
+  ResidentDecodeProcess resident;
+  resident.shared_embedding_matrix_path = shared_embedding_matrix_path;
+  resident.args = make_joint_decode_args(shared_embedding_matrix_path);
+  resident.result.before = process_memory_snapshot();
+  resident.result.exit_code = 0;
+  std::vector<char*> argv;
+  argv.reserve(resident.args.size() + 1);
+  for (auto& arg : resident.args) {
+    argv.push_back(arg.data());
+  }
+  argv.push_back(nullptr);
+  resident.runtime = llama_pd_inprocess_runtime_create(
+      static_cast<int>(resident.args.size()),
+      argv.data(),
+      g_joint_model_source->data(),
+      g_joint_model_source->size(),
+      &resident.result.startup_ms);
+  ET_CHECK_MSG(
+      resident.runtime != nullptr,
+      "failed to create persistent joint Decode runtime");
+  ET_LOG(
+      Info,
+      "Joint Decode initialized in-process before Prefill: model_ptr=%p "
+      "model_bytes=%zu initialization_ms=%.3f threadpool_deferred=1",
+      g_joint_model_source->data(),
+      g_joint_model_source->size(),
+      resident.result.startup_ms);
+  return resident;
+}
+
+void start_resident_decode_runtime_prepare(int) {
+  ET_LOG(
+      Info,
+      "Prefill rebuild buffers released; joint Decode will create context at the direct-pointer boundary");
+}
+
+void begin_resident_decode_handoff(
+    ResidentDecodeProcess& resident,
+    const example::PDPrefillRunner<uint8_t>::MemoryHandoff& memory_handoff) {
+  ET_CHECK_MSG(
+      memory_handoff.direct_pointer && memory_handoff.bytes &&
+          !memory_handoff.bytes->empty(),
+      "joint Decode requires a direct-pointer KV handoff");
+
+  llama_pd_inprocess_request request{
+      g_joint_model_source->data(),
+      g_joint_model_source->size(),
+      memory_handoff.bytes->data(),
+      memory_handoff.bytes->size(),
+      memory_handoff.prompt_length,
+      memory_handoff.num_layers,
+      memory_handoff.num_kv_heads,
+      memory_handoff.head_dim,
+      static_cast<int32_t>(memory_handoff.first_token),
+      memory_handoff.first_token_is_prompt_tail,
+      nullptr,
+  };
+  llama_pd_inprocess_result inprocess_result{};
+  request.result = &inprocess_result;
+  const auto decode_start = SteadyClock::now();
+  resident.result.exit_code =
+      llama_pd_inprocess_runtime_run(resident.runtime, &request);
+  resident.result.process_wall_ms = elapsed_ms(decode_start);
+  resident.result.startup_ms = inprocess_result.initialization_ms;
+  resident.result.boundary_ms = inprocess_result.boundary_ms;
+  resident.result.generation_ms = inprocess_result.generation_ms;
+  resident.result.generated_tokens = inprocess_result.generated_tokens;
+  resident.result.wall_ms =
+      resident.result.boundary_ms + resident.result.generation_ms;
+  resident.result.after = process_memory_snapshot();
+  resident.result.process_tree_peak_rss_bytes =
+      resident.result.after.hwm_bytes;
+  resident.result.process_tree_peak_pss_bytes =
+      resident.result.after.pss_bytes;
+  resident.runtime_prepare_sent = true;
+  ET_LOG(
+      Info,
+      "Joint Decode completed in-process: model_ptr=%p kv_ptr=%p "
+      "initialization_once_ms=%.3f boundary_ms=%.3f generation_ms=%.3f "
+      "decode_round_ms=%.3f process_wall_ms=%.3f",
+      request.model_data,
+      request.handoff_data,
+      resident.result.startup_ms,
+      resident.result.boundary_ms,
+      resident.result.generation_ms,
+      resident.result.wall_ms,
+      resident.result.process_wall_ms);
+}
+
+DecodeProcessResult finish_resident_decode_process(
+    ResidentDecodeProcess resident) {
+  llama_pd_inprocess_runtime_destroy(resident.runtime);
+  resident.runtime = nullptr;
+  return resident.result;
+}
+#endif
 
 template <typename T>
 void run_wikitext_ppl(
@@ -1557,6 +1829,9 @@ PdE2ERuntimeStats run_pd_e2e(
   }
 
   PdE2ERuntimeStats stats;
+#ifdef QNN_LLAMA_PD_JOINT
+  stats.memory_handoff.direct_pointer = true;
+#endif
   stats.shared_embedding_matrix_path = effective_separate_embed
       ? effective_embedding_matrix_path
       : std::string{};
@@ -1603,6 +1878,10 @@ PdE2ERuntimeStats run_pd_e2e(
   const std::string formatted_prompt = tokenized_prompt
       ? prompt_input
       : get_formatted_prompt(prompt_input, FLAGS_system_prompt, decoder_version);
+#ifdef QNN_LLAMA_PD_JOINT
+  runner.set_prefill_tokens(
+      joint_tokenize_prompt(formatted_prompt, tokenized_prompt));
+#endif
   const auto qnn_export_start = SteadyClock::now();
   ET_CHECK_MSG(
       runner.export_prefill_memory_handoff(
@@ -1633,7 +1912,7 @@ PdE2ERuntimeStats run_pd_e2e(
 
 } // namespace
 
-int main(int argc, char** argv) {
+int qnn_llama_pd_e2e_main(int argc, char** argv) {
   std::vector<std::string> prompts = CollectPrompts(argc, argv);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
@@ -1729,6 +2008,17 @@ int main(int argc, char** argv) {
   }
   auto prefill_shard_rebuild =
       make_prefill_shard_rebuild_config(prefill_shard_files);
+#ifdef QNN_LLAMA_PD_JOINT
+  ET_CHECK_MSG(
+      FLAGS_model_ram_store,
+      "joint PD runner requires --model_ram_store=true so the one-time GGUF "
+      "read completes before Prefill/Decode timing");
+  ET_CHECK_MSG(
+      prefill_shard_rebuild.mapped_source_bytes &&
+          !prefill_shard_rebuild.mapped_source_bytes->empty(),
+      "joint PD runner requires --gguf_model_path as the shared Prefill/Decode model");
+  g_joint_model_source = prefill_shard_rebuild.mapped_source_bytes;
+#endif
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module;
 
   if (!FLAGS_wikitext_path.empty()) {
@@ -1784,6 +2074,14 @@ int main(int argc, char** argv) {
     memory_monitor = std::thread([&]() {
       while (!stop_memory_monitor.load(std::memory_order_relaxed)) {
         const auto parent_memory = process_memory_snapshot();
+#ifdef QNN_LLAMA_PD_JOINT
+        resident_decode.result.process_tree_peak_rss_bytes = std::max(
+            resident_decode.result.process_tree_peak_rss_bytes,
+            parent_memory.rss_bytes);
+        resident_decode.result.process_tree_peak_pss_bytes = std::max(
+            resident_decode.result.process_tree_peak_pss_bytes,
+            parent_memory.pss_bytes);
+#else
         const auto child_memory = process_memory_snapshot(resident_decode.pid);
         resident_decode.result.child_peak.rss_bytes = std::max(
             resident_decode.result.child_peak.rss_bytes,
@@ -1800,6 +2098,7 @@ int main(int argc, char** argv) {
         resident_decode.result.process_tree_peak_pss_bytes = std::max(
             resident_decode.result.process_tree_peak_pss_bytes,
             parent_memory.pss_bytes + child_memory.pss_bytes);
+#endif
         usleep(5000);
       }
     });
@@ -1855,3 +2154,9 @@ int main(int argc, char** argv) {
       elapsed_ms(e2e_start));
   return 0;
 }
+
+#ifndef QNN_LLAMA_PD_E2E_NO_MAIN
+int main(int argc, char** argv) {
+  return qnn_llama_pd_e2e_main(argc, argv);
+}
+#endif
