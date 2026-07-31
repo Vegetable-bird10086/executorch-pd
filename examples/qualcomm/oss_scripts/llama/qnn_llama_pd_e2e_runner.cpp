@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <regex>
 #include <sstream>
@@ -90,6 +91,11 @@ DEFINE_string(
     tokenized_prompt,
     "",
     "Optional raw uint64 token file used instead of string prompt.");
+DEFINE_string(
+    session_prompts_path,
+    "",
+    "Optional UTF-8 text file containing one prompt per non-empty line. "
+    "All prompts run in one process and reuse Prefill/Decode runtime state.");
 DEFINE_string(system_prompt, "", "Optional system prompt.");
 DEFINE_string(
     wikitext_path,
@@ -144,6 +150,12 @@ DEFINE_bool(
     prefill_qnn_backend_prewarm,
     true,
     "Prewarm the process-lifetime QNN backend/device from qnn_compile_spec_hex in the shard manifest without creating a QNN context or graph.");
+DEFINE_bool(
+    prefill_persistent_shard0,
+    false,
+    "Rebuild and QNN-load prefill shard 0 during runner preparation, retain "
+    "its context through the request, and start the three-stage pipeline at "
+    "shard 1.");
 DEFINE_string(
     prefill_etdump_dir,
     "",
@@ -200,6 +212,11 @@ DEFINE_string(
     decode_gguf_path,
     "",
     "Path to the decode-side GGUF model. When omitted, --gguf_model_path is reused, then --tmac_model_path.");
+DEFINE_bool(
+    decode_use_prefill_embedding,
+    true,
+    "Pass the separate Prefill embedding matrix to Decode as --pd-disk-embedding. "
+    "Disable when the Decode GGUF contains its own embedding tensor.");
 DEFINE_int32(
     decode_n_predict,
     128,
@@ -304,9 +321,14 @@ double bytes_to_mib(uint64_t bytes) {
 struct PdE2ERuntimeStats {
   int32_t prompt_tokens{0};
   double runner_setup_ms{0.0};
+  double prefill_prepare_ms{0.0};
+  double bootstrap_tokenize_ms{0.0};
+  double prepare_overlap_wall_ms{0.0};
   double qnn_export_total_ms{0.0};
   double qnn_backend_prewarm_ms{0.0};
   bool qnn_backend_prewarmed{false};
+  double persistent_shard0_prepare_ms{0.0};
+  bool persistent_shard0_prepared{false};
   example::PDPrefillRunner<uint16_t>::RuntimeStats prefill{};
   std::vector<example::DecoderRunner::PrefillShardRuntimeStats> shard_stats;
   ProcessMemorySnapshot before_runner;
@@ -371,7 +393,8 @@ void log_pd_e2e_runtime_summary(
       "PD E2E shard setup: preload_ms=%.3f qat_checkpoint_context_ms=%.3f "
       "qat_recipe_ms=%.3f gguf_checkpoint_context_ms=%.3f gguf_recipe_ms=%.3f "
       "qnn_backend_prewarm_ms=%.3f qnn_backend_prewarmed=%d pipeline_wait_ms=%.3f "
-      "pipeline_enabled=%d stage_major_enabled=%d three_stage_enabled=%d",
+      "pipeline_enabled=%d stage_major_enabled=%d three_stage_enabled=%d "
+      "persistent_shard0_prepare_ms=%.3f persistent_shard0_prepared=%d",
       shard_preload_total_ms,
       qat_checkpoint_context_total_ms,
       qat_recipe_total_ms,
@@ -383,7 +406,9 @@ void log_pd_e2e_runtime_summary(
       static_cast<int>(
           FLAGS_prefill_shard_pipeline || FLAGS_prefill_shard_pipeline_3stage),
       static_cast<int>(FLAGS_prefill_shard_stage_major),
-      static_cast<int>(FLAGS_prefill_shard_pipeline_3stage));
+      static_cast<int>(FLAGS_prefill_shard_pipeline_3stage),
+      prefill.persistent_shard0_prepare_ms,
+      static_cast<int>(prefill.persistent_shard0_prepared));
   ET_LOG(
       Info,
       "PD E2E rebuild breakdown: allocation_ms=%.3f static_copy_ms=%.3f "
@@ -399,10 +424,15 @@ void log_pd_e2e_runtime_summary(
       gguf_relayout_total_bytes);
   ET_LOG(
       Info,
-      "PD E2E timing: runner_setup_ms=%.3f tokenize_ms=%.3f qnn_prefill_ms=%.3f "
+      "PD E2E timing: runner_setup_ms=%.3f prefill_prepare_ms=%.3f "
+      "bootstrap_tokenize_ms=%.3f prepare_overlap_wall_ms=%.3f "
+      "tokenize_ms=%.3f qnn_prefill_ms=%.3f "
       "handoff_ms=%.3f qnn_export_total_ms=%.3f decode_startup_ms=%.3f "
       "decode_process_ms=%.3f e2e_total_ms=%.3f",
       prefill.runner_setup_ms,
+      prefill.prefill_prepare_ms,
+      prefill.bootstrap_tokenize_ms,
+      prefill.prepare_overlap_wall_ms,
       prefill.prefill.tokenize_ms,
       prefill.prefill.prefill_ms,
       prefill.prefill.handoff_total_ms,
@@ -426,7 +456,8 @@ void log_pd_e2e_runtime_summary(
       "decode_generation_ms=%.3f decode_round_ms=%.3f "
       "decode_generated_tokens=%d decode_round_ms_per_token=%.3f "
       "qnn_backend_prewarmed=%d",
-      prefill.runner_setup_ms + decode.startup_ms,
+      prefill.runner_setup_ms + prefill.prepare_overlap_wall_ms +
+          decode.startup_ms,
       prefill_round_ms,
       prefill.prefill.handoff_total_ms,
       decode.boundary_ms,
@@ -609,6 +640,29 @@ std::vector<std::string> CollectPrompts(int argc, char** argv) {
     }
   }
   return prompts;
+}
+
+void append_session_prompts(
+    const std::string& path,
+    std::vector<std::string>* prompts) {
+  if (path.empty()) {
+    return;
+  }
+  std::ifstream input(path);
+  ET_CHECK_MSG(input.is_open(), "Unable to read session prompts: %s", path.c_str());
+  std::string line;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (!line.empty()) {
+      prompts->push_back(std::move(line));
+    }
+  }
+  ET_CHECK_MSG(
+      !prompts->empty(),
+      "Session prompt file contains no non-empty prompts: %s",
+      path.c_str());
 }
 
 std::vector<uint8_t> read_binary_file(const std::string& path) {
@@ -1189,6 +1243,12 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   config.pipeline_rebuild =
       FLAGS_prefill_shard_pipeline || FLAGS_prefill_shard_pipeline_3stage;
   config.prewarm_qnn_backend = FLAGS_prefill_qnn_backend_prewarm;
+  ET_CHECK_MSG(
+      !FLAGS_prefill_persistent_shard0 ||
+          FLAGS_prefill_shard_pipeline_3stage,
+      "--prefill_persistent_shard0 requires "
+      "--prefill_shard_pipeline_3stage");
+  config.persistent_shard0_context = FLAGS_prefill_persistent_shard0;
   config.qnn_compile_spec_bytes = files.qnn_compile_spec_bytes;
   ET_LOG(
       Info,
@@ -1782,10 +1842,19 @@ void run_wikitext_ppl(
 }
 
 template <typename T>
-PdE2ERuntimeStats run_pd_e2e(
+struct PdPrefillSession {
+  std::unique_ptr<example::PDPrefillRunner<T>> runner;
+  example::DecoderModelVersion decoder_version;
+  ProcessMemorySnapshot before_runner;
+  ProcessMemorySnapshot after_runner;
+  std::string shared_embedding_matrix_path;
+  double runner_setup_ms{0.0};
+  size_t request_count{0};
+};
+
+template <typename T>
+PdPrefillSession<T> create_pd_prefill_session(
     ModuleBundle module_bundle,
-    const std::string& prompt_input,
-    bool tokenized_prompt,
     PrefillShardFiles prefill_shard_files,
     example::DecoderRunner::PrefillShardRebuildConfig prefill_shard_rebuild,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module) {
@@ -1828,16 +1897,10 @@ PdE2ERuntimeStats run_pd_e2e(
     static_metadata.resident_embedding = false;
   }
 
-  PdE2ERuntimeStats stats;
-#ifdef QNN_LLAMA_PD_JOINT
-  stats.memory_handoff.direct_pointer = true;
-#endif
-  stats.shared_embedding_matrix_path = effective_separate_embed
-      ? effective_embedding_matrix_path
-      : std::string{};
-  stats.before_runner = process_memory_snapshot();
+  PdPrefillSession<T> session;
+  session.before_runner = process_memory_snapshot();
   const auto runner_setup_start = SteadyClock::now();
-  example::PDPrefillRunner<T> runner(
+  session.runner = std::make_unique<example::PDPrefillRunner<T>>(
       std::move(module_bundle.module),
       std::move(prefill_shard_files.pte_paths),
       std::move(prefill_shard_files.index_bin_paths),
@@ -1865,33 +1928,86 @@ PdE2ERuntimeStats run_pd_e2e(
     ET_CHECK_MSG(
         FLAGS_prefill_etdump_debug_buffer_bytes > 0,
         "--prefill_etdump_debug_buffer_bytes must be positive");
-    runner.set_prefill_etdump_config({
+    session.runner->set_prefill_etdump_config({
         FLAGS_prefill_etdump_dir,
         FLAGS_prefill_etdump_shard,
         static_cast<size_t>(FLAGS_prefill_etdump_debug_buffer_bytes),
     });
   }
-  stats.runner_setup_ms = elapsed_ms(runner_setup_start);
-  stats.after_runner = process_memory_snapshot();
+  session.runner_setup_ms = elapsed_ms(runner_setup_start);
+  session.after_runner = process_memory_snapshot();
+  session.shared_embedding_matrix_path = effective_separate_embed
+      ? effective_embedding_matrix_path
+      : std::string{};
+  session.decoder_version = session.runner->get_decoder_model_version().get();
+  return session;
+}
 
-  const auto decoder_version = runner.get_decoder_model_version().get();
+template <typename T>
+PdE2ERuntimeStats run_pd_e2e_request(
+    PdPrefillSession<T>& session,
+    const std::string& prompt_input,
+    bool tokenized_prompt) {
+  ET_CHECK_MSG(session.runner != nullptr, "PD Prefill session is not initialized");
+  PdE2ERuntimeStats stats;
+#ifdef QNN_LLAMA_PD_JOINT
+  stats.memory_handoff.direct_pointer = true;
+#endif
+  stats.shared_embedding_matrix_path = session.shared_embedding_matrix_path;
+  stats.before_runner = session.request_count == 0
+      ? session.before_runner
+      : process_memory_status_snapshot();
+  stats.after_runner = session.request_count == 0
+      ? session.after_runner
+      : stats.before_runner;
+  stats.runner_setup_ms =
+      session.request_count == 0 ? session.runner_setup_ms : 0.0;
+  session.runner->begin_request();
+
   const std::string formatted_prompt = tokenized_prompt
       ? prompt_input
-      : get_formatted_prompt(prompt_input, FLAGS_system_prompt, decoder_version);
+      : get_formatted_prompt(
+            prompt_input, FLAGS_system_prompt, session.decoder_version);
 #ifdef QNN_LLAMA_PD_JOINT
-  runner.set_prefill_tokens(
-      joint_tokenize_prompt(formatted_prompt, tokenized_prompt));
+  const auto prepare_overlap_start = SteadyClock::now();
+  auto tokenize_future = std::async(
+      std::launch::async,
+      [formatted_prompt, tokenized_prompt]() {
+        const auto tokenize_start = SteadyClock::now();
+        auto tokens =
+            joint_tokenize_prompt(formatted_prompt, tokenized_prompt);
+        return std::make_pair(
+            std::move(tokens), elapsed_ms(tokenize_start));
+      });
+  const auto prepare_start = SteadyClock::now();
+  ET_CHECK_MSG(
+      session.runner->load() == executorch::runtime::Error::Ok,
+      "Failed to prepare joint QNN Prefill runner");
+  stats.prefill_prepare_ms = elapsed_ms(prepare_start);
+  auto tokenization = tokenize_future.get();
+  stats.bootstrap_tokenize_ms = tokenization.second;
+  stats.prepare_overlap_wall_ms = elapsed_ms(prepare_overlap_start);
+  session.runner->set_prefill_tokens(std::move(tokenization.first));
+  ET_LOG(
+      Info,
+      "Joint Prefill initialization overlap: prepare_ms=%.3f "
+      "tokenize_ms=%.3f wall_ms=%.3f hidden_ms=%.3f",
+      stats.prefill_prepare_ms,
+      stats.bootstrap_tokenize_ms,
+      stats.prepare_overlap_wall_ms,
+      stats.prefill_prepare_ms + stats.bootstrap_tokenize_ms -
+          stats.prepare_overlap_wall_ms);
 #endif
   const auto qnn_export_start = SteadyClock::now();
   ET_CHECK_MSG(
-      runner.export_prefill_memory_handoff(
+      session.runner->export_prefill_memory_handoff(
           formatted_prompt,
           tokenized_prompt,
           FLAGS_seq_len,
           &stats.memory_handoff) == executorch::runtime::Error::Ok,
       "PD prefill export failed");
   stats.qnn_export_total_ms = elapsed_ms(qnn_export_start);
-  const auto runner_stats = runner.last_runtime_stats();
+  const auto runner_stats = session.runner->last_runtime_stats();
   stats.prompt_tokens = runner_stats.prompt_tokens;
   stats.prefill.prompt_tokens = runner_stats.prompt_tokens;
   stats.prefill.tokenize_ms = runner_stats.tokenize_ms;
@@ -1900,13 +2016,20 @@ PdE2ERuntimeStats run_pd_e2e(
   stats.prefill.kv_layout_ms = runner_stats.kv_layout_ms;
   stats.prefill.kv_write_ms = runner_stats.kv_write_ms;
   stats.prefill.fingerprint_ms = runner_stats.fingerprint_ms;
-  stats.shard_stats = runner.prefill_shard_runtime_stats();
-  stats.qnn_backend_prewarm_ms = runner.prefill_qnn_backend_prewarm_ms();
-  stats.qnn_backend_prewarmed = runner.prefill_qnn_backend_prewarmed();
+  stats.shard_stats = session.runner->prefill_shard_runtime_stats();
+  stats.qnn_backend_prewarm_ms =
+      session.runner->prefill_qnn_backend_prewarm_ms();
+  stats.qnn_backend_prewarmed =
+      session.runner->prefill_qnn_backend_prewarmed();
+  stats.persistent_shard0_prepare_ms =
+      session.runner->prefill_persistent_shard0_prepare_ms();
+  stats.persistent_shard0_prepared =
+      session.runner->prefill_persistent_shard0_prepared();
   // The handoff must be sent immediately after Prefill. Reading
   // smaps_rollup here can stall for tens of milliseconds; the concurrent
   // dense monitor already records PSS for the full process tree.
   stats.after_export = process_memory_status_snapshot();
+  ++session.request_count;
   return stats;
 }
 
@@ -1915,6 +2038,11 @@ PdE2ERuntimeStats run_pd_e2e(
 int qnn_llama_pd_e2e_main(int argc, char** argv) {
   std::vector<std::string> prompts = CollectPrompts(argc, argv);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
+  const bool use_session_prompt_file = !FLAGS_session_prompts_path.empty();
+  ET_CHECK_MSG(
+      !use_session_prompt_file || prompts.empty(),
+      "--session_prompts_path cannot be combined with --prompt");
+  append_session_prompts(FLAGS_session_prompts_path, &prompts);
 
   ET_CHECK_MSG(
       FLAGS_attention_sink_rope_path.empty(),
@@ -1929,14 +2057,14 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
 
   const bool use_tokenized_prompt =
       !gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default;
+  ET_CHECK_MSG(
+      !use_tokenized_prompt || !use_session_prompt_file,
+      "--session_prompts_path cannot be combined with --tokenized_prompt");
   if (!FLAGS_wikitext_path.empty()) {
     ET_CHECK_MSG(
         gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default,
         "tokenized_prompt is not supported in wikitext PPL mode");
   } else {
-    ET_CHECK_MSG(
-        use_tokenized_prompt || prompts.size() == 1,
-        "PD flow only supports a single prompt");
     ET_CHECK_MSG(
         use_tokenized_prompt || !prompts.empty(),
         "Provide --prompt or --tokenized_prompt");
@@ -2008,6 +2136,8 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
   }
   auto prefill_shard_rebuild =
       make_prefill_shard_rebuild_config(prefill_shard_files);
+  const size_t request_count = use_tokenized_prompt ? 1 : prompts.size();
+  prefill_shard_rebuild.retain_session_rebuild_resources = request_count > 1;
 #ifdef QNN_LLAMA_PD_JOINT
   ET_CHECK_MSG(
       FLAGS_model_ram_store,
@@ -2052,7 +2182,7 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
   ET_LOG(Info, "Using in-memory PD handoff");
 
   const std::string resident_embedding_matrix_path =
-      effective_prefill_separate_embed
+      effective_prefill_separate_embed && FLAGS_decode_use_prefill_embedding
       ? (!FLAGS_prefill_embedding_matrix_path.empty()
              ? FLAGS_prefill_embedding_matrix_path
              : prefill_shard_files.embedding_matrix_path)
@@ -2068,90 +2198,138 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
         };
   }
 
-  std::atomic<bool> stop_memory_monitor{false};
-  std::thread memory_monitor;
-  if (!FLAGS_prefill_only) {
-    memory_monitor = std::thread([&]() {
-      while (!stop_memory_monitor.load(std::memory_order_relaxed)) {
-        const auto parent_memory = process_memory_snapshot();
+  PdPrefillSession<uint8_t> prefill_session =
+      create_pd_prefill_session<uint8_t>(
+          std::move(module_bundle),
+          std::move(prefill_shard_files),
+          std::move(prefill_shard_rebuild),
+          std::move(attention_sink_rope_module));
+  ET_LOG(
+      Info,
+      "PD session ready: requests=%zu persistent_shard0=%d decode_resident=%d",
+      request_count,
+      static_cast<int>(FLAGS_prefill_persistent_shard0),
+      static_cast<int>(!FLAGS_prefill_only));
+
+  for (size_t request_index = 0; request_index < request_count;
+       ++request_index) {
+    const auto request_start = SteadyClock::now();
+    ET_LOG(
+        Info,
+        "PD session request begin: index=%zu total=%zu",
+        request_index,
+        request_count);
+
+    std::atomic<bool> stop_memory_monitor{false};
+    std::thread memory_monitor;
+    if (!FLAGS_prefill_only) {
+      memory_monitor = std::thread([&]() {
+        while (!stop_memory_monitor.load(std::memory_order_relaxed)) {
+          const auto parent_memory = process_memory_snapshot();
 #ifdef QNN_LLAMA_PD_JOINT
-        resident_decode.result.process_tree_peak_rss_bytes = std::max(
-            resident_decode.result.process_tree_peak_rss_bytes,
-            parent_memory.rss_bytes);
-        resident_decode.result.process_tree_peak_pss_bytes = std::max(
-            resident_decode.result.process_tree_peak_pss_bytes,
-            parent_memory.pss_bytes);
+          resident_decode.result.process_tree_peak_rss_bytes = std::max(
+              resident_decode.result.process_tree_peak_rss_bytes,
+              parent_memory.rss_bytes);
+          resident_decode.result.process_tree_peak_pss_bytes = std::max(
+              resident_decode.result.process_tree_peak_pss_bytes,
+              parent_memory.pss_bytes);
 #else
-        const auto child_memory = process_memory_snapshot(resident_decode.pid);
-        resident_decode.result.child_peak.rss_bytes = std::max(
-            resident_decode.result.child_peak.rss_bytes,
-            child_memory.rss_bytes);
-        resident_decode.result.child_peak.hwm_bytes = std::max(
-            resident_decode.result.child_peak.hwm_bytes,
-            child_memory.hwm_bytes);
-        resident_decode.result.child_peak.pss_bytes = std::max(
-            resident_decode.result.child_peak.pss_bytes,
-            child_memory.pss_bytes);
-        resident_decode.result.process_tree_peak_rss_bytes = std::max(
-            resident_decode.result.process_tree_peak_rss_bytes,
-            parent_memory.rss_bytes + child_memory.rss_bytes);
-        resident_decode.result.process_tree_peak_pss_bytes = std::max(
-            resident_decode.result.process_tree_peak_pss_bytes,
-            parent_memory.pss_bytes + child_memory.pss_bytes);
+          const auto child_memory = process_memory_snapshot(resident_decode.pid);
+          resident_decode.result.child_peak.rss_bytes = std::max(
+              resident_decode.result.child_peak.rss_bytes,
+              child_memory.rss_bytes);
+          resident_decode.result.child_peak.hwm_bytes = std::max(
+              resident_decode.result.child_peak.hwm_bytes,
+              child_memory.hwm_bytes);
+          resident_decode.result.child_peak.pss_bytes = std::max(
+              resident_decode.result.child_peak.pss_bytes,
+              child_memory.pss_bytes);
+          resident_decode.result.process_tree_peak_rss_bytes = std::max(
+              resident_decode.result.process_tree_peak_rss_bytes,
+              parent_memory.rss_bytes + child_memory.rss_bytes);
+          resident_decode.result.process_tree_peak_pss_bytes = std::max(
+              resident_decode.result.process_tree_peak_pss_bytes,
+              parent_memory.pss_bytes + child_memory.pss_bytes);
 #endif
-        usleep(5000);
+          usleep(5000);
+        }
+      });
+    }
+
+    const std::string prompt_input = use_tokenized_prompt
+        ? FLAGS_tokenized_prompt
+        : prompts[request_index];
+    PdE2ERuntimeStats prefill_runtime = run_pd_e2e_request<uint8_t>(
+        prefill_session, prompt_input, use_tokenized_prompt);
+
+    if (FLAGS_prefill_only) {
+      if (prefill_runtime.memory_handoff.fd >= 0) {
+        close(prefill_runtime.memory_handoff.fd);
+        prefill_runtime.memory_handoff.fd = -1;
       }
-    });
-  }
+      DecodeProcessResult no_decode;
+      no_decode.before = process_memory_snapshot();
+      no_decode.after = no_decode.before;
+      log_pd_e2e_runtime_summary(
+          prefill_runtime,
+          no_decode,
+          elapsed_ms(request_start));
+      ET_LOG(
+          Info,
+          "PD session request complete: index=%zu prefill_only=1 wall_ms=%.3f",
+          request_index,
+          elapsed_ms(request_start));
+      continue;
+    }
 
-  const std::string prompt_input =
-      use_tokenized_prompt ? FLAGS_tokenized_prompt : prompts.front();
-  PdE2ERuntimeStats prefill_runtime = run_pd_e2e<uint8_t>(
-      std::move(module_bundle),
-      prompt_input,
-      use_tokenized_prompt,
-      prefill_shard_files,
-      prefill_shard_rebuild,
-      std::move(attention_sink_rope_module));
+    // Send the ready KV immediately. Joining the dense PSS monitor can take
+    // tens of milliseconds on Android and must not sit on the PD boundary.
+    begin_resident_decode_handoff(
+        resident_decode,
+        prefill_runtime.memory_handoff);
+    stop_memory_monitor.store(true, std::memory_order_relaxed);
+    memory_monitor.join();
 
-  if (FLAGS_prefill_only) {
+    const DecodeProcessResult decode = resident_decode.result;
     if (prefill_runtime.memory_handoff.fd >= 0) {
       close(prefill_runtime.memory_handoff.fd);
       prefill_runtime.memory_handoff.fd = -1;
     }
-    DecodeProcessResult no_decode;
-    no_decode.before = process_memory_snapshot();
-    no_decode.after = no_decode.before;
+    ET_CHECK_MSG(
+        decode.exit_code == 0,
+        "llama-pd-cli exited with code %d on session request %zu",
+        decode.exit_code,
+        request_index);
     log_pd_e2e_runtime_summary(
         prefill_runtime,
-        no_decode,
-        elapsed_ms(e2e_start));
-    ET_LOG(Info, "Prefill completed; in-memory handoff released");
-    return 0;
+        decode,
+        elapsed_ms(request_start));
+    ET_LOG(
+        Info,
+        "PD session request complete: index=%zu generated_tokens=%d wall_ms=%.3f",
+        request_index,
+        decode.generated_tokens,
+        elapsed_ms(request_start));
   }
 
-  // Send the ready KV immediately. Joining the dense PSS monitor can take
-  // tens of milliseconds on Android and must not sit on the PD boundary.
-  begin_resident_decode_handoff(
-      resident_decode,
-      prefill_runtime.memory_handoff);
-  stop_memory_monitor.store(true, std::memory_order_relaxed);
-  memory_monitor.join();
-
-  const DecodeProcessResult decode =
-      finish_resident_decode_process(std::move(resident_decode));
-  if (prefill_runtime.memory_handoff.fd >= 0) {
-    close(prefill_runtime.memory_handoff.fd);
-    prefill_runtime.memory_handoff.fd = -1;
+  if (!FLAGS_prefill_only) {
+    finish_resident_decode_process(std::move(resident_decode));
   }
-  ET_CHECK_MSG(
-      decode.exit_code == 0,
-      "llama-pd-cli exited with code %d",
-      decode.exit_code);
-  log_pd_e2e_runtime_summary(
-      prefill_runtime,
-      decode,
+  ET_LOG(
+      Info,
+      "PD session complete: requests=%zu wall_ms=%.3f",
+      request_count,
       elapsed_ms(e2e_start));
+#ifdef QNN_LLAMA_PD_JOINT
+  if (request_count > 1) {
+    // Release live QNN contexts explicitly, then avoid the Android QNN SDK's
+    // process-global static teardown path. The OS reclaims the process-lifetime
+    // backend/device bundle.
+    prefill_session.runner.reset();
+    std::fflush(nullptr);
+    _Exit(0);
+  }
+#endif
   return 0;
 }
 

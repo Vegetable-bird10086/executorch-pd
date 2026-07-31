@@ -1005,7 +1005,8 @@ bool PDPrefillRunner<T>::is_loaded() const {
 
 template <typename T>
 Error PDPrefillRunner<T>::load() {
-  if (is_loaded()) {
+  if (decoder_runner_ != nullptr && prompt_processor_ != nullptr &&
+      kv_manager_ != nullptr && buffer_manager_ != nullptr) {
     return Error::Ok;
   }
 
@@ -1022,9 +1023,8 @@ Error PDPrefillRunner<T>::load() {
 
   if (tokenizer_ == nullptr) {
 #ifdef QNN_LLAMA_PD_JOINT
-    ET_CHECK_MSG(
-        !prefill_tokens_override_.empty(),
-        "joint PD Prefill requires tokens from the shared llama.cpp tokenizer");
+    // The joint runner tokenizes from the shared GGUF. Allow static Prefill
+    // resources to load before those tokens are ready so both paths overlap.
 #else
     tokenizer_ = llm::load_tokenizer(tokenizer_path_);
     if (tokenizer_ == nullptr) {
@@ -1226,6 +1226,22 @@ Error PDPrefillRunner<T>::load() {
 }
 
 template <typename T>
+void PDPrefillRunner<T>::begin_request() {
+  ET_CHECK_MSG(
+      cur_pos_ == 0 || last_runtime_stats_.prompt_tokens > 0,
+      "Invalid Prefill request state");
+  cur_pos_ = 0;
+  last_runtime_stats_ = {};
+  prefill_tokens_override_.clear();
+  if (prompt_processor_ != nullptr) {
+    prompt_processor_->clear_all_logits();
+  }
+  if (decoder_runner_ != nullptr) {
+    decoder_runner_->begin_prefill_request();
+  }
+}
+
+template <typename T>
 void PDPrefillRunner<T>::reset() {
   cur_pos_ = 0;
   context_len_ = 0;
@@ -1363,6 +1379,19 @@ bool PDPrefillRunner<T>::prefill_qnn_backend_prewarmed() const {
 }
 
 template <typename T>
+double PDPrefillRunner<T>::prefill_persistent_shard0_prepare_ms() const {
+  return decoder_runner_ != nullptr
+      ? decoder_runner_->prefill_persistent_shard0_prepare_ms()
+      : 0.0;
+}
+
+template <typename T>
+bool PDPrefillRunner<T>::prefill_persistent_shard0_prepared() const {
+  return decoder_runner_ != nullptr &&
+      decoder_runner_->prefill_persistent_shard0_prepared();
+}
+
+template <typename T>
 void PDPrefillRunner<T>::set_prefill_etdump_config(
     DecoderRunner::PrefillEtDumpConfig config) {
   ET_CHECK_MSG(
@@ -1374,8 +1403,8 @@ void PDPrefillRunner<T>::set_prefill_etdump_config(
 template <typename T>
 void PDPrefillRunner<T>::set_prefill_tokens(std::vector<uint64_t> tokens) {
   ET_CHECK_MSG(
-      decoder_runner_ == nullptr,
-      "Set joint Prefill tokens before PDPrefillRunner::load");
+      cur_pos_ == 0 && last_runtime_stats_.prompt_tokens == 0,
+      "Set joint Prefill tokens before Prefill execution starts");
   ET_CHECK_MSG(!tokens.empty(), "Joint Prefill token array cannot be empty");
   prefill_tokens_override_ = std::move(tokens);
 }

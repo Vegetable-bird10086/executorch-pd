@@ -976,6 +976,39 @@ bool DecoderRunner::uses_prefill_shard_three_stage_pipeline() const {
       uses_prefill_shard_stage_major() && !prefill_shards_.empty();
 }
 
+void DecoderRunner::prepare_persistent_prefill_shard0() {
+  if (!prefill_shard_rebuild_.persistent_shard0_context ||
+      prefill_shards_.empty() || prefill_persistent_shard0_prepared_) {
+    return;
+  }
+
+  auto& shard = prefill_shards_.front();
+  ET_CHECK_MSG(
+      shard.rebuild_on_execute,
+      "Persistent shard 0 preparation requires rebuild-on-execute");
+  const auto prepare_start = SteadyClock::now();
+  materialize_prefill_shard(shard);
+  const auto memory_after_materialize = process_memory_snapshot();
+  record_memory_peak(
+      &shard.runtime_stats.rss_after_materialize_bytes,
+      memory_after_materialize.rss_bytes);
+  record_memory_peak(
+      &shard.runtime_stats.hwm_after_materialize_bytes,
+      memory_after_materialize.hwm_bytes);
+  ET_CHECK_MSG(
+      load_prefill_shard_method(shard) == Error::Ok,
+      "Failed to prepare persistent prefill shard 0");
+  prefill_persistent_shard0_prepare_ms_ = elapsed_ms(prepare_start);
+  prefill_persistent_shard0_prepared_ = true;
+  ET_LOG(
+      Info,
+      "persistent prefill shard 0 prepared: rebuild_ms=%.3f "
+      "qnn_load_method_ms=%.3f prepare_ms=%.3f",
+      shard.runtime_stats.rebuild_ms,
+      shard.runtime_stats.qnn_load_method_ms,
+      prefill_persistent_shard0_prepare_ms_);
+}
+
 void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
   if (prefill_shard_three_stage_pipeline_ != nullptr) {
     return;
@@ -994,13 +1027,25 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
   pipeline->rebuild_results.resize(shard_count);
   pipeline->rebuilt.assign(shard_count, false);
   pipeline->loaded.assign(shard_count, false);
+  const size_t first_pipeline_shard =
+      prefill_persistent_shard0_prepared_ ? 1 : 0;
+  if (prefill_persistent_shard0_prepared_) {
+    ET_CHECK_MSG(
+        prefill_shards_.front().module != nullptr,
+        "Persistent shard 0 is marked prepared without a live module");
+    pipeline->rebuilt[0] = true;
+    pipeline->loaded[0] = true;
+  }
   pipeline->rebuild_permit_index = std::min<size_t>(1, shard_count - 1);
   pipeline->load_permit_index = 0;
   auto* state = pipeline.get();
   prefill_shard_three_stage_pipeline_ = std::move(pipeline);
 
-  state->rebuild_worker = std::thread([this, state, shard_count]() {
-    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index) {
+  state->rebuild_worker =
+      std::thread([this, state, shard_count, first_pipeline_shard]() {
+    for (size_t shard_index = first_pipeline_shard;
+         shard_index < shard_count;
+         ++shard_index) {
       {
         std::unique_lock<std::mutex> lock(state->mutex);
         state->cv.wait(lock, [state, shard_index]() {
@@ -1025,8 +1070,11 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
     }
   });
 
-  state->load_worker = std::thread([this, state, shard_count]() {
-    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index) {
+  state->load_worker =
+      std::thread([this, state, shard_count, first_pipeline_shard]() {
+    for (size_t shard_index = first_pipeline_shard;
+         shard_index < shard_count;
+         ++shard_index) {
       PteRebuildResult rebuild_result;
       {
         std::unique_lock<std::mutex> lock(state->mutex);
@@ -1067,8 +1115,11 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
   });
   ET_LOG(
       Info,
-      "three-stage prefill pipeline started: rebuild_worker=1 load_worker=1 shards=%zu",
-      shard_count);
+      "three-stage prefill pipeline started: rebuild_worker=1 load_worker=1 "
+      "shards=%zu first_pipeline_shard=%zu persistent_shard0=%d",
+      shard_count,
+      first_pipeline_shard,
+      static_cast<int>(prefill_persistent_shard0_prepared_));
 }
 
 void DecoderRunner::stop_prefill_shard_three_stage_pipeline() {
@@ -1480,6 +1531,7 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
       "preloaded prefill shard inputs: shards=%zu total_bytes=%zu",
       prefill_shards_.size(),
       preloaded_bytes);
+  prepare_persistent_prefill_shard0();
 }
 
 Error DecoderRunner::set_outputs(
@@ -1502,7 +1554,8 @@ Error DecoderRunner::load(const std::vector<std::string>& method_names) {
   for (const std::string& method_name : method_names) {
     if (method_name == "prefill_forward" && uses_prefill_shards()) {
       for (auto& shard : prefill_shards_) {
-        if (shard.module != nullptr) {
+        if (shard.module != nullptr &&
+            !shard.module->is_method_loaded(shard.method_name)) {
           ET_CHECK_OK_OR_RETURN_ERROR(load_prefill_shard_method(shard));
         }
       }
@@ -1603,6 +1656,18 @@ void DecoderRunner::prepare_final_prefill_shard_overlap() {
   ET_CHECK_MSG(
       uses_prefill_shard_stage_major() && !prefill_shards_.empty(),
       "Final-shard overlap preparation requires stage-major prefill");
+
+  if (prefill_shard_rebuild_.retain_session_rebuild_resources) {
+    ET_LOG(
+        Info,
+        "retaining Prefill rebuild resources for the next session request");
+    if (prefill_shard_rebuild_.final_shard_overlap_callback) {
+      auto callback = std::exchange(
+          prefill_shard_rebuild_.final_shard_overlap_callback, {});
+      callback();
+    }
+    return;
+  }
 
   // end_prefill_shard_stage() waits for the following shard to finish loading,
   // so at this point the final PTE no longer depends on the GGUF rebuild source.
@@ -2064,9 +2129,17 @@ Error DecoderRunner::end_prefill_shard_stage(size_t shard_index) {
     next_shard.runtime_stats.pipeline_wait_ms +=
         wait_for_prefill_shard_three_stage_load(shard_index + 1);
   }
-  const auto release_start = SteadyClock::now();
-  release_prefill_shard(shard);
-  shard.runtime_stats.release_ms += elapsed_ms(release_start);
+  const bool retain_shard =
+      shard_index == 0 && prefill_persistent_shard0_prepared_;
+  if (!retain_shard) {
+    const auto release_start = SteadyClock::now();
+    release_prefill_shard(shard);
+    shard.runtime_stats.release_ms += elapsed_ms(release_start);
+  } else {
+    ET_LOG(
+        Info,
+        "persistent prefill shard 0 retained after execution: context_alive=1");
+  }
   if (prefill_shard_release_callback_) {
     prefill_shard_release_callback_(
         shard_index, shard.layer_offset, shard.layer_count);
@@ -2416,6 +2489,38 @@ double DecoderRunner::prefill_qnn_backend_prewarm_ms() const {
 
 bool DecoderRunner::prefill_qnn_backend_prewarmed() const {
   return prefill_qnn_backend_prewarmed_;
+}
+
+double DecoderRunner::prefill_persistent_shard0_prepare_ms() const {
+  return prefill_persistent_shard0_prepare_ms_;
+}
+
+bool DecoderRunner::prefill_persistent_shard0_prepared() const {
+  return prefill_persistent_shard0_prepared_;
+}
+
+void DecoderRunner::begin_prefill_request() {
+  ET_CHECK_MSG(
+      prefill_shard_three_stage_pipeline_ == nullptr,
+      "Cannot reset Prefill request while the three-stage pipeline is active");
+  ET_CHECK_MSG(
+      !prefill_shard_stage_pending_rebuild_.valid(),
+      "Cannot reset Prefill request while a shard rebuild is pending");
+  for (size_t shard_index = 0; shard_index < prefill_shards_.size();
+       ++shard_index) {
+    const bool retained_shard0 =
+        shard_index == 0 && prefill_persistent_shard0_prepared_;
+    ET_CHECK_MSG(
+        retained_shard0 || prefill_shards_[shard_index].module == nullptr,
+        "Prefill shard %zu remained active between requests",
+        shard_index);
+    auto& shard = prefill_shards_[shard_index];
+    shard.runtime_stats = {};
+    shard.runtime_stats.layer_offset = shard.layer_offset;
+    shard.runtime_stats.layer_count = shard.layer_count;
+  }
+  prefill_shard_stage_starts_.clear();
+  prefill_shard_release_callback_ = {};
 }
 
 bool DecoderRunner::uses_prefill_shards() const {

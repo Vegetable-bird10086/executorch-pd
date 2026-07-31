@@ -89,6 +89,7 @@ class PDPrefillRunner {
 
   bool is_loaded() const;
   executorch::runtime::Error load();
+  void begin_request();
   void reset();
 
   executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version();
@@ -97,6 +98,8 @@ class PDPrefillRunner {
   prefill_shard_runtime_stats() const;
   double prefill_qnn_backend_prewarm_ms() const;
   bool prefill_qnn_backend_prewarmed() const;
+  double prefill_persistent_shard0_prepare_ms() const;
+  bool prefill_persistent_shard0_prepared() const;
   void set_prefill_etdump_config(DecoderRunner::PrefillEtDumpConfig config);
   void set_prefill_tokens(std::vector<uint64_t> tokens);
 

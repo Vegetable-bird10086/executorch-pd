@@ -70,6 +70,12 @@ class DecoderRunner {
     // released, immediately before the final shard starts executing.
     std::function<void()> final_shard_overlap_callback;
     bool prewarm_qnn_backend{false};
+    // Materialize and load shard 0 during runner preparation, then keep its
+    // QNN context alive until the DecoderRunner is destroyed.
+    bool persistent_shard0_context{false};
+    // Keep GGUF recipes, stripped shard inputs, and reusable rebuild buffers
+    // alive so the same DecoderRunner can serve another request.
+    bool retain_session_rebuild_resources{false};
     // Raw qnn_compile_spec copied from a complete, unstripped PTE. Stripped
     // PTEs are not valid FlatBuffers and must never be parsed for this.
     std::shared_ptr<std::vector<uint8_t>> qnn_compile_spec_bytes;
@@ -148,6 +154,9 @@ class DecoderRunner {
   std::vector<PrefillShardRuntimeStats> prefill_shard_runtime_stats() const;
   double prefill_qnn_backend_prewarm_ms() const;
   bool prefill_qnn_backend_prewarmed() const;
+  double prefill_persistent_shard0_prepare_ms() const;
+  bool prefill_persistent_shard0_prepared() const;
+  void begin_prefill_request();
   bool uses_prefill_shard_stage_major() const;
   size_t prefill_shard_count() const;
   size_t prefill_shard_layer_offset(size_t shard_index) const;
@@ -340,6 +349,7 @@ class DecoderRunner {
   bool should_arm_prefill_etdump(const PrefillShardPlan& shard) const;
   executorch::runtime::Error write_prefill_etdump(PrefillShardPlan& shard);
   bool uses_prefill_shard_three_stage_pipeline() const;
+  void prepare_persistent_prefill_shard0();
   void start_prefill_shard_three_stage_pipeline();
   void stop_prefill_shard_three_stage_pipeline();
   void permit_prefill_shard_three_stage_pipeline(
@@ -368,6 +378,8 @@ class DecoderRunner {
   std::shared_ptr<PteGgufRebuildContext> prefill_gguf_rebuild_context_;
   double prefill_qnn_backend_prewarm_ms_{0.0};
   bool prefill_qnn_backend_prewarmed_{false};
+  double prefill_persistent_shard0_prepare_ms_{0.0};
+  bool prefill_persistent_shard0_prepared_{false};
   std::mutex prefill_rebuild_buffer_pool_mutex_;
   std::vector<std::shared_ptr<PteRebuildBuffer>> prefill_rebuild_buffer_pool_;
   std::vector<PrefillShardPlan> prefill_shards_;
