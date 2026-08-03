@@ -57,6 +57,7 @@ class PDPrefillRunner {
   struct RuntimeStats {
     int32_t prompt_tokens{0};
     double tokenize_ms{0.0};
+    double embedding_prepare_ms{0.0};
     double prefill_ms{0.0};
     double handoff_total_ms{0.0};
     double kv_layout_ms{0.0};

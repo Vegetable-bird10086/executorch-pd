@@ -1631,6 +1631,21 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
     }
   }
 
+  const auto embedding_prepare_start = SteadyClock::now();
+  prompt_processor_->prepare_prompt_embeddings(cached_prompt_tokens);
+  last_runtime_stats_.embedding_prepare_ms =
+      elapsed_ms(embedding_prepare_start);
+  ET_LOG(
+      Info,
+      "prepared prompt embeddings before active Prefill: tokens=%zu "
+      "bytes=%zu prepare_ms=%.3f",
+      cached_prompt_tokens.size(),
+      separate_embed_
+          ? cached_prompt_tokens.size() *
+              static_cast<size_t>(prefill_static_hidden_size_) * sizeof(float)
+          : size_t{0},
+      last_runtime_stats_.embedding_prepare_ms);
+
   const auto prefill_start = SteadyClock::now();
   auto prefill_res = prompt_processor_->prefill(
       cached_prompt_tokens,
@@ -1639,6 +1654,7 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
       attention_sink_rope_runner_.get());
   decoder_runner_->set_prefill_shard_release_callback({});
   last_runtime_stats_.prefill_ms = elapsed_ms(prefill_start);
+  prompt_processor_->clear_prompt_embeddings();
   const auto handoff_start = SteadyClock::now();
   if (incremental_pack_worker.joinable()) {
     {

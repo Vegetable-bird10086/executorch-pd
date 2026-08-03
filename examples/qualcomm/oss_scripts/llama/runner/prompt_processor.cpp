@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <type_traits>
 using executorch::aten::TensorImpl;
@@ -408,15 +409,61 @@ const std::vector<uint16_t>& PromptProcessor<T>::get_all_logits() {
 }
 
 template <typename T>
+void PromptProcessor<T>::prepare_prompt_embeddings(
+    const std::vector<uint64_t>& prompt_tokens) {
+  clear_prompt_embeddings();
+  if (!metadata_.use_separate_embed) {
+    return;
+  }
+  ET_CHECK_MSG(
+      metadata_.separate_embedding != nullptr && metadata_.embedding_dim > 0,
+      "Separate embedding instance is required");
+  const size_t embedding_dim = static_cast<size_t>(metadata_.embedding_dim);
+  ET_CHECK_MSG(
+      prompt_tokens.size() <=
+          std::numeric_limits<size_t>::max() / embedding_dim,
+      "Prompt embedding cache size overflow");
+  prompt_embeddings_.resize(prompt_tokens.size() * embedding_dim);
+  for (size_t token_index = 0; token_index < prompt_tokens.size();
+       ++token_index) {
+    metadata_.separate_embedding->copy_row_to_float(
+        prompt_tokens[token_index],
+        prompt_embeddings_.data() + token_index * embedding_dim,
+        embedding_dim);
+  }
+}
+
+template <typename T>
+void PromptProcessor<T>::clear_prompt_embeddings() {
+  std::vector<float>().swap(prompt_embeddings_);
+}
+
+template <typename T>
 void PromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     int64_t prompt_pos,
-    int64_t start_pos) {
-  if (metadata_.use_separate_embed) {
+    int64_t start_pos,
+    bool prepare_embedding) {
+  const size_t embedding_dim = static_cast<size_t>(metadata_.embedding_dim);
+  const bool use_cached_embeddings =
+      metadata_.use_separate_embed && prepare_embedding &&
+      prompt_embeddings_.size() == prompt_tokens.size() * embedding_dim;
+  if (metadata_.use_separate_embed && prepare_embedding) {
     ET_CHECK_MSG(
         metadata_.separate_embedding != nullptr,
         "Separate embedding instance is required");
     std::memset(input_embedding_.data, 0, input_embedding_.size);
+    if (use_cached_embeddings &&
+        prompt_pos < static_cast<int64_t>(prompt_tokens.size())) {
+      const size_t valid_rows = std::min<size_t>(
+          static_cast<size_t>(metadata_.ar_len),
+          prompt_tokens.size() - static_cast<size_t>(prompt_pos));
+      std::memcpy(
+          input_embedding_.data,
+          prompt_embeddings_.data() +
+              static_cast<size_t>(prompt_pos) * embedding_dim,
+          valid_rows * embedding_dim * sizeof(float));
+    }
   }
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (!is_bert()) {
@@ -427,11 +474,13 @@ void PromptProcessor<T>::prepare_io(
     }
     const uint64_t token = prompt_tokens[prompt_pos + i];
     if (metadata_.use_separate_embed) {
-      metadata_.separate_embedding->copy_row_to_float(
-          token,
-          reinterpret_cast<float*>(input_embedding_.data) +
-              static_cast<size_t>(i) * metadata_.embedding_dim,
-          metadata_.embedding_dim);
+      if (prepare_embedding && !use_cached_embeddings) {
+        metadata_.separate_embedding->copy_row_to_float(
+            token,
+            reinterpret_cast<float*>(input_embedding_.data) +
+                static_cast<size_t>(i) * metadata_.embedding_dim,
+            metadata_.embedding_dim);
+      }
     } else if (metadata_.use_int64_token) {
       input_toks_.data[i] = token;
     } else {
@@ -578,7 +627,11 @@ Result<uint64_t> PromptProcessor<T>::prefill(
               stage_pos,
               metadata_.sliding_window);
         }
-        prepare_io(prompt_tokens, stage_prompt_pos, stage_pos);
+        prepare_io(
+            prompt_tokens,
+            stage_prompt_pos,
+            stage_pos,
+            shard_index == 0);
 
         const DecoderRunner::PrefillShardStageState* previous_stage =
             shard_index == 0 ? nullptr : &stage_states[static_cast<size_t>(i)];

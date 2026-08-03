@@ -76,6 +76,9 @@ class PromptProcessor {
    */
   virtual void reserve_all_logits(size_t elements);
 
+  void prepare_prompt_embeddings(const std::vector<uint64_t>& prompt_tokens);
+  void clear_prompt_embeddings();
+
   /**
    * Prefill an LLM Module with the given text input.
    * @param prompt_tokens The text prompt tokens to the LLM Module. Encoded by
@@ -123,7 +126,8 @@ class PromptProcessor {
   void prepare_io(
       const std::vector<uint64_t>& prompt_tokens,
       int64_t prompt_pos,
-      int64_t start_pos);
+      int64_t start_pos,
+      bool prepare_embedding = true);
   DecoderRunner* decoder_runner_;
   KVManager<T>* kv_manager_;
   std::string method_name_;
@@ -155,5 +159,6 @@ class PromptProcessor {
 
   // Unused by default, only used when dump_logits_path is provided.
   std::vector<uint16_t> prompt_all_logits_;
+  std::vector<float> prompt_embeddings_;
 };
 } // namespace example

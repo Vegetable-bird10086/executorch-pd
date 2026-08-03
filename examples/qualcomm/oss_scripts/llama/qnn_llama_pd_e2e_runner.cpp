@@ -152,7 +152,7 @@ DEFINE_bool(
     "Prewarm the process-lifetime QNN backend/device from qnn_compile_spec_hex in the shard manifest without creating a QNN context or graph.");
 DEFINE_bool(
     prefill_persistent_shard0,
-    false,
+    true,
     "Rebuild and QNN-load prefill shard 0 during runner preparation, retain "
     "its context through the request, and start the three-stage pipeline at "
     "shard 1.");
@@ -426,7 +426,7 @@ void log_pd_e2e_runtime_summary(
       Info,
       "PD E2E timing: runner_setup_ms=%.3f prefill_prepare_ms=%.3f "
       "bootstrap_tokenize_ms=%.3f prepare_overlap_wall_ms=%.3f "
-      "tokenize_ms=%.3f qnn_prefill_ms=%.3f "
+      "tokenize_ms=%.3f embedding_prepare_ms=%.3f qnn_prefill_ms=%.3f "
       "handoff_ms=%.3f qnn_export_total_ms=%.3f decode_startup_ms=%.3f "
       "decode_process_ms=%.3f e2e_total_ms=%.3f",
       prefill.runner_setup_ms,
@@ -434,6 +434,7 @@ void log_pd_e2e_runtime_summary(
       prefill.bootstrap_tokenize_ms,
       prefill.prepare_overlap_wall_ms,
       prefill.prefill.tokenize_ms,
+      prefill.prefill.embedding_prepare_ms,
       prefill.prefill.prefill_ms,
       prefill.prefill.handoff_total_ms,
       prefill.qnn_export_total_ms,
@@ -2011,6 +2012,7 @@ PdE2ERuntimeStats run_pd_e2e_request(
   stats.prompt_tokens = runner_stats.prompt_tokens;
   stats.prefill.prompt_tokens = runner_stats.prompt_tokens;
   stats.prefill.tokenize_ms = runner_stats.tokenize_ms;
+  stats.prefill.embedding_prepare_ms = runner_stats.embedding_prepare_ms;
   stats.prefill.prefill_ms = runner_stats.prefill_ms;
   stats.prefill.handoff_total_ms = runner_stats.handoff_total_ms;
   stats.prefill.kv_layout_ms = runner_stats.kv_layout_ms;
