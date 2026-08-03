@@ -63,7 +63,7 @@ source shell_scripts/export_<model_family>.sh <model_name> <num_chunks> <prompt_
     - `cache_size`: Cache Size.
     - `calibration_data_file`: Name of calibration dataset with extension that is found inside the `aot_utils/llm_utils/prompts/` directory. Example: `alpaca.txt`. If `"None"`, will use dummy data to calibrate.
     - `precision`: Quantization precision for the model. Available options are `["A16W4", "A16W8", "A16W16", "A8W4", "A8W8"]`
-    - `platform`: The platform of the device. `DX4` for Mediatek Dimensity 9400 and `DX3` for Mediatek Dimensity 9300.
+    - `platform`: The platform of the device. `DX4` for Mediatek Dimensity 9400 and `DX3` for Mediatek Dimensity 9300. The Qwen exporter also accepts `DX5` for Mediatek Dimensity 9500 (`mt6993`); this target must be validated on the destination device before production use.
     <sub>**Note: Export script example only tested on `.txt` file.**</sub>
 
 - Available model names:

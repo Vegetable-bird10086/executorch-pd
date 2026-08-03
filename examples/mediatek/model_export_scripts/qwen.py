@@ -58,6 +58,12 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
+PLATFORM_CONFIGS = {
+    "DX3": b"mt6989",
+    "DX4": b"mt6991",
+    "DX5": b"mt6993",
+}
+
 
 def get_argument_parser():
     parser = argparse.ArgumentParser(
@@ -81,9 +87,10 @@ def get_argument_parser():
         "--platform",
         type=str,
         default="DX4",
-        choices=["DX3", "DX4"],
+        choices=list(PLATFORM_CONFIGS),
         help="Chip model of the inference device. "
-        "DX3 for Dimensity 9300, DX4 for Dimensity 9400.",
+        "DX3 for Dimensity 9300, DX4 for Dimensity 9400, "
+        "DX5 for Dimensity 9500.",
     )
     parser.add_argument(
         "-d",
@@ -422,14 +429,7 @@ def main():
         exp_name = (
             f"{get_exp_name(args.config)}_{args.precision}_{args.num_chunks}_chunks"
         )
-    if args.platform == "DX4":
-        platform_b = b"mt6991"
-    elif args.platform == "DX3":
-        platform_b = b"mt6989"
-    else:
-        raise ValueError(
-            f"Platform should be either DX3 or DX4, but got {args.platform}"
-        )
+    platform_b = PLATFORM_CONFIGS[args.platform]
     print_args(args, exp_name)
 
     config, weight_dir, tokenizer_class, chunk_class = resolve_model_classes(
