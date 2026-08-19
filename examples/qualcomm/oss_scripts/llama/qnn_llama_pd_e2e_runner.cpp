@@ -3362,9 +3362,11 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
         request_count);
 
     std::atomic<bool> stop_memory_monitor{false};
+    std::atomic<bool> memory_monitor_running{false};
     std::thread memory_monitor;
     if (!FLAGS_prefill_only) {
       memory_monitor = std::thread([&]() {
+        memory_monitor_running.store(true, std::memory_order_release);
         while (!stop_memory_monitor.load(std::memory_order_relaxed)) {
           const auto parent_memory = process_memory_snapshot();
 #ifdef QNN_LLAMA_PD_JOINT
@@ -3394,8 +3396,19 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
 #endif
           usleep(5000);
         }
+        memory_monitor_running.store(false, std::memory_order_release);
       });
     }
+    const auto stop_and_join_memory_monitor = [&]() {
+      stop_memory_monitor.store(true, std::memory_order_relaxed);
+      if (memory_monitor.joinable()) {
+        memory_monitor.join();
+      }
+      ET_CHECK_MSG(
+          !memory_monitor_running.load(std::memory_order_acquire) &&
+              !memory_monitor.joinable(),
+          "Dense process-memory monitor must be stopped before Decode");
+    };
 
     const std::string prompt_input = use_tokenized_prompt
         ? FLAGS_tokenized_prompt
@@ -3497,16 +3510,19 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
 #endif
 
 #ifdef QNN_LLAMA_PD_JOINT
-    // Avoid /proc PSS sampling while the synchronous joint Decode is running.
-    memory_monitor.join();
+    // Dense /proc sampling perturbs GGML worker scheduling. Treat monitor
+    // shutdown as a hard production-Decode lifecycle invariant.
+    stop_and_join_memory_monitor();
+    ET_LOG(
+        Info,
+        "PD memory monitor stopped before joint Decode: active=0");
 #endif
     // Send the ready KV after the Prefill memory monitor has exited.
     begin_resident_decode_handoff(
         resident_decode,
         prefill_runtime.memory_handoff);
 #ifndef QNN_LLAMA_PD_JOINT
-    stop_memory_monitor.store(true, std::memory_order_relaxed);
-    memory_monitor.join();
+    stop_and_join_memory_monitor();
     // The forked Decode path completes asynchronously after the handoff. Wait
     // for the child before reading its result; the joint path is synchronous
     // and has already populated resident_decode.result at this point.
