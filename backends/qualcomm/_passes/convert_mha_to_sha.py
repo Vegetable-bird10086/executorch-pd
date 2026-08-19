@@ -13,6 +13,7 @@ import torch
 
 from executorch.backends.qualcomm._passes.utils import find_pattern
 from executorch.backends.qualcomm.utils.constants import (
+    QCOM_AXIS,
     QCOM_BLOCK_SIZE,
     QCOM_QUANT_ATTRS,
     QCOM_REQUANTIZE,
@@ -273,6 +274,28 @@ class ConvertMhaToSha(ExportPass):
             new_args = [(arg0, *arg1) for arg0, arg1 in zip(new_arg0s, new_arg1s)]
 
             new_nodes = _split_call(node, sha, new_args, out_shape)
+
+            # QNN Concat requires every quantized input to use the output
+            # encoding.  In token-axis A8 decode, the past-V cache remains
+            # per-channel while the attention working tensor and the original
+            # cat output are per-tensor.  The original graph carries a
+            # requantize edge for that transition, but its user name is lost
+            # when MHA-to-SHA duplicates the cat per head.  Restore the edge so
+            # InsertRequantize emits an explicit PCQ -> per-tensor Convert.
+            # This does not modify the cache tensor or its 4095 axis qparams.
+            for new_node in new_nodes:
+                output_attrs = new_node.meta.get(QCOM_QUANT_ATTRS)
+                if not output_attrs or QCOM_SCALES in output_attrs:
+                    continue
+                for input_node in new_node.args[0]:
+                    if not _is_node(input_node):
+                        continue
+                    input_attrs = input_node.meta.get(QCOM_QUANT_ATTRS, {})
+                    if QCOM_SCALES not in input_attrs:
+                        continue
+                    input_node.meta.setdefault(QCOM_REQUANTIZE, {})[
+                        new_node.name
+                    ] = output_attrs.copy()
             return new_nodes
 
         def _visit_default(node, sha):
@@ -383,13 +406,25 @@ class ConvertMhaToSha(ExportPass):
             # PCQ
             if QCOM_QUANT_ATTRS in src and QCOM_SCALES in src[QCOM_QUANT_ATTRS]:
                 dst[QCOM_QUANT_ATTRS] = src[QCOM_QUANT_ATTRS].copy()
-                # slice for per channel quantize
-                dst[QCOM_QUANT_ATTRS][QCOM_SCALES] = src[QCOM_QUANT_ATTRS][
-                    QCOM_SCALES
-                ].clone()[slicer]
-                dst[QCOM_QUANT_ATTRS][QCOM_ZERO_POINTS] = src[QCOM_QUANT_ATTRS][
-                    QCOM_ZERO_POINTS
-                ].clone()[slicer]
+                # Per-axis qparams are 1-D even when the represented tensor is
+                # 3-D/4-D. Apply only the tensor slicer component belonging to
+                # the quantization axis. A split on another axis must preserve
+                # the complete qparam vector.
+                quant_attrs = src[QCOM_QUANT_ATTRS]
+                scales = quant_attrs[QCOM_SCALES].clone()
+                zero_points = quant_attrs[QCOM_ZERO_POINTS].clone()
+                quant_axis = int(quant_attrs.get(QCOM_AXIS, 0))
+                if quant_axis < 0 and "val" in src:
+                    quant_axis += src["val"].dim()
+                qparam_slicer = slice(None)
+                if isinstance(slicer, tuple) and quant_axis < len(slicer):
+                    candidate = slicer[quant_axis]
+                    if isinstance(candidate, slice):
+                        qparam_slicer = candidate
+                dst[QCOM_QUANT_ATTRS][QCOM_SCALES] = scales[qparam_slicer]
+                dst[QCOM_QUANT_ATTRS][QCOM_ZERO_POINTS] = zero_points[
+                    qparam_slicer
+                ]
 
             # LPBQ
             if QCOM_QUANT_ATTRS in src and QCOM_BLOCK_SIZE in src[QCOM_QUANT_ATTRS]:

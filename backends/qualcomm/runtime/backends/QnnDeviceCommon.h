@@ -33,6 +33,10 @@ class QnnDevice {
 
   virtual executorch::runtime::Error Configure();
 
+  // Drop any backend-specific performance vote while keeping the device and
+  // delegate contexts alive.
+  virtual void ReleasePerformanceVote() {}
+
  protected:
   virtual executorch::runtime::Error MakeConfig(
       std::vector<const QnnDevice_Config_t*>& config) {

@@ -7,7 +7,7 @@ from typing import Dict
 
 import torch
 
-from executorch.backends.qualcomm.builders.node_visitor import q_ops
+from executorch.backends.qualcomm.builders.node_visitor import dq_ops, q_ops
 
 from executorch.backends.qualcomm.builders.utils import (
     is_mutable_buffer_input,
@@ -36,6 +36,13 @@ class InsertIOQDQ(ExportPass):
         exir_ops.edge.quantized_decomposed.quantize_per_tensor.tensor: exir_ops.edge.quantized_decomposed.dequantize_per_tensor.tensor,
         # per channel
         exir_ops.edge.quantized_decomposed.quantize_per_channel.default: exir_ops.edge.quantized_decomposed.dequantize_per_channel.default,
+    }
+    dq_normalization_map = {
+        # QNN delegated graph I/O represents scale and zero-point as tensor
+        # operands, even when the source QDQ used the scalar/default overload.
+        exir_ops.edge.quantized_decomposed.dequantize_per_tensor.default: exir_ops.edge.quantized_decomposed.dequantize_per_tensor.tensor,
+        exir_ops.edge.quantized_decomposed.dequantize_per_tensor.tensor: exir_ops.edge.quantized_decomposed.dequantize_per_tensor.tensor,
+        exir_ops.edge.quantized_decomposed.dequantize_per_channel.default: exir_ops.edge.quantized_decomposed.dequantize_per_channel.default,
     }
 
     def __init__(self, edge_program: torch.export.ExportedProgram):
@@ -141,10 +148,21 @@ class InsertIOQDQ(ExportPass):
             if n.meta.get(QCOM_QUANT_ATTRS) and any(
                 user.op == "output" for user in users
             ):
+                encoding = n.meta[QCOM_QUANT_ATTRS][QCOM_ENCODING]
+                # Most output metadata records the producer quantize op, but
+                # partition boundaries created around portable fallbacks can
+                # already carry a dequantize encoding.  In that case the
+                # encoding itself is exactly the node we need to insert.
+                # Indexing q_dq_map unconditionally used to raise KeyError for
+                # these valid mixed QNN/portable boundaries.
+                dequant_target = self.q_dq_map.get(encoding)
+                if dequant_target is None:
+                    assert encoding in dq_ops, f"Unsupported IO quant encoding: {encoding}"
+                    dequant_target = self.dq_normalization_map.get(encoding, encoding)
                 self._insert_dequant_node(
                     graph_module,
                     n,
-                    self.q_dq_map[n.meta[QCOM_QUANT_ATTRS][QCOM_ENCODING]],
+                    dequant_target,
                 )
 
     def call(self, graph_module: torch.fx.GraphModule):

@@ -173,6 +173,7 @@ int run_compare(int argc, char** argv) {
   std::string original_shard_dir;
   std::string stripped_manifest_path;
   std::string gguf_model_path;
+  std::string reference_gguf_model_path;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
@@ -182,14 +183,18 @@ int run_compare(int argc, char** argv) {
       stripped_manifest_path = argv[++i];
     } else if (arg == "--gguf_model_path" && i + 1 < argc) {
       gguf_model_path = argv[++i];
+    } else if (arg == "--reference_gguf_model_path" && i + 1 < argc) {
+      reference_gguf_model_path = argv[++i];
     }
   }
 
-  if (original_shard_dir.empty() || stripped_manifest_path.empty() ||
+  if ((original_shard_dir.empty() == reference_gguf_model_path.empty()) ||
+      stripped_manifest_path.empty() ||
       gguf_model_path.empty()) {
     std::fprintf(stderr,
         "Usage: pte_rebuild_compare \\\n"
-        "    --original_shard_dir /path/to/original/shards \\\n"
+        "    (--original_shard_dir /path/to/original/shards | \\\n"
+        "     --reference_gguf_model_path /path/to/reference.gguf) \\\n"
         "    --stripped_manifest_path /path/to/shard/manifest.json \\\n"
         "    --gguf_model_path /path/to/model.gguf\n");
     return 1;
@@ -203,6 +208,16 @@ int run_compare(int argc, char** argv) {
   auto gguf_bytes = example::ReadOnlyMappedFile::open(gguf_model_path);
   auto gguf_context = example::create_pte_gguf_rebuild_context(gguf_bytes);
   ET_LOG(Info, "GGUF model size: %zu bytes (read-only mmap)", gguf_bytes->size());
+  std::shared_ptr<example::ReadOnlyMappedFile> reference_gguf_bytes;
+  std::shared_ptr<example::PteGgufRebuildContext> reference_gguf_context;
+  if (!reference_gguf_model_path.empty()) {
+    ET_LOG(Info, "Loading reference GGUF model: %s",
+        reference_gguf_model_path.c_str());
+    reference_gguf_bytes =
+        example::ReadOnlyMappedFile::open(reference_gguf_model_path);
+    reference_gguf_context =
+        example::create_pte_gguf_rebuild_context(reference_gguf_bytes);
+  }
 
   const std::string manifest = read_text_file(stripped_manifest_path);
   const std::string manifest_dir = [&]() {
@@ -255,16 +270,41 @@ int run_compare(int argc, char** argv) {
               << shard_idx << ".pte";
 
     ET_LOG(Info, "--- Shard %zu ---", shard_idx);
-    ET_LOG(Info, "  Original:  %s", orig_name.str().c_str());
+    ET_LOG(Info, "  Reference: %s",
+        reference_gguf_context ? reference_gguf_model_path.c_str()
+                               : orig_name.str().c_str());
     ET_LOG(Info, "  Stripped:  %s", stripped_path.c_str());
     ET_LOG(Info, "  Index:     %s", index_path.c_str());
 
-    const std::vector<uint8_t> original_bytes =
-        read_binary_file(orig_name.str());
     const std::vector<uint8_t> stripped_bytes =
         read_binary_file(stripped_path);
     auto index_bytes = std::make_shared<std::vector<uint8_t>>(
         read_binary_file(index_path));
+    std::vector<uint8_t> original_bytes;
+    if (reference_gguf_context) {
+      auto reference_recipe = example::prepare_pte_gguf_shard_recipe(
+          reference_gguf_context, index_bytes, 32);
+      example::PteRebuildResult reference_result =
+          example::rebuild_pte_from_stripped_gguf_recipe(
+              stripped_bytes, *reference_recipe, nullptr);
+      if (reference_result.rebuilt_pte_buffer == nullptr) {
+        ET_LOG(Error, "  REFERENCE REBUILD FAILED");
+        ++mismatched_shards;
+        continue;
+      }
+      ET_LOG(Info,
+          "  Reference rebuilt: %zu bytes  records=%zu  weight_bytes=%zu  time=%.2f ms",
+          reference_result.rebuilt_pte_buffer->size(),
+          reference_result.rebuilt_records,
+          reference_result.materialized_weight_bytes,
+          reference_result.rebuild_time_ms);
+      const example::PteRebuildBuffer& reference =
+          *reference_result.rebuilt_pte_buffer;
+      original_bytes.assign(reference.data(), reference.data() + reference.size());
+      example::discard_pte_gguf_rebuild_source_pages(reference_gguf_context);
+    } else {
+      original_bytes = read_binary_file(orig_name.str());
+    }
 
     ET_LOG(Info, "  Sizes: original=%zu stripped=%zu index=%zu",
         original_bytes.size(), stripped_bytes.size(), index_bytes->size());

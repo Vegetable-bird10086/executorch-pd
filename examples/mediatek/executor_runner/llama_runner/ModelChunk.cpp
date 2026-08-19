@@ -13,6 +13,7 @@
 #include "executorch/backends/mediatek/runtime/include/NeuronBufferAllocator.h"
 
 #include <executorch/extension/data_loader/file_data_loader.h>
+#include <executorch/extension/data_loader/buffer_data_loader.h>
 #include <executorch/extension/evalue_util/print_evalue.h>
 #include <executorch/runtime/executor/method.h>
 #include <executorch/runtime/executor/program.h>
@@ -88,6 +89,34 @@ class ModelInstance {
     mProgramInstance->program =
         std::make_unique<Program>(std::move(program_loaded.get()));
     mCachedPrograms.emplace(modelPath, mProgramInstance);
+  }
+
+  ModelInstance(
+      const std::string& modelLabel,
+      std::shared_ptr<std::vector<uint8_t>> modelBytes) {
+    ET_CHECK_MSG(
+        modelBytes != nullptr && !modelBytes->empty(),
+        "In-memory model %s is empty",
+        modelLabel.c_str());
+    ET_LOG(
+        Debug,
+        "Loading reconstructed model from memory: %s (%zu bytes)",
+        modelLabel.c_str(),
+        modelBytes->size());
+    mProgramInstance = std::make_shared<ProgramInstance>();
+    mProgramInstance->modelBytes = std::move(modelBytes);
+    mProgramInstance->dataLoader =
+        std::make_unique<executorch::extension::BufferDataLoader>(
+            mProgramInstance->modelBytes->data(),
+            mProgramInstance->modelBytes->size());
+    Result<Program> programLoaded =
+        Program::load(mProgramInstance->dataLoader.get());
+    ET_CHECK_MSG(
+        programLoaded.ok(),
+        "Failed to parse reconstructed model %s",
+        modelLabel.c_str());
+    mProgramInstance->program =
+        std::make_unique<Program>(std::move(programLoaded.get()));
   }
 
   Method& GetMethod() {
@@ -188,7 +217,8 @@ class ModelInstance {
   // The member ordering below affects the order of destruction.
 
   struct ProgramInstance {
-    std::unique_ptr<FileDataLoader> dataLoader;
+    std::shared_ptr<std::vector<uint8_t>> modelBytes;
+    std::unique_ptr<executorch::runtime::DataLoader> dataLoader;
     std::unique_ptr<Program> program;
   };
   std::shared_ptr<ProgramInstance> mProgramInstance;
@@ -284,6 +314,15 @@ bool ModelChunk::HotSwapModel(const size_t tokenBatchSize) {
   SetBackendInputs();
   SetBackendOutputs();
   return true;
+}
+
+void ModelChunk::SetModelBytes(
+    std::shared_ptr<std::vector<uint8_t>> modelBytes) {
+  ET_CHECK_MSG(!Initialized(), "SetModelBytes must be called before Initialize");
+  ET_CHECK_MSG(
+      modelBytes != nullptr && !modelBytes->empty(),
+      "Reconstructed model bytes must not be empty");
+  mModelBytes = std::move(modelBytes);
 }
 
 void ModelChunk::SetInputBuffer(
@@ -643,7 +682,9 @@ Method& ModelChunk::GetModelMethod() {
 
 // Override the virtual functions
 void* ModelChunk::CreateModelInstance(const std::string& modelPath) {
-  auto modelInstance = new ModelInstance(modelPath);
+  auto modelInstance = mModelBytes
+      ? new ModelInstance(modelPath, mModelBytes)
+      : new ModelInstance(modelPath);
   const auto selectedMethod = SelectMethod(modelInstance->GetMethodNames());
   if (!selectedMethod.empty()) {
     modelInstance->LoadMethod(selectedMethod);

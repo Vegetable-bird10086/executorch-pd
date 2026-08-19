@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from qnn_llama_quant_profile_bin import convert_profile
@@ -16,6 +17,62 @@ FIXED_POINT_DATA_TYPES = {
     "QNN_DATATYPE_SFIXED_POINT_32",
 }
 MAX_AUXILIARY_STATIC_PAYLOAD_BYTES = 1 << 20
+
+# FX assigns these suffix counters from layer zero.  A retained tail graph is
+# re-exported as a smaller GraphModule, so its counters restart at zero even
+# though decoder bindings keep the original layer ids.  Normalize only the FX
+# lookup key; QNN operation and tensor names must remain exactly as exported.
+INDEXED_FX_LAYER_STRIDES = {
+    "aten_rms_norm_default": 4,
+    "aten_matmul_default": 4,
+    "aten_mul_tensor": 10,
+    "aten_slice_copy_tensor": 4,
+    "aten_sub_tensor": 2,
+    "aten_add_tensor": 5,
+    "aten_convolution_default": 7,
+    "aten_div_tensor": 1,
+    "aten_amin_default": 1,
+    "aten_where_self": 1,
+    "aten__softmax_default": 1,
+    "aten_sigmoid_default": 1,
+}
+
+
+def normalize_supplemental_fx_names(shard):
+    layer_start = int(shard["layer_start"])
+    if layer_start <= 0:
+        return 0
+    normalized = 0
+    for operation in shard["operations"]:
+        source = operation["source"]
+        binding_layers = sorted(set(source["decoder_binding"]["layer_ids"]))
+        if len(binding_layers) != 1 or binding_layers[0] < layer_start:
+            continue
+        fx_name = source["fx_node_name"]
+        for stem, stride in INDEXED_FX_LAYER_STRIDES.items():
+            match = re.fullmatch(
+                rf"{re.escape(stem)}(?:_(\d+))?(_h_\d+)?", fx_name
+            )
+            if match is None:
+                continue
+            local_index = int(match.group(1) or 0)
+            global_floor = stride * layer_start
+            if stem == "aten_mul_tensor":
+                # The full graph consumes suffix zero for its input activation
+                # scale.  A retained tail starts directly at layer RoPE, so all
+                # of its local Mul suffixes are one lower than the full graph.
+                global_floor += 1
+            if local_index >= global_floor:
+                break
+            global_index = local_index + global_floor
+            source["fx_node_name"] = (
+                stem
+                + (f"_{global_index}" if global_index else "")
+                + (match.group(2) or "")
+            )
+            normalized += 1
+            break
+    return normalized
 
 
 def is_fixed_point_tensor(tensor):
@@ -321,17 +378,62 @@ def validate_compact_manifest(manifest, compact):
     return statistics
 
 
+def apply_supplemental_profile_shards(manifest, supplemental):
+    if supplemental.get("num_decoder_layers") != manifest.get("num_decoder_layers"):
+        raise ValueError("supplemental manifest changed decoder layer count")
+    profile = manifest["graphs"]["prefill_forward"]["llama_qnn_quant_profile"]
+    supplemental_profile = supplemental["graphs"]["prefill_forward"][
+        "llama_qnn_quant_profile"
+    ]
+    for field in (
+        "schema_version",
+        "format",
+        "capabilities",
+        "quantization_formula",
+        "gptq_source_recipe",
+    ):
+        if supplemental_profile[field] != profile[field]:
+            raise ValueError(f"supplemental manifest changed {field}")
+    shards_by_scope = {shard["scope"]: shard for shard in profile["shards"]}
+    replaced_scopes = []
+    for shard in supplemental_profile["shards"]:
+        normalize_supplemental_fx_names(shard)
+        scope = shard["scope"]
+        original = shards_by_scope.get(scope)
+        if original is None:
+            raise ValueError(f"supplemental manifest has unknown scope {scope}")
+        for field in ("layer_start", "layer_end_exclusive", "capabilities"):
+            if shard[field] != original[field]:
+                raise ValueError(f"supplemental scope {scope} changed {field}")
+        shards_by_scope[scope] = shard
+        replaced_scopes.append(scope)
+    if not replaced_scopes:
+        raise ValueError("supplemental manifest contains no profile shards")
+    profile["shards"] = [shards_by_scope[shard["scope"]] for shard in profile["shards"]]
+    return replaced_scopes
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Strip a full QNN shard manifest to the exact runtime U16 ABI."
+        description="Strip a full QNN shard manifest to its exact runtime activation ABI."
     )
     parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument(
+        "--supplemental-manifest",
+        action="append",
+        default=[],
+        type=Path,
+        help=(
+            "replace matching profile shard scopes before compaction; useful when "
+            "a no-output graph prunes decode-only projections"
+        ),
+    )
     parser.add_argument("--gguf", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument(
         "--bin-out",
         type=Path,
-        help="mmap runtime profile (default: JSON output with .bin suffix)",
+        help="V5 sidecar metadata (default: JSON output with .meta suffix)",
     )
     parser.add_argument(
         "--bin-converter",
@@ -341,21 +443,31 @@ def main():
 
     with args.manifest.open("r", encoding="utf-8") as source:
         manifest = json.load(source)
+    replaced_scopes = []
+    for supplemental_path in args.supplemental_manifest:
+        with supplemental_path.open("r", encoding="utf-8") as source:
+            supplemental = json.load(source)
+        replaced_scopes.extend(
+            apply_supplemental_profile_shards(manifest, supplemental)
+        )
     compact = compact_manifest(manifest)
     statistics = validate_compact_manifest(manifest, compact)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as destination:
         json.dump(compact, destination, separators=(",", ":"), sort_keys=True)
         destination.write("\n")
-    binary_out = args.bin_out or args.out.with_suffix(".bin")
+    binary_out = args.bin_out or args.out.with_suffix(".meta")
     convert_profile(args.out, args.gguf, binary_out, args.bin_converter)
+    payload_out = binary_out.with_suffix(".bin")
 
     print(
-        "QNN runtime U16 profile: "
+        "QNN runtime activation profile: "
         f"verified={json.dumps(statistics, sort_keys=True)} "
+        f"supplemental_scopes={json.dumps(replaced_scopes)} "
         f"shards={len(compact['graphs']['prefill_forward']['llama_qnn_quant_profile']['shards'])} "
         f"json_bytes={args.out.stat().st_size} json_out={args.out} "
-        f"bin_bytes={binary_out.stat().st_size} bin_out={binary_out}"
+        f"meta_bytes={binary_out.stat().st_size} meta_out={binary_out} "
+        f"payload_bytes={payload_out.stat().st_size} payload_out={payload_out}"
     )
 
 

@@ -338,6 +338,11 @@ class ModelChunk(BaseModelChunk):
                 for _ in range(num_blocks)
             ]
         )
+        # Prefill/Decode separation may only need the KV side effects from the
+        # final chunk.  When enabled, export a KV-only ABI so torch.export can
+        # prune the unused final hidden-state path just like QNN no-output
+        # prefill.  This must only be enabled on a tail-less final chunk.
+        self.prefill_no_output = False
 
         if self.config.use_stable_embedding and self.chunk_idx == 0:
             self.embed_layer_norm = nn.LayerNorm(config.hidden_size).float()
@@ -401,6 +406,9 @@ class ModelChunk(BaseModelChunk):
                 )
             hidden_states = self.lm_head(hidden_states)
 
+        if self.prefill_no_output:
+            assert not self.include_tail
+            return *next_key_cache, *next_value_cache
         if self.return_attn:
             return hidden_states, *next_key_cache, *next_value_cache, *attn_outputs
         return hidden_states, *next_key_cache, *next_value_cache

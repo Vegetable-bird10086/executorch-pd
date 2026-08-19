@@ -16,6 +16,7 @@
 #include <executorch/runtime/core/portable_type/half.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -519,8 +520,15 @@ void DecoderRunner::set_prefill_etdump_config(PrefillEtDumpConfig config) {
 std::shared_ptr<PteRebuildBuffer> DecoderRunner::acquire_prefill_rebuild_buffer(
     size_t required_size) {
   std::shared_ptr<PteRebuildBuffer> buffer;
+  std::shared_ptr<PteRebuildBuffer> undersized_buffer;
+  size_t pool_size_before = 0;
+  size_t pool_size_after = 0;
+  size_t undersized_capacity = 0;
+  const bool pool_diag =
+      std::getenv("ET_PREFILL_REBUILD_BUFFER_POOL_DIAG") != nullptr;
   {
     std::lock_guard<std::mutex> lock(prefill_rebuild_buffer_pool_mutex_);
+    pool_size_before = prefill_rebuild_buffer_pool_.size();
     auto it = std::find_if(
         prefill_rebuild_buffer_pool_.begin(),
         prefill_rebuild_buffer_pool_.end(),
@@ -530,10 +538,35 @@ std::shared_ptr<PteRebuildBuffer> DecoderRunner::acquire_prefill_rebuild_buffer(
     if (it != prefill_rebuild_buffer_pool_.end()) {
       buffer = std::move(*it);
       prefill_rebuild_buffer_pool_.erase(it);
+    } else if (!prefill_rebuild_buffer_pool_.empty()) {
+      // If the closest idle buffer is no more than 50% smaller than the
+      // request, replace it instead of retaining almost the same allocation
+      // and creating another full-size PTE buffer beside it.
+      auto closest = std::max_element(
+          prefill_rebuild_buffer_pool_.begin(),
+          prefill_rebuild_buffer_pool_.end(),
+          [](const std::shared_ptr<PteRebuildBuffer>& lhs,
+             const std::shared_ptr<PteRebuildBuffer>& rhs) {
+            return lhs->capacity() < rhs->capacity();
+          });
+      const size_t closest_capacity = (*closest)->capacity();
+      if (closest_capacity > 0 && required_size > closest_capacity &&
+          required_size - closest_capacity <= closest_capacity / 2) {
+        undersized_capacity = closest_capacity;
+        undersized_buffer = std::move(*closest);
+        prefill_rebuild_buffer_pool_.erase(closest);
+      }
     }
+    pool_size_after = prefill_rebuild_buffer_pool_.size();
   }
 
   const bool reused = buffer != nullptr;
+  const bool enlarged = undersized_buffer != nullptr;
+  const void* replaced_address = undersized_buffer.get();
+  // PteRebuildBuffer::resize_uninitialized() allocates the larger array before
+  // resetting the old unique_ptr. Destroy the idle buffer explicitly first so
+  // enlargement does not create a transient double-allocation peak.
+  undersized_buffer.reset();
   if (!reused) {
     buffer = std::make_shared<PteRebuildBuffer>(required_size);
   } else {
@@ -541,10 +574,23 @@ std::shared_ptr<PteRebuildBuffer> DecoderRunner::acquire_prefill_rebuild_buffer(
   }
   ET_LOG(
       Info,
-      "prefill rebuild buffer: required_bytes=%zu capacity_bytes=%zu reused=%d",
+      "prefill rebuild buffer: required_bytes=%zu capacity_bytes=%zu reused=%d "
+      "enlarged=%d replaced_capacity_bytes=%zu",
       required_size,
       buffer->capacity(),
-      static_cast<int>(reused));
+      static_cast<int>(reused),
+      static_cast<int>(enlarged),
+      undersized_capacity);
+  if (pool_diag) {
+    ET_LOG(
+        Info,
+        "prefill rebuild buffer pool acquire: buffer=%p replaced_buffer=%p "
+        "pool_before=%zu pool_after=%zu",
+        static_cast<void*>(buffer.get()),
+        const_cast<void*>(replaced_address),
+        pool_size_before,
+        pool_size_after);
+  }
   return buffer;
 }
 
@@ -554,13 +600,27 @@ void DecoderRunner::release_prefill_rebuild_buffer(
     return;
   }
   buffer->resize_uninitialized(0);
-  const size_t retained_buffer_count =
-      prefill_shard_rebuild_.pipeline_qnn_load ? 3 : 1;
+  const size_t retained_buffer_count = prefill_shard_rebuild_.pipeline_qnn_load
+      ? (prefill_shard_rebuild_.detach_all_qnn_after_load ? 2 : 3)
+      : 1;
+  const bool pool_diag =
+      std::getenv("ET_PREFILL_REBUILD_BUFFER_POOL_DIAG") != nullptr;
+  const void* released_address = buffer.get();
+  const size_t released_capacity = buffer->capacity();
+  size_t pool_size_before = 0;
+  size_t pool_size_after = 0;
+  size_t idle_capacity_after = 0;
+  bool retained = false;
   std::shared_ptr<PteRebuildBuffer> discarded;
   {
     std::lock_guard<std::mutex> lock(prefill_rebuild_buffer_pool_mutex_);
-    if (prefill_rebuild_buffer_pool_.size() < retained_buffer_count) {
+    pool_size_before = prefill_rebuild_buffer_pool_.size();
+    if (!prefill_rebuild_buffer_pool_accepting_) {
+      discarded = std::move(buffer);
+    } else if (
+        prefill_rebuild_buffer_pool_.size() < retained_buffer_count) {
       prefill_rebuild_buffer_pool_.push_back(std::move(buffer));
+      retained = true;
     } else {
       auto smallest = std::min_element(
           prefill_rebuild_buffer_pool_.begin(),
@@ -573,10 +633,34 @@ void DecoderRunner::release_prefill_rebuild_buffer(
           (*smallest)->capacity() < buffer->capacity()) {
         discarded = std::move(*smallest);
         *smallest = std::move(buffer);
+        retained = true;
       } else {
         discarded = std::move(buffer);
       }
     }
+    pool_size_after = prefill_rebuild_buffer_pool_.size();
+    if (pool_diag) {
+      idle_capacity_after = std::accumulate(
+          prefill_rebuild_buffer_pool_.begin(),
+          prefill_rebuild_buffer_pool_.end(),
+          size_t{0},
+          [](size_t total, const std::shared_ptr<PteRebuildBuffer>& candidate) {
+            return total + candidate->capacity();
+          });
+    }
+  }
+  if (pool_diag) {
+    ET_LOG(
+        Info,
+        "prefill rebuild buffer pool release: buffer=%p capacity_bytes=%zu "
+        "retained=%d pool_before=%zu pool_after=%zu "
+        "idle_capacity_after_bytes=%zu",
+        const_cast<void*>(released_address),
+        released_capacity,
+        static_cast<int>(retained),
+        pool_size_before,
+        pool_size_after,
+        idle_capacity_after);
   }
 }
 
@@ -702,29 +786,32 @@ PteRebuildResult DecoderRunner::rebuild_prefill_shard(
       "Prefill shard inputs were not preloaded: %s",
       shard.pte_path.c_str());
 
+  PteRebuildResult result;
   switch (prefill_shard_rebuild_.source_kind) {
     case PrefillShardRebuildConfig::SourceKind::QatCheckpoint:
       ET_CHECK_MSG(
           shard.qat_rebuild_recipe != nullptr,
           "QAT rebuild recipe was not prepared: %s",
           shard.pte_path.c_str());
-      return rebuild_pte_from_stripped_checkpoint_recipe(
+      result = rebuild_pte_from_stripped_checkpoint_recipe(
           *shard.stripped_pte_bytes,
           *shard.qat_rebuild_recipe,
           acquire_prefill_rebuild_buffer(
               pte_rebuild_output_size(*shard.qat_rebuild_recipe)));
+      break;
     case PrefillShardRebuildConfig::SourceKind::TmacGguf:
-      return rebuild_pte_from_stripped_tmac_gguf(
+      result = rebuild_pte_from_stripped_tmac_gguf(
           *shard.stripped_pte_bytes,
           *shard.index_bytes,
           *prefill_shard_rebuild_.source_bytes);
+      break;
     case PrefillShardRebuildConfig::SourceKind::Gguf:
       ET_CHECK_MSG(
           shard.gguf_rebuild_recipe != nullptr,
           "GGUF rebuild recipe was not prepared: %s",
           shard.pte_path.c_str());
       {
-        auto result = rebuild_pte_from_stripped_gguf_recipe(
+        result = rebuild_pte_from_stripped_gguf_recipe(
           *shard.stripped_pte_bytes,
           *shard.gguf_rebuild_recipe,
           acquire_prefill_rebuild_buffer(
@@ -732,13 +819,23 @@ PteRebuildResult DecoderRunner::rebuild_prefill_shard(
 #ifndef QNN_LLAMA_PD_JOINT
         discard_pte_gguf_rebuild_source_pages(prefill_gguf_rebuild_context_);
 #endif
-        return result;
+        break;
       }
     case PrefillShardRebuildConfig::SourceKind::None:
       ET_CHECK_MSG(false, "Invalid prefill shard rebuild source");
   }
-  ET_CHECK_MSG(false, "Unhandled prefill shard rebuild source");
-  return {};
+  if (prefill_shard_rebuild_.release_stripped_pte_after_rebuild) {
+    const size_t released_bytes = shard.stripped_pte_bytes
+        ? shard.stripped_pte_bytes->size()
+        : 0;
+    shard.stripped_pte_bytes.reset();
+    ET_LOG(
+        Info,
+        "released stripped PTE after rebuild: shard=%zu bytes=%zu",
+        shard.shard_index,
+        released_bytes);
+  }
+  return result;
 }
 
 void DecoderRunner::attach_rebuilt_prefill_shard(
@@ -799,13 +896,55 @@ void DecoderRunner::materialize_prefill_shard(PrefillShardPlan& shard) {
 }
 
 void DecoderRunner::release_prefill_shard(PrefillShardPlan& shard) {
+  shard.detached_qnn_execution.reset();
   if (!shard.rebuild_on_execute) {
+    // Standalone complete shard PTEs must be streamed just like rebuilt
+    // shards. Keeping every QNN method resident exhausts HTP context/PD
+    // resources before the combined decode method can be initialized.
+    shard.module.reset();
     return;
   }
   shard.module.reset();
   shard.rebuilt_pte_bytes.reset();
   auto rebuild_buffer = std::move(shard.rebuilt_pte_buffer);
   release_prefill_rebuild_buffer(std::move(rebuild_buffer));
+}
+
+void DecoderRunner::release_prefill_shard_backing_after_load(
+    PrefillShardPlan& shard) {
+  if (!prefill_shard_rebuild_.release_rebuilt_pte_backing_after_load ||
+      !shard.rebuild_on_execute) {
+    return;
+  }
+
+  const size_t vector_bytes =
+      shard.rebuilt_pte_bytes ? shard.rebuilt_pte_bytes->size() : 0;
+  const size_t pooled_bytes =
+      shard.rebuilt_pte_buffer ? shard.rebuilt_pte_buffer->capacity() : 0;
+  ET_CHECK_MSG(
+      vector_bytes > 0 || pooled_bytes > 0,
+      "Experimental post-load PTE release found no backing: shard=%zu",
+      shard.shard_index);
+
+  const auto memory_before = process_memory_snapshot();
+  shard.rebuilt_pte_bytes.reset();
+  auto rebuild_buffer = std::move(shard.rebuilt_pte_buffer);
+  release_prefill_rebuild_buffer(std::move(rebuild_buffer));
+  const auto memory_after = process_memory_snapshot();
+  ET_LOG(
+      Info,
+      "experimental post-load PTE backing released: shard=%zu "
+      "vector_bytes=%zu pooled_capacity_bytes=%zu rss_before_mib=%.2f "
+      "rss_after_mib=%.2f module_alive=%d method_loaded=%d",
+      shard.shard_index,
+      vector_bytes,
+      pooled_bytes,
+      memory_before.rss_bytes / (1024.0 * 1024.0),
+      memory_after.rss_bytes / (1024.0 * 1024.0),
+      static_cast<int>(shard.module != nullptr),
+      static_cast<int>(
+          shard.module != nullptr &&
+          shard.module->is_method_loaded(shard.method_name)));
 }
 
 Error DecoderRunner::load_prefill_shard_method(PrefillShardPlan& shard) {
@@ -885,6 +1024,41 @@ Error DecoderRunner::load_prefill_shard_method(PrefillShardPlan& shard) {
         shard.module->set_output(shard.method_name, shard.output_tensors[i], i));
   }
   shard.runtime_stats.output_binding_ms += elapsed_ms(output_binding_start);
+  const bool detach_qnn_execution =
+      prefill_shard_rebuild_.detach_all_qnn_after_load ||
+      (prefill_shard_rebuild_.detach_shard0_qnn_after_load &&
+       shard.shard_index == 0);
+  if (detach_qnn_execution) {
+    shard.detached_qnn_execution =
+        executorch::backends::qnn::AcquireLastInitializedQnnExecution(
+            shard.method_name.c_str());
+    ET_CHECK_MSG(
+        shard.detached_qnn_execution != nullptr,
+        "Unable to detach initialized QNN execution for shard %zu",
+        shard.shard_index);
+    const size_t vector_bytes =
+        shard.rebuilt_pte_bytes ? shard.rebuilt_pte_bytes->size() : 0;
+    const size_t pooled_bytes =
+        shard.rebuilt_pte_buffer ? shard.rebuilt_pte_buffer->capacity() : 0;
+    const auto memory_before = process_memory_snapshot();
+    shard.module.reset();
+    shard.rebuilt_pte_bytes.reset();
+    auto rebuild_buffer = std::move(shard.rebuilt_pte_buffer);
+    release_prefill_rebuild_buffer(std::move(rebuild_buffer));
+    const auto memory_after = process_memory_snapshot();
+    ET_LOG(
+        Info,
+        "detached QNN execution at load tail: shard=%zu module_alive=0 "
+        "pte_vector_bytes=%zu pte_buffer_capacity_bytes=%zu "
+        "rss_before_mib=%.2f rss_after_mib=%.2f",
+        shard.shard_index,
+        vector_bytes,
+        pooled_bytes,
+        memory_before.rss_bytes / (1024.0 * 1024.0),
+        memory_after.rss_bytes / (1024.0 * 1024.0));
+  } else {
+    release_prefill_shard_backing_after_load(shard);
+  }
   return Error::Ok;
 }
 
@@ -1031,8 +1205,9 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
       prefill_persistent_shard0_prepared_ ? 1 : 0;
   if (prefill_persistent_shard0_prepared_) {
     ET_CHECK_MSG(
-        prefill_shards_.front().module != nullptr,
-        "Persistent shard 0 is marked prepared without a live module");
+        prefill_shards_.front().module != nullptr ||
+            prefill_shards_.front().detached_qnn_execution != nullptr,
+        "Persistent shard 0 is marked prepared without an execution owner");
     pipeline->rebuilt[0] = true;
     pipeline->loaded[0] = true;
   }
@@ -1041,6 +1216,10 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
   auto* state = pipeline.get();
   prefill_shard_three_stage_pipeline_ = std::move(pipeline);
 
+  {
+    std::lock_guard<std::mutex> lock(prefill_rebuild_buffer_pool_mutex_);
+    prefill_rebuild_buffer_pool_accepting_ = true;
+  }
   state->rebuild_worker =
       std::thread([this, state, shard_count, first_pipeline_shard]() {
     for (size_t shard_index = first_pipeline_shard;
@@ -1056,8 +1235,8 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
         }
       }
 
-      PteRebuildResult rebuild_result =
-          rebuild_prefill_shard(prefill_shards_[shard_index]);
+      auto& shard = prefill_shards_[shard_index];
+      PteRebuildResult rebuild_result = rebuild_prefill_shard(shard);
       {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->stop) {
@@ -1068,6 +1247,28 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
       }
       state->cv.notify_all();
     }
+
+    std::vector<std::shared_ptr<PteRebuildBuffer>> stale_idle_buffers;
+    {
+      std::lock_guard<std::mutex> lock(prefill_rebuild_buffer_pool_mutex_);
+      prefill_rebuild_buffer_pool_accepting_ = false;
+      stale_idle_buffers.swap(prefill_rebuild_buffer_pool_);
+    }
+    const size_t stale_idle_capacity = std::accumulate(
+        stale_idle_buffers.begin(),
+        stale_idle_buffers.end(),
+        size_t{0},
+        [](size_t total, const std::shared_ptr<PteRebuildBuffer>& buffer) {
+          return total + (buffer ? buffer->capacity() : 0);
+        });
+    stale_idle_buffers.clear();
+    ET_LOG(
+        Info,
+        "prefill rebuild worker complete: future_acquire=0 "
+        "released_idle_capacity=%zu stripped_inputs_retained=%d",
+        stale_idle_capacity,
+        static_cast<int>(
+            !prefill_shard_rebuild_.release_stripped_pte_after_rebuild));
   });
 
   state->load_worker =
@@ -1116,10 +1317,13 @@ void DecoderRunner::start_prefill_shard_three_stage_pipeline() {
   ET_LOG(
       Info,
       "three-stage prefill pipeline started: rebuild_worker=1 load_worker=1 "
-      "shards=%zu first_pipeline_shard=%zu persistent_shard0=%d",
+      "shards=%zu first_pipeline_shard=%zu persistent_shard0=%d "
+      "rebuild_buffer_pool_limit=%zu detach_all_qnn_after_load=%d",
       shard_count,
       first_pipeline_shard,
-      static_cast<int>(prefill_persistent_shard0_prepared_));
+      static_cast<int>(prefill_persistent_shard0_prepared_),
+      prefill_shard_rebuild_.detach_all_qnn_after_load ? size_t{2} : size_t{3},
+      static_cast<int>(prefill_shard_rebuild_.detach_all_qnn_after_load));
 }
 
 void DecoderRunner::stop_prefill_shard_three_stage_pipeline() {
@@ -1191,6 +1395,8 @@ void DecoderRunner::configure_prefill_shards(
   prefill_has_window_attention_mask_ = has_window_attention_mask;
   prefill_shards_.clear();
   prefill_shards_.reserve(prefill_shard_paths_.size());
+  prefill_intermediate_aux_workspace_.clear();
+  prefill_intermediate_hidden_workspace_.clear();
 
   if (prefill_qwen3_static_plan_) {
     configure_qwen3_static_prefill_shards();
@@ -1262,6 +1468,19 @@ void DecoderRunner::configure_prefill_shards(
           shard.input_bindings.push_back(
               {PrefillShardPlan::InputKind::KCache, k_seen++});
         }
+      } else if (
+          prefill_separate_embed_ && shard.layer_offset == 0 &&
+          input_meta->sizes().size() == 3 &&
+          !is_mask_tensor(*input_meta, prompt_ar_len, context_len)) {
+        // With a separate embedding matrix, shard 0 receives hidden states
+        // instead of token ids. In split graphs it may follow position/mask.
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Tokens, 0});
+      } else if (
+          prefill_separate_embed_ && shard.layer_offset == 0 &&
+          is_rank2_integral_tensor(*input_meta)) {
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Position, 0});
       } else if (
           (i == 0 && input_meta->sizes().size() == 3) ||
           is_rank2_integral_tensor(*input_meta) ||
@@ -1343,6 +1562,8 @@ void DecoderRunner::configure_prefill_shards(
           load_prefill_shard_method(shard) == Error::Ok,
           "Unable to load ETDump shard %zu during configuration",
           shard.shard_index);
+    } else {
+      release_prefill_shard(shard);
     }
     prefill_shards_.push_back(std::move(shard));
   }
@@ -1381,6 +1602,28 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
       "Invalid Qwen3 static prefill metadata: aux_size=%d hidden_size=%d",
       prefill_static_aux_size_,
       prefill_static_hidden_size_);
+
+  prefill_intermediate_aux_workspace_.reserve(2);
+  for (size_t i = 0; i < 2; ++i) {
+    prefill_intermediate_aux_workspace_.push_back(make_tensor_ptr_from_sizes(
+        {prefill_prompt_ar_len_, prefill_static_aux_size_}, activation_type));
+  }
+  prefill_intermediate_hidden_workspace_.reserve(2);
+  for (size_t i = 0; i < 2; ++i) {
+    prefill_intermediate_hidden_workspace_.push_back(make_tensor_ptr_from_sizes(
+        {1, prefill_prompt_ar_len_, prefill_static_hidden_size_},
+        activation_type));
+  }
+  const size_t intermediate_workspace_bytes =
+      prefill_intermediate_aux_workspace_[0]->nbytes() +
+      prefill_intermediate_aux_workspace_[1]->nbytes() +
+      prefill_intermediate_hidden_workspace_[0]->nbytes() +
+      prefill_intermediate_hidden_workspace_[1]->nbytes();
+  ET_LOG(
+      Info,
+      "configured qwen3 prefill intermediate workspace: hidden_slots=2 "
+      "aux_tensors=2 bytes=%zu",
+      intermediate_workspace_bytes);
 
   size_t layer_offset = 0;
   for (size_t shard_index = 0; shard_index < prefill_shard_paths_.size(); ++shard_index) {
@@ -1428,12 +1671,10 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
 
     size_t owned_aux = 0;
     if (shard_index == 0) {
-      shard.owned_outputs.push_back(make_tensor_ptr_from_sizes(
-          {prefill_prompt_ar_len_, prefill_static_aux_size_}, activation_type));
+      shard.owned_outputs.push_back(prefill_intermediate_aux_workspace_[0]);
       shard.output_bindings.push_back(
           {PrefillShardPlan::OutputKind::IntermediateAux, 0, owned_aux++});
-      shard.owned_outputs.push_back(make_tensor_ptr_from_sizes(
-          {prefill_prompt_ar_len_, prefill_static_aux_size_}, activation_type));
+      shard.owned_outputs.push_back(prefill_intermediate_aux_workspace_[1]);
       shard.output_bindings.push_back(
           {PrefillShardPlan::OutputKind::IntermediateAux, 1, owned_aux++});
     }
@@ -1449,8 +1690,8 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
             {PrefillShardPlan::OutputKind::FinalLogits, 0, static_cast<size_t>(-1)});
       }
     } else {
-      shard.owned_outputs.push_back(make_tensor_ptr_from_sizes(
-          {1, prefill_prompt_ar_len_, prefill_static_hidden_size_}, activation_type));
+      shard.owned_outputs.push_back(
+          prefill_intermediate_hidden_workspace_[shard_index % 2]);
       shard.output_bindings.push_back(
           {PrefillShardPlan::OutputKind::IntermediateHidden,
            0,
@@ -1574,7 +1815,7 @@ bool DecoderRunner::is_method_loaded(
       bool shard_methods_loaded = true;
       for (const auto& shard : prefill_shards_) {
         shard_methods_loaded &=
-            shard.rebuild_on_execute ||
+            shard.module == nullptr || shard.rebuild_on_execute ||
             (shard.module != nullptr && shard.module->is_method_loaded(shard.method_name));
       }
       method_loaded &= shard_methods_loaded;
@@ -1652,25 +1893,26 @@ bool DecoderRunner::uses_prefill_shard_stage_major() const {
       prefill_qwen3_static_plan_ && !prefill_shards_.empty();
 }
 
-void DecoderRunner::prepare_final_prefill_shard_overlap() {
+bool DecoderRunner::prepare_final_prefill_shard_overlap() {
   ET_CHECK_MSG(
       uses_prefill_shard_stage_major() && !prefill_shards_.empty(),
       "Final-shard overlap preparation requires stage-major prefill");
 
-  if (prefill_shard_rebuild_.retain_session_rebuild_resources) {
+  // In the three-stage pipeline, end_prefill_shard_stage() has already waited
+  // for the final shard to finish loading before PromptProcessor reaches it.
+  // Serial and rebuild-only stage-major paths have not loaded that shard yet,
+  // so defer the final handoff callback until that shard is ready.
+  if (prefill_shards_.back().module == nullptr &&
+      prefill_shards_.back().runtime_stats.execution_count == 0) {
     ET_LOG(
         Info,
-        "retaining Prefill rebuild resources for the next session request");
-    if (prefill_shard_rebuild_.final_shard_overlap_callback) {
-      auto callback = std::exchange(
-          prefill_shard_rebuild_.final_shard_overlap_callback, {});
-      callback();
-    }
-    return;
+        "deferring final Prefill resource release until the final shard is loaded");
+    return false;
   }
 
-  // end_prefill_shard_stage() waits for the following shard to finish loading,
-  // so at this point the final PTE no longer depends on the GGUF rebuild source.
+  // Only idle rebuilt-PTE work buffers are request-scoped. Stripped PTEs,
+  // indexes, recipes, and their source context remain alive for the runner
+  // session so a subsequent Prefill does not reload or reparse them.
   const auto release_start = SteadyClock::now();
   const auto memory_before = process_memory_snapshot();
   std::vector<std::shared_ptr<PteRebuildBuffer>> idle_rebuild_buffers;
@@ -1687,34 +1929,35 @@ void DecoderRunner::prepare_final_prefill_shard_overlap() {
       });
   idle_rebuild_buffers.clear();
 
-  prefill_gguf_rebuild_context_.reset();
-  prefill_shard_rebuild_.mapped_source_bytes.reset();
-  prefill_shard_rebuild_.source_bytes.reset();
-  for (auto& shard : prefill_shards_) {
-    shard.stripped_pte_bytes.reset();
-    shard.index_bytes.reset();
-    shard.gguf_rebuild_recipe.reset();
-  }
   const auto memory_after = process_memory_snapshot();
 
   ET_LOG(
       Info,
       "final prefill shard overlap ready: released_idle_rebuild_capacity=%zu "
-      "release_ms=%.3f rss_before_mib=%.2f rss_after_mib=%.2f",
+      "release_ms=%.3f rss_before_mib=%.2f rss_after_mib=%.2f "
+      "stripped_inputs_retained=%d",
       released_rebuild_capacity,
       elapsed_ms(release_start),
       memory_before.rss_bytes / (1024.0 * 1024.0),
-      memory_after.rss_bytes / (1024.0 * 1024.0));
+      memory_after.rss_bytes / (1024.0 * 1024.0),
+      static_cast<int>(
+          !prefill_shard_rebuild_.release_stripped_pte_after_rebuild));
   if (prefill_shard_rebuild_.final_shard_overlap_callback) {
     auto callback = std::exchange(
         prefill_shard_rebuild_.final_shard_overlap_callback, {});
     callback();
   }
+  return true;
 }
 
 void DecoderRunner::set_prefill_shard_release_callback(
     std::function<void(size_t, size_t, size_t)> callback) {
   prefill_shard_release_callback_ = std::move(callback);
+}
+
+void DecoderRunner::set_prefill_active_execute_callback(
+    std::function<void()> callback) {
+  prefill_active_execute_callback_ = std::move(callback);
 }
 
 size_t DecoderRunner::prefill_shard_count() const {
@@ -1756,7 +1999,7 @@ Error DecoderRunner::begin_prefill_shard_stage(size_t shard_index) {
     shard.runtime_stats.pipeline_wait_ms +=
         wait_for_prefill_shard_three_stage_load(shard_index);
     ET_CHECK_MSG(
-        shard.module != nullptr,
+        shard.module != nullptr || shard.detached_qnn_execution != nullptr,
         "Three-stage pipeline did not load prefill shard %zu",
         shard_index);
     permit_prefill_shard_three_stage_pipeline(
@@ -2007,7 +2250,34 @@ DecoderRunner::execute_prefill_shard(
   }
 
   const auto execute_start = SteadyClock::now();
-  auto outputs_res = shard.module->execute(shard.method_name, shard_inputs);
+  if (shard.runtime_stats.execution_count == 1 &&
+      prefill_shard_rebuild_.shard_execute_begin_callback) {
+    prefill_shard_rebuild_.shard_execute_begin_callback(shard.shard_index);
+  }
+  if (shard.shard_index == 0 && prefill_active_execute_callback_) {
+    auto callback = std::exchange(prefill_active_execute_callback_, {});
+    callback();
+  }
+  std::optional<Result<std::vector<EValue>>> outputs_res;
+  const bool detached_execute = shard.detached_qnn_execution != nullptr;
+  if (detached_execute) {
+    std::vector<EValue> detached_args = shard_inputs;
+    detached_args.reserve(shard_inputs.size() + shard.output_tensors.size());
+    for (const auto& output_tensor : shard.output_tensors) {
+      detached_args.emplace_back(output_tensor);
+    }
+    std::vector<EValue*> detached_arg_ptrs;
+    detached_arg_ptrs.reserve(detached_args.size());
+    for (auto& arg : detached_args) {
+      detached_arg_ptrs.push_back(&arg);
+    }
+    ET_CHECK_OK_OR_RETURN_ERROR(shard.detached_qnn_execution->execute(
+        executorch::runtime::Span<EValue*>(
+            detached_arg_ptrs.data(), detached_arg_ptrs.size())));
+  } else {
+    outputs_res.emplace(
+        shard.module->execute(shard.method_name, shard_inputs));
+  }
   shard.runtime_stats.execute_ms += elapsed_ms(execute_start);
   const auto memory_after_execute = process_memory_snapshot();
   record_memory_peak(
@@ -2016,31 +2286,35 @@ DecoderRunner::execute_prefill_shard(
   record_memory_peak(
       &shard.runtime_stats.hwm_after_execute_bytes,
       memory_after_execute.hwm_bytes);
-  ET_CHECK_OK_OR_RETURN_ERROR(outputs_res.error());
-  ET_CHECK_MSG(
-      outputs_res->size() == shard.output_tensors.size(),
-      "Shard output count mismatch: returned=%zu bound=%zu",
-      outputs_res->size(),
-      shard.output_tensors.size());
   const auto output_copy_start = SteadyClock::now();
-  for (size_t i = 0; i < outputs_res->size(); ++i) {
+  if (!detached_execute) {
+    ET_CHECK_MSG(outputs_res.has_value(), "Missing Module execution result");
+    ET_CHECK_OK_OR_RETURN_ERROR(outputs_res->error());
     ET_CHECK_MSG(
-        outputs_res.get()[i].isTensor(),
-        "Non Tensor Output returned from prefill shard");
-    if (shard_tensor_dump_enabled() &&
-        shard.output_bindings[i].kind !=
-            PrefillShardPlan::OutputKind::FinalKCache &&
-        shard.output_bindings[i].kind !=
-            PrefillShardPlan::OutputKind::FinalVCache) {
-      dump_prefill_shard_tensor(
-          shard.layer_offset,
-          shard.runtime_stats.execution_count,
-          "runtime_output",
-          "pre_copy",
-          i,
-          outputs_res.get()[i].toTensor());
+        outputs_res->get().size() == shard.output_tensors.size(),
+        "Shard output count mismatch: returned=%zu bound=%zu",
+        outputs_res->get().size(),
+        shard.output_tensors.size());
+    for (size_t i = 0; i < outputs_res->get().size(); ++i) {
+      ET_CHECK_MSG(
+          outputs_res->get()[i].isTensor(),
+          "Non Tensor Output returned from prefill shard");
+      if (shard_tensor_dump_enabled() &&
+          shard.output_bindings[i].kind !=
+              PrefillShardPlan::OutputKind::FinalKCache &&
+          shard.output_bindings[i].kind !=
+              PrefillShardPlan::OutputKind::FinalVCache) {
+        dump_prefill_shard_tensor(
+            shard.layer_offset,
+            shard.runtime_stats.execution_count,
+            "runtime_output",
+            "pre_copy",
+            i,
+            outputs_res->get()[i].toTensor());
+      }
+      copy_tensor_data(
+          outputs_res->get()[i].toTensor(), shard.output_tensors[i]);
     }
-    copy_tensor_data(outputs_res.get()[i].toTensor(), shard.output_tensors[i]);
   }
   shard.runtime_stats.output_copy_ms += elapsed_ms(output_copy_start);
   ET_CHECK_OK_OR_RETURN_ERROR(write_prefill_etdump(shard));
@@ -2111,7 +2385,10 @@ DecoderRunner::step_prefill_shard_stage(
       "Stage-major prefill is not enabled");
   ET_CHECK_MSG(shard_index < prefill_shards_.size(), "Invalid prefill shard index %zu", shard_index);
   auto& shard = prefill_shards_[shard_index];
-  ET_CHECK_MSG(shard.module != nullptr, "Prefill shard %zu was not started", shard_index);
+  ET_CHECK_MSG(
+      shard.module != nullptr || shard.detached_qnn_execution != nullptr,
+      "Prefill shard %zu was not started",
+      shard_index);
   ++shard.runtime_stats.execution_count;
   return execute_prefill_shard(shard, inputs, previous_stage);
 }
@@ -2122,7 +2399,10 @@ Error DecoderRunner::end_prefill_shard_stage(size_t shard_index) {
       prefill_shard_stage_starts_.size() == prefill_shards_.size(),
       "Prefill shard stage timing is not initialized");
   auto& shard = prefill_shards_[shard_index];
-  ET_CHECK_MSG(shard.module != nullptr, "Prefill shard %zu was not started", shard_index);
+  ET_CHECK_MSG(
+      shard.module != nullptr || shard.detached_qnn_execution != nullptr,
+      "Prefill shard %zu was not started",
+      shard_index);
   if (uses_prefill_shard_three_stage_pipeline() &&
       shard_index + 1 < prefill_shards_.size()) {
     auto& next_shard = prefill_shards_[shard_index + 1];
@@ -2130,11 +2410,44 @@ Error DecoderRunner::end_prefill_shard_stage(size_t shard_index) {
         wait_for_prefill_shard_three_stage_load(shard_index + 1);
   }
   const bool retain_shard =
-      shard_index == 0 && prefill_persistent_shard0_prepared_;
+      shard_index == 0 && prefill_persistent_shard0_prepared_ &&
+      !prefill_shard_rebuild_.release_prepared_shard0_after_execute;
   if (!retain_shard) {
     const auto release_start = SteadyClock::now();
     release_prefill_shard(shard);
     shard.runtime_stats.release_ms += elapsed_ms(release_start);
+  } else if (
+      prefill_shard_rebuild_.unload_prepared_shard0_method_after_execute) {
+    const auto release_start = SteadyClock::now();
+    ET_CHECK_MSG(
+        shard.module->unload_method(shard.method_name),
+        "Unable to unload retained prefill shard0 method after execute");
+    shard.runtime_stats.release_ms += elapsed_ms(release_start);
+    ET_LOG(
+        Info,
+        "persistent prefill shard 0 method unloaded after execution: "
+        "module_alive=1 rebuilt_pte_alive=%d",
+        shard.rebuilt_pte_bytes != nullptr ||
+            shard.rebuilt_pte_buffer != nullptr);
+  } else if (
+      prefill_shard_rebuild_
+          .destroy_prepared_shard0_module_keep_pte_after_execute) {
+    const auto release_start = SteadyClock::now();
+    shard.module.reset();
+    size_t discarded_pte_page_bytes = 0;
+    if (prefill_shard_rebuild_.discard_prepared_shard0_pte_pages_after_execute &&
+        shard.rebuilt_pte_buffer != nullptr) {
+      discarded_pte_page_bytes =
+          shard.rebuilt_pte_buffer->discard_resident_pages_keep_capacity();
+    }
+    shard.runtime_stats.release_ms += elapsed_ms(release_start);
+    ET_LOG(
+        Info,
+        "persistent prefill shard 0 Module destroyed after execution: "
+        "module_alive=0 rebuilt_pte_alive=%d discarded_pte_page_bytes=%zu",
+        shard.rebuilt_pte_bytes != nullptr ||
+            shard.rebuilt_pte_buffer != nullptr,
+        discarded_pte_page_bytes);
   } else {
     ET_LOG(
         Info,
@@ -2183,6 +2496,13 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
   ET_CHECK_MSG(
       !prefill_output_values_.empty(),
       "Prefill shard outputs are not bound before execution");
+  const bool restore_decode_method = module_->is_method_loaded("kv_forward");
+  if (restore_decode_method) {
+    ET_CHECK_MSG(
+        module_->unload_method("kv_forward"),
+        "Failed to release kv_forward before streamed prefill");
+    ET_LOG(Info, "released kv_forward before streamed prefill shards");
+  }
   const size_t full_mask_index = 1;
   const size_t full_window_mask_index =
       prefill_has_window_attention_mask_ ? 2 : static_cast<size_t>(-1);
@@ -2378,6 +2698,28 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
     }
     shard.runtime_stats.input_binding_ms += elapsed_ms(input_binding_start);
 
+    if (shard_index == 0 && shard.runtime_stats.execution_count == 1) {
+      for (size_t i = 0; i < shard_inputs.size(); ++i) {
+        const auto& tensor = shard_inputs[i].toTensor();
+        std::ostringstream shape;
+        shape << "[";
+        for (size_t dim = 0; dim < tensor.sizes().size(); ++dim) {
+          if (dim) {
+            shape << ",";
+          }
+          shape << tensor.sizes()[dim];
+        }
+        shape << "]";
+        ET_LOG(
+            Info,
+            "prefill shard0 runtime input: index=%zu kind=%d shape=%s scalar=%d",
+            i,
+            static_cast<int>(shard.input_bindings[i].kind),
+            shape.str().c_str(),
+            static_cast<int>(tensor.scalar_type()));
+      }
+    }
+
     const auto output_binding_start = SteadyClock::now();
     for (size_t i = 0; i < shard.output_tensors.size(); ++i) {
       ET_CHECK_OK_OR_RETURN_ERROR(
@@ -2411,6 +2753,73 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
     }
     shard.runtime_stats.output_copy_ms += elapsed_ms(output_copy_start);
     ET_CHECK_OK_OR_RETURN_ERROR(write_prefill_etdump(shard));
+
+    if (std::getenv("ET_A8_IO_DIAG") != nullptr) {
+      for (size_t oi = 0; oi < shard.output_bindings.size(); ++oi) {
+        const auto kind = shard.output_bindings[oi].kind;
+        if (kind != PrefillShardPlan::OutputKind::IntermediateHidden &&
+            kind != PrefillShardPlan::OutputKind::FinalLogits) {
+          continue;
+        }
+        const Tensor& tensor = shard.output_tensors[oi];
+        const auto* raw = reinterpret_cast<const uint8_t*>(tensor.const_data_ptr());
+        const size_t count = static_cast<size_t>(tensor.numel());
+        uint8_t raw_min = 255;
+        uint8_t raw_max = 0;
+        std::array<bool, 256> seen{};
+        size_t distinct = 0;
+        for (size_t j = 0; j < count; ++j) {
+          raw_min = std::min(raw_min, raw[j]);
+          raw_max = std::max(raw_max, raw[j]);
+          if (!seen[raw[j]]) {
+            seen[raw[j]] = true;
+            ++distinct;
+          }
+        }
+        ET_LOG(
+            Info,
+            "A8_IO_DIAG shard=%zu kind=%s raw_count=%zu raw_min=%u "
+            "raw_max=%u raw_distinct=%zu",
+            shard_index,
+            kind == PrefillShardPlan::OutputKind::IntermediateHidden
+                ? "hidden"
+                : "logits",
+            count,
+            static_cast<unsigned>(raw_min),
+            static_cast<unsigned>(raw_max),
+            distinct);
+        if (kind == PrefillShardPlan::OutputKind::FinalLogits &&
+            prefill_vocab_size_ > 0) {
+          const size_t rows = count / static_cast<size_t>(prefill_vocab_size_);
+          std::ostringstream varying_rows;
+          size_t varying_count = 0;
+          for (size_t row = 0; row < rows; ++row) {
+            const uint8_t* row_data =
+                raw + row * static_cast<size_t>(prefill_vocab_size_);
+            uint8_t row_min = 255;
+            uint8_t row_max = 0;
+            for (int32_t col = 0; col < prefill_vocab_size_; ++col) {
+              row_min = std::min(row_min, row_data[col]);
+              row_max = std::max(row_max, row_data[col]);
+            }
+            if (row_min != row_max) {
+              if (varying_count < 40) {
+                if (varying_count) varying_rows << ",";
+                varying_rows << row << ":" << static_cast<unsigned>(row_min)
+                             << "-" << static_cast<unsigned>(row_max);
+              }
+              ++varying_count;
+            }
+          }
+          ET_LOG(
+              Info,
+              "A8_IO_DIAG logits_rows=%zu varying_count=%zu varying=[%s]",
+              rows,
+              varying_count,
+              varying_rows.str().c_str());
+        }
+      }
+    }
 
     if (std::getenv("ET_SHARD_OUTPUT_DIAG") != nullptr) {
 
@@ -2470,6 +2879,10 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
         memory_after_release.hwm_bytes);
     shard.runtime_stats.total_ms += elapsed_ms(shard_total_start);
   }
+  if (restore_decode_method) {
+    ET_CHECK_OK_OR_RETURN_ERROR(module_->load_method("kv_forward"));
+    ET_LOG(Info, "restored kv_forward after streamed prefill shards");
+  }
   return prefill_output_values_[0];
 }
 
@@ -2499,6 +2912,29 @@ bool DecoderRunner::prefill_persistent_shard0_prepared() const {
   return prefill_persistent_shard0_prepared_;
 }
 
+void DecoderRunner::release_prefill_resources_before_decode() {
+  stop_prefill_shard_three_stage_pipeline();
+  ET_CHECK_MSG(
+      !prefill_shard_stage_pending_rebuild_.valid(),
+      "Cannot release Prefill resources while a rebuild is pending");
+  size_t released_modules = 0;
+  for (auto& shard : prefill_shards_) {
+    if (shard.module != nullptr || shard.detached_qnn_execution != nullptr ||
+        shard.rebuilt_pte_bytes != nullptr ||
+        shard.rebuilt_pte_buffer != nullptr) {
+      release_prefill_shard(shard);
+      ++released_modules;
+    }
+  }
+  prefill_persistent_shard0_prepared_ = false;
+  prefill_rebuild_buffer_pool_.clear();
+  prefill_active_execute_callback_ = {};
+  ET_LOG(
+      Info,
+      "released Prefill resources before Decode: live_modules_released=%zu",
+      released_modules);
+}
+
 void DecoderRunner::begin_prefill_request() {
   ET_CHECK_MSG(
       prefill_shard_three_stage_pipeline_ == nullptr,
@@ -2521,6 +2957,7 @@ void DecoderRunner::begin_prefill_request() {
   }
   prefill_shard_stage_starts_.clear();
   prefill_shard_release_callback_ = {};
+  prefill_active_execute_callback_ = {};
 }
 
 bool DecoderRunner::uses_prefill_shards() const {

@@ -45,7 +45,11 @@ class Index(NodeVisitor):
         axis = len(node.args[1]) - 1
         indices_node = node.args[1][axis]
         indices_tensor = self.get_tensor(indices_node, node).to(torch.int32)
-        assert indices_tensor.size(0) != 0, "Not support empty indices list"
+        # Scalar index tensors are valid for aten.index.Tensor.  Using size(0)
+        # here raises IndexError during capability probing before QNN gets a
+        # chance to validate (or reject) the op.  numel() handles both scalar
+        # and non-scalar indices while preserving the empty-index guard.
+        assert indices_tensor.numel() != 0, "Not support empty indices list"
 
         indices_tensor_wrapper = self.define_tensor(
             indices_node,

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <optional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,11 @@ class ModelChunk : protected MultiTokenSizeModelLoader {
   virtual void Run();
 
   virtual bool HotSwapModel(const size_t tokenBatchSize);
+
+  // Use an in-memory reconstructed PTE instead of opening the configured path.
+  // Must be set before Initialize(); the bytes remain owned by the model
+  // instance until Release().
+  void SetModelBytes(std::shared_ptr<std::vector<uint8_t>> modelBytes);
 
   void
   SetInputBuffer(const void* data, const size_t size, const size_t index = 0);
@@ -115,6 +121,8 @@ class ModelChunk : protected MultiTokenSizeModelLoader {
 
   // The number of input tokens the the fixed-shape model takes
   size_t mTokenBatchSize = 1;
+
+  std::shared_ptr<std::vector<uint8_t>> mModelBytes;
 
   // Input/Output buffers info
   std::vector<BufferInfo> mInputBufferInfos;

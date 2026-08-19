@@ -72,3 +72,9 @@ class ConcatObserver(UniformQuantizationObserverBase):
 
     def calculate_qparams(self):
         return self._calculate_qparams(self.min_val, self.max_val)
+
+    def reset_min_max_vals(self):
+        self.min_val.copy_(torch.tensor(float("inf"), device=self.min_val.device))
+        self.max_val.copy_(
+            torch.tensor(float("-inf"), device=self.max_val.device)
+        )

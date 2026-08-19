@@ -18,8 +18,16 @@ namespace example {
 
 class ReadOnlyMappedFile {
  public:
+  struct Residency {
+    size_t total_pages{0};
+    size_t resident_pages{0};
+    int error{0};
+  };
+
   static std::shared_ptr<ReadOnlyMappedFile> open(const std::string& path);
   static std::shared_ptr<ReadOnlyMappedFile> load_into_shared_memory(
+      const std::string& path);
+  static std::shared_ptr<ReadOnlyMappedFile> load_into_anonymous_buffer(
       const std::string& path);
   ~ReadOnlyMappedFile();
 
@@ -30,20 +38,28 @@ class ReadOnlyMappedFile {
   size_t size() const;
   bool empty() const;
   bool shared_memory_backed() const;
+  bool anonymous_buffer_backed() const;
   std::string inherited_fd_spec() const;
   void discard_resident_pages() const;
+  Residency residency() const;
 
  private:
+  enum class Backing {
+    File,
+    SharedMemory,
+    Anonymous,
+  };
+
   ReadOnlyMappedFile(
       int fd,
       const uint8_t* data,
       size_t size,
-      bool shared_memory_backed);
+      Backing backing);
 
   int fd_{-1};
   const uint8_t* data_{nullptr};
   size_t size_{0};
-  bool shared_memory_backed_{false};
+  Backing backing_{Backing::File};
 };
 
 class PteRebuildBuffer {
@@ -54,6 +70,7 @@ class PteRebuildBuffer {
   PteRebuildBuffer& operator=(const PteRebuildBuffer&) = delete;
 
   void resize_uninitialized(size_t size);
+  size_t discard_resident_pages_keep_capacity();
   uint8_t* data();
   const uint8_t* data() const;
   size_t size() const;

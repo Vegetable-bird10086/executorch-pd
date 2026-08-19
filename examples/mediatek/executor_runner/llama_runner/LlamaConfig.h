@@ -27,8 +27,19 @@ struct LlamaModelOptions {
   size_t head_dim = 0;
   size_t window_size = 0;
   size_t max_token_length = 2048;
+  size_t layer_debug_output_count = 0;
+  size_t logit_shard_count = 1;
+  size_t vocab_size = 0;
+  int64_t layer_debug_chunk_index = -1;
   double partial_rotary_factor = 1.0;
   double rot_emb_base = 10000.0;
+
+  // Diagnostic output. Empty by default, so normal models/runners are unchanged.
+  std::string layer_debug_dump_dir;
+  std::string chunk_debug_dump_dir;
+  std::string first_chunk_input_path;
+  std::string combined_logits_dump_dir;
+  bool copy_chunk_io = false;
 
   // Types
   LLMType model_input_type = LLMType::INT16;

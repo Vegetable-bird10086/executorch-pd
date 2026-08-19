@@ -4,16 +4,63 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from typing import Optional
 
 import torch
-from executorch.backends.qualcomm.quantizer.custom_annotation import annotate_kv_8bit
+from executorch.backends.qualcomm.quantizer.custom_annotation import (
+    annotate_kv_8bit,
+    annotate_kv_8bit_a8,
+    annotate_llm_all_token_axis_a8,
+    annotate_llm_residual_token_axis_a8,
+    annotate_llm_v_projection_token_axis_a8,
+    annotate_llm_prefill_kv_output_per_tensor_a8,
+)
 from executorch.backends.qualcomm.quantizer.quant_recipe import (
     QuantGranularity,
     QuantRecipe,
 )
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
-from torchao.quantization.pt2e import MinMaxObserver
+from torchao.quantization.pt2e import HistogramObserver, MinMaxObserver
+
+
+class PercentileHistogramObserver(HistogramObserver):
+    """Linear-time percentile clipping for the experimental native-A8 path."""
+
+    @torch.jit.export
+    def reset_min_max_vals(self):
+        self.min_val.fill_(float("inf"))
+        self.max_val.fill_(float("-inf"))
+        self.histogram.zero_()
+
+    def calculate_qparams(self):
+        if self.min_val == float("inf") or self.max_val == float("-inf"):
+            return self._calculate_qparams(self.min_val, self.max_val)
+        total = self.histogram.sum()
+        if total <= 0 or self.max_val <= self.min_val:
+            return self._calculate_qparams(self.min_val, self.max_val)
+
+        retained = float(os.environ.get("ET_QNN_A8_RETAINED_PERCENTILE", "0.999"))
+        if not 0.0 < retained <= 1.0:
+            raise ValueError(
+                "ET_QNN_A8_RETAINED_PERCENTILE must be in (0, 1], "
+                f"got {retained}"
+            )
+        tail = (1.0 - retained) / 2.0
+        cumulative = torch.cumsum(self.histogram, dim=0)
+        lower_count = total * tail
+        upper_count = total * (1.0 - tail)
+        lower_bin = int(torch.searchsorted(cumulative, lower_count).item())
+        upper_bin = int(torch.searchsorted(cumulative, upper_count).item())
+        lower_bin = max(0, min(lower_bin, self.bins - 1))
+        upper_bin = max(lower_bin, min(upper_bin, self.bins - 1))
+        bin_width = (self.max_val - self.min_val) / self.bins
+        new_min = self.min_val + bin_width * lower_bin
+        new_max = self.min_val + bin_width * (upper_bin + 1)
+        zero = torch.zeros_like(new_min)
+        return self._calculate_qparams(
+            torch.minimum(new_min, zero), torch.maximum(new_max, zero)
+        )
 
 
 class StaticLLMQuantRecipe:
@@ -689,6 +736,116 @@ class Qwen3_1_7BQuantRecipe(StaticLLMQuantRecipe):
             )
         )
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+
+
+class Qwen3_4BQuantRecipe(Qwen3_1_7BQuantRecipe):
+    pass
+
+
+class Qwen3_4BA8QuantRecipe(StaticLLMQuantRecipe):
+    """Experimental Qwen3 recipe with native U8 activations.
+
+    The production Qwen3 recipes above remain A16. The convolution
+    placeholder weights remain INT4 block32 so the existing GPTQ2 replacement
+    contract is unchanged; only activation and output domains become U8.
+    """
+
+    default_quant_dtype = QuantDtype.use_8a4w
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+        conv_weight_bits = int(os.environ.get("ET_QNN_A8_CONV_WEIGHT_BITS", "4"))
+        if conv_weight_bits not in (4, 8):
+            raise ValueError(
+                "ET_QNN_A8_CONV_WEIGHT_BITS must be 4 or 8, "
+                f"got {conv_weight_bits}"
+            )
+        activation_observer = (
+            PercentileHistogramObserver
+            if os.environ.get("ET_QNN_A8_HISTOGRAM_OBSERVER", "") == "1"
+            else MinMaxObserver
+        )
+        self.recipe = (
+            QuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=activation_observer,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+                note="experimental native 8bit activation",
+            )
+            .add_node_target(
+                {torch.ops.aten.conv2d.default},
+                (
+                    QuantDtype.use_8a8w
+                    if conv_weight_bits == 8
+                    else QuantDtype.use_8a4w_block
+                ),
+                False,
+                act_observer=activation_observer,
+                granularity=(
+                    QuantGranularity.PER_CHANNEL
+                    if conv_weight_bits == 8
+                    else QuantGranularity.PER_BLOCK
+                ),
+                extra_kwargs=(
+                    {} if conv_weight_bits == 8 else {"block_size": (1, 32, 1, 1)}
+                ),
+                note=f"experimental U8 activation with INT{conv_weight_bits} weight",
+            )
+            .add_regex(
+                {r"output\.conv"},
+                QuantDtype.use_8a8w,
+                False,
+                act_observer=activation_observer,
+                granularity=QuantGranularity.PER_CHANNEL,
+                note="experimental U8 output activation",
+            )
+        )
+        selective_ops = {
+            item.strip()
+            for item in os.environ.get(
+                "ET_QNN_A8_PERCENTILE_OPS", ""
+            ).split(",")
+            if item.strip()
+        }
+        selective_targets = set()
+        if "mul" in selective_ops:
+            selective_targets.add(torch.ops.aten.mul.Tensor)
+        if "add" in selective_ops:
+            selective_targets.add(torch.ops.aten.add.Tensor)
+        if selective_targets:
+            self.recipe.add_node_target(
+                selective_targets,
+                QuantDtype.use_8a4w,
+                False,
+                act_observer=PercentileHistogramObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                note="selective native-A8 percentile activation clipping",
+            )
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit_a8)
+        if os.environ.get("ET_QNN_A8_TOKEN_AXIS_RESIDUAL", "") == "1":
+            self.recipe.custom_quant_annotations.append(
+                annotate_llm_residual_token_axis_a8
+            )
+        if os.environ.get("ET_QNN_A8_TOKEN_AXIS_ALL", "") == "1":
+            self.recipe.custom_quant_annotations.append(
+                annotate_llm_all_token_axis_a8
+            )
+        if os.environ.get("ET_QNN_A8_V_TOKEN_AXIS", "") == "1":
+            self.recipe.custom_quant_annotations.append(
+                annotate_llm_v_projection_token_axis_a8
+            )
+        if os.environ.get("ET_QNN_A8_KV_OUTPUT_PER_TENSOR", "") == "1":
+            self.recipe.custom_quant_annotations.append(
+                annotate_llm_prefill_kv_output_per_tensor_a8
+            )
+
+    def get_kv_io_bit_width(self) -> int:
+        return 8
+
+    def get_logits_output_bit_width(self) -> int:
+        return 8
 
 
 class Smollm2QuantRecipe(StaticLLMQuantRecipe):

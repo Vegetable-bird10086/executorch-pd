@@ -7,6 +7,7 @@
 # pyre-strict
 
 import copy
+import logging
 import operator
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -22,8 +23,9 @@ from executorch.exir.emit import emit_program
 from executorch.exir.graph_module import _get_submodule
 
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
-from executorch.exir.passes.spec_prop_pass import make_spec, SpecPropPass
+from executorch.exir.passes.spec_prop_pass import make_spec
 from executorch.exir.schema import Program
+from executorch.exir.tensor import TensorSpec
 
 from executorch.exir.tracer import Value
 from torch._library.fake_class_registry import FakeScriptObject
@@ -86,26 +88,12 @@ class LoweredBackendModule(torch.nn.Module):
 
     # pyre-ignore
     def __deepcopy__(self, memo: Optional[Dict[int, Any]]) -> "LoweredBackendModule":
-        # Copy exported program
-        copied_program = ExportedProgram(
-            root=copy.deepcopy(self._original_exported_program.graph_module),
-            graph=copy.deepcopy(self._original_exported_program.graph),
-            graph_signature=copy.deepcopy(
-                self._original_exported_program.graph_signature
-            ),
-            state_dict=self._original_exported_program.state_dict,
-            range_constraints=copy.deepcopy(
-                self._original_exported_program.range_constraints
-            ),
-            module_call_graph=copy.deepcopy(
-                self._original_exported_program.module_call_graph
-            ),
-            constants=self._original_exported_program.constants,
-            verifiers=[copy.deepcopy(self._original_exported_program.verifier)],
-        )
-
+        # A lowered module is immutable: runtime execution uses only the backend
+        # blob and compile specs. Sharing its diagnostic original program avoids
+        # trying to deepcopy FakeTensor/FunctionalTensor metadata when FX passes
+        # copy a GraphModule containing this delegate.
         res = LoweredBackendModule(
-            edge_program=copied_program,
+            edge_program=self._original_exported_program,
             backend_id=self._backend_id,
             processed_bytes=self._processed_bytes,
             compile_specs=copy.deepcopy(self._compile_specs, memo),
@@ -186,10 +174,7 @@ class LoweredBackendModule(torch.nn.Module):
         # Fix autodpes introuces cyclic dependencies:
         # program -> verifier -> lowered_backend_module -> program
         # @manual
-        from executorch.exir.program._program import (
-            _get_updated_graph_signature,
-            _transform,
-        )
+        from executorch.exir.program._program import _get_updated_graph_signature
 
         """
         Returns the object that represents the ExecuTorch binary before serialization.
@@ -221,78 +206,79 @@ class LoweredBackendModule(torch.nn.Module):
         # We'll remove all call_function nodes, insert an call_delegate node, inserting getitems nodes to get the result for call_delegate node
         # and return the list of getitems as the output
 
-        lowered_exported_program = copy.deepcopy(self._original_exported_program)
+        original_program = self._original_exported_program
 
-        # The real input nodes are the ones not buffer or parameter
-        all_input_nodes = [
+        def verifier_val(spec: Any) -> Any:
+            if isinstance(spec, TensorSpec):
+                return torch.empty_strided(
+                    tuple(spec.shape),
+                    tuple(spec.stride),
+                    dtype=spec.dtype,
+                    device="meta",
+                    requires_grad=spec.requires_grad,
+                )
+            return spec
+
+        # The shard PTE needs only user placeholders and one delegate call. Build
+        # that graph iteratively instead of deep-copying and erasing the full
+        # backend graph. Besides doing unnecessary work, deepcopy is invalid for
+        # FakeTensor/FunctionalTensor metadata retained by torch.export.
+        original_input_nodes = [
             node
-            for node in lowered_exported_program.graph.nodes
+            for node in original_program.graph.nodes
             if (
                 node.op == "placeholder"
+                and node.name not in original_program.graph_signature.inputs_to_buffers
                 and node.name
-                not in lowered_exported_program.graph_signature.inputs_to_buffers
-                and node.name
-                not in lowered_exported_program.graph_signature.inputs_to_parameters
+                not in original_program.graph_signature.inputs_to_parameters
             )
         ]
+        graph = torch.fx.Graph()
+        input_nodes = []
+        for original_node in original_input_nodes:
+            input_node = graph.placeholder(original_node.name)
+            input_node.meta = copy.copy(original_node.meta)
+            input_node.meta["spec"] = make_spec(original_node.meta["val"])
+            input_node.meta["val"] = verifier_val(input_node.meta["spec"])
+            input_nodes.append(input_node)
 
-        output_node = lowered_exported_program.graph.output_node()
-
-        # Step 1. Cleaning up the graph before inserting the call_delegate node
-        # Remove the original output node
-        lowered_exported_program.graph.erase_node(output_node)
-
-        # Remove all the everything else except the input
-        for node in reversed(lowered_exported_program.graph.nodes):
-            if node.op != "placeholder":
-                lowered_exported_program.graph.erase_node(node)
-
-        # Find placeholders that are parameters or buffers, remove them from the main graph
-        for node in lowered_exported_program.graph.nodes:
-            if node.op == "placeholder" and (
-                node.name in lowered_exported_program.graph_signature.inputs_to_buffers
-                or node.name
-                in lowered_exported_program.graph_signature.inputs_to_parameters
-            ):
-                lowered_exported_program.graph.erase_node(node)
-
-        # Step 2. Start constructing the graph
-        lowered_name = get_lowered_module_name(
-            lowered_exported_program.graph_module, self
-        )
-        # Insert the lowered module to the graph module as an attibute
-        lowered_node = lowered_exported_program.graph.get_attr(lowered_name)
+        root = torch.nn.Module()
+        lowered_name = get_lowered_module_name(root, self)
+        lowered_node = graph.get_attr(lowered_name)
 
         # Insert a call_delegate node to the graph module, with arguments from the arg list
-        delegate_node = lowered_exported_program.graph.call_function(
-            executorch_call_delegate, (lowered_node, *all_input_nodes)
+        delegate_node = graph.call_function(
+            executorch_call_delegate, (lowered_node, *input_nodes)
         )
         # Get the output list. Since the output node is a tuple of list, like ([aten_mul_tensor, aten_add_tensor],)
         # We add some handling logic to get the list `[aten_mul_tensor, aten_add_tensor]` properly
         original_output_nodes = (
-            self._original_exported_program.graph.output_node().args[0]
+            original_program.graph.output_node().args[0]
         )
 
         delegate_node.meta["spec"] = tuple(
             [make_spec(node.meta["val"]) for node in original_output_nodes]
         )
         delegate_node.meta["val"] = tuple(
-            [node.meta["val"] for node in original_output_nodes]
+            verifier_val(spec) for spec in delegate_node.meta["spec"]
         )
-
         # The getitem nodes that are going to be inserted to the lowered graph module
         getitem_nodes = []
         for i in range(len(original_output_nodes)):
-            getitem_node = lowered_exported_program.graph.call_function(
+            getitem_node = graph.call_function(
                 operator.getitem,
                 args=(delegate_node, i),
             )
+            getitem_node.meta["spec"] = delegate_node.meta["spec"][i]
             getitem_node.meta["val"] = delegate_node.meta["val"][i]
             getitem_nodes.append(getitem_node)
-        lowered_exported_program.graph.output(getitem_nodes)
-
-        lowered_exported_program.graph_module.recompile()
-        lowered_exported_program.graph.lint()
+        output_node = graph.output(getitem_nodes)
+        output_node.meta["spec"] = [node.meta["spec"] for node in getitem_nodes]
+        graph_module = torch.fx.GraphModule(root, graph)
+        graph_module.meta = {}
+        graph_module.recompile()
+        graph.lint()
+        logging.info("LoweredBackendModule.program: delegate graph constructed")
 
         # Users output will be the get items nodes instead
         output_specs = [
@@ -304,47 +290,57 @@ class LoweredBackendModule(torch.nn.Module):
             for getitem_node in getitem_nodes
         ]
         # All data are consumed by the delegates so they should be removed from the state dict.
-        inputs_to_parameters = (
-            lowered_exported_program.graph_signature.inputs_to_parameters
-        )
-        inputs_to_buffers = lowered_exported_program.graph_signature.inputs_to_buffers
         input_specs = [
             InputSpec(
                 kind=InputKind.USER_INPUT,
-                arg=TensorArgument(name=node.name),
+                arg=TensorArgument(name=input_node.name),
                 target=None,
             )
-            for user_input in lowered_exported_program.graph_signature.user_inputs
-            if user_input not in inputs_to_parameters
-            and user_input not in inputs_to_buffers
+            for input_node in input_nodes
         ]
 
         # Double check the ExportedProgram data(especially everything except graph) is good
         exported_program = ExportedProgram(
-            root=lowered_exported_program.graph_module,
-            graph=lowered_exported_program.graph,
+            root=graph_module,
+            graph=graph,
             graph_signature=_get_updated_graph_signature(
                 ExportGraphSignature(
                     input_specs=input_specs, output_specs=output_specs
                 ),
-                lowered_exported_program.graph_module,
+                graph_module,
             ),
             # TODO: May need to set lowered_exported_program.call_spec = CallSpec(None, None)
             # somewhere as we should pass it a list of tensors to the lowered module and output a
             # list of tensors. Putting call_spec=lowered_exported_program.call_spec is correct here as the
             # inputs/outputs to the toplevel program will be in the format of the eager module.
             state_dict={},  # None because all data are consumed by delegate
-            range_constraints=lowered_exported_program.range_constraints,
-            module_call_graph=lowered_exported_program.module_call_graph,
+            range_constraints=original_program.range_constraints,
+            # The delegate-only shard has no Python module call structure.  In
+            # particular, retaining the source call graph can keep FakeTensor
+            # values alive and causes generic ExportPass tracing to deepcopy
+            # tensors that do not expose a data pointer.
+            module_call_graph=[],
             example_inputs=None,
-            verifiers=[lowered_exported_program.verifier],
+            verifiers=[original_program.verifier],
         )
+        logging.info("LoweredBackendModule.program: ExportedProgram constructed")
         if memory_planning is None:
             memory_planning = MemoryPlanningPass()
-        exported_program = _transform(exported_program, SpecPropPass(), memory_planning)
+        # Every node in this tiny delegate-only graph already has a TensorSpec.
+        # Re-running SpecPropPass would trace the delegate call and deepcopy its
+        # FakeTensor arguments.  Memory planning is an in-place graph analysis,
+        # so invoke it directly with the freshly constructed signature.
+        # ExportedProgram may install its own GraphModule wrapper, so plan the
+        # exact module that will be handed to the emitter rather than the local
+        # construction object above.
+        memory_planning.run(
+            exported_program.graph_module, exported_program.graph_signature
+        )
+        logging.info("LoweredBackendModule.program: memory planning completed")
         emitted_program = emit_program(
             exported_program, emit_stacktrace=emit_stacktrace
         ).program
+        logging.info("LoweredBackendModule.program: emission completed")
         return emitted_program
 
     # Used to patch each delegated function with a call_delegate call

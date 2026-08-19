@@ -59,6 +59,13 @@ class QnnBackendUnifiedRegistry {
       const QnnExecuTorchOptions* options,
       std::shared_ptr<QnnBackendBundle>& bundle);
 
+  // Release process-global backend/device resources after every delegate
+  // context has been destroyed. CPU Decode does not use these resources.
+  void ReleaseBackendBundles();
+
+  // Down-vote HTP performance without destroying backend/device/context.
+  void ReleasePerformanceVotes();
+
  private:
   QnnBackendUnifiedRegistry();
   ~QnnBackendUnifiedRegistry();

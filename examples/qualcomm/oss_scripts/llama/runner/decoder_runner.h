@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <executorch/backends/qualcomm/runtime/QnnExecuTorchBackend.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/pte_rebuilder.h>
 #include <executorch/devtools/etdump/etdump_flatcc.h>
 #include <executorch/extension/llm/sampler/sampler.h>
@@ -66,6 +67,11 @@ class DecoderRunner {
     bool pipeline_rebuild{false};
     bool pipeline_qnn_load{false};
     bool stage_major_execution{false};
+    // Single-request experiment: the stripped input is no longer needed once
+    // its rebuilt PTE has been produced. Release it on the rebuild worker.
+    bool release_stripped_pte_after_rebuild{false};
+    // Fired once immediately before each shard's first QNN Execute.
+    std::function<void(size_t)> shard_execute_begin_callback;
     // Called once, after all rebuild inputs and idle rebuild buffers have been
     // released, immediately before the final shard starts executing.
     std::function<void()> final_shard_overlap_callback;
@@ -73,9 +79,31 @@ class DecoderRunner {
     // Materialize and load shard 0 during runner preparation, then keep its
     // QNN context alive until the DecoderRunner is destroyed.
     bool persistent_shard0_context{false};
-    // Keep GGUF recipes, stripped shard inputs, and reusable rebuild buffers
-    // alive so the same DecoderRunner can serve another request.
-    bool retain_session_rebuild_resources{false};
+    // Experimental ownership probe: once Module::load_method() and output
+    // binding complete, return the rebuilt-PTE backing to the pool while the
+    // loaded Module/QNN context remains alive. A later rebuild may immediately
+    // overwrite the same storage, proving whether Execute still depends on it.
+    bool release_rebuilt_pte_backing_after_load{false};
+    // Retain only an independently-owned QNN delegate shell for persistent
+    // shard0, then destroy Module and release the complete PTE before Execute.
+    bool detach_shard0_qnn_after_load{false};
+    // Apply the detached QNN execution-shell lifetime to every Prefill shard.
+    // Load finishes all metadata/output binding first; its final operation
+    // destroys Module/Method and returns the rebuilt PTE to a two-buffer pool.
+    bool detach_all_qnn_after_load{false};
+    // When shard 0 was prepared early, release it immediately after its only
+    // execution instead of retaining the QNN context through CPU Decode.
+    bool release_prepared_shard0_after_execute{false};
+    // Destroy only shard0's loaded Method/delegate/QNN graph after execution,
+    // retaining the Module object and rebuilt PTE backing for isolation.
+    bool unload_prepared_shard0_method_after_execute{false};
+    // Destroy shard0's complete Module after execution, but retain the rebuilt
+    // PTE backing allocation. Diagnostic isolation of Module lifetime from
+    // passive backing-memory lifetime; single-request only.
+    bool destroy_prepared_shard0_module_keep_pte_after_execute{false};
+    // Additionally discard the retained backing's physical pages while keeping
+    // the same allocation and capacity. Requires the Module-only diagnostic.
+    bool discard_prepared_shard0_pte_pages_after_execute{false};
     // Raw qnn_compile_spec copied from a complete, unstripped PTE. Stripped
     // PTEs are not valid FlatBuffers and must never be parsed for this.
     std::shared_ptr<std::vector<uint8_t>> qnn_compile_spec_bytes;
@@ -156,13 +184,15 @@ class DecoderRunner {
   bool prefill_qnn_backend_prewarmed() const;
   double prefill_persistent_shard0_prepare_ms() const;
   bool prefill_persistent_shard0_prepared() const;
+  void set_prefill_active_execute_callback(std::function<void()> callback);
+  void release_prefill_resources_before_decode();
   void begin_prefill_request();
   bool uses_prefill_shard_stage_major() const;
   size_t prefill_shard_count() const;
   size_t prefill_shard_layer_offset(size_t shard_index) const;
   size_t prefill_shard_layer_count(size_t shard_index) const;
   executorch::runtime::Error begin_prefill_shard_stage(size_t shard_index);
-  void prepare_final_prefill_shard_overlap();
+  bool prepare_final_prefill_shard_overlap();
   void set_prefill_shard_release_callback(
       std::function<void(size_t, size_t, size_t)> callback);
   executorch::runtime::Result<PrefillShardStageState> step_prefill_shard_stage(
@@ -207,13 +237,20 @@ class DecoderRunner {
   inline int32_t logits_to_token(
       const executorch::aten::Tensor& logits_tensor,
       int64_t pos) {
-    auto* logits_last = logits_ptr_for_pos(logits_tensor, pos);
     auto vocab_size = logits_tensor.size(2);
     static std::vector<float> logits_f(vocab_size);
-    // Discard dequantization (converting uint16_t to float) because the
+    // Discard dequantization because the
     // relative order of elements remains the same without conversion
-    for (int i = 0; i < vocab_size; i++) {
-      logits_f[i] = logits_last[i];
+    if (logits_bit_width_ == 8) {
+      auto* logits_last = logits_ptr_for_pos<uint8_t>(logits_tensor, pos);
+      for (int i = 0; i < vocab_size; i++) {
+        logits_f[i] = logits_last[i];
+      }
+    } else {
+      auto* logits_last = logits_ptr_for_pos<uint16_t>(logits_tensor, pos);
+      for (int i = 0; i < vocab_size; i++) {
+        logits_f[i] = logits_last[i];
+      }
     }
     return sampler_->sample(logits_f.data());
   }
@@ -221,8 +258,13 @@ class DecoderRunner {
   inline int32_t logits_to_argmax_token(
       const executorch::aten::Tensor& logits_tensor,
       int64_t pos) {
-    auto* logits_last = logits_ptr_for_pos(logits_tensor, pos);
     const auto vocab_size = logits_tensor.size(2);
+    if (logits_bit_width_ == 8) {
+      const auto* logits_last = logits_ptr_for_pos<uint8_t>(logits_tensor, pos);
+      return static_cast<int32_t>(std::max_element(
+          logits_last, logits_last + vocab_size) - logits_last);
+    }
+    auto* logits_last = logits_ptr_for_pos<uint16_t>(logits_tensor, pos);
     int32_t best_token = 0;
     float best_logit = -std::numeric_limits<float>::infinity();
     bool found_finite_logit = false;
@@ -253,11 +295,20 @@ class DecoderRunner {
     return best_token;
   }
 
+  void set_logits_bit_width(int32_t bit_width) {
+    ET_CHECK_MSG(
+        bit_width == 8 || bit_width == 16,
+        "Unsupported logits bit width: %d",
+        bit_width);
+    logits_bit_width_ = bit_width;
+  }
+
  protected:
-  inline uint16_t* logits_ptr_for_pos(
+  template <typename LogitsT>
+  inline LogitsT* logits_ptr_for_pos(
       const executorch::aten::Tensor& logits_tensor,
       int64_t pos) {
-    auto* logits = logits_tensor.mutable_data_ptr<uint16_t>();
+    auto* logits = reinterpret_cast<LogitsT*>(logits_tensor.mutable_data_ptr<void>());
     auto num_tokens = logits_tensor.size(1);
     auto vocab_size = logits_tensor.size(2);
     auto* logits_last = logits;
@@ -296,6 +347,8 @@ class DecoderRunner {
       size_t owned_index;
     };
     std::unique_ptr<executorch::extension::Module> module;
+    std::unique_ptr<executorch::backends::qnn::QnnDetachedExecution>
+        detached_qnn_execution;
     std::shared_ptr<std::vector<uint8_t>> rebuilt_pte_bytes;
     std::shared_ptr<PteRebuildBuffer> rebuilt_pte_buffer;
     std::shared_ptr<std::vector<uint8_t>> stripped_pte_bytes;
@@ -341,6 +394,7 @@ class DecoderRunner {
       PteRebuildResult rebuild_result);
   void materialize_prefill_shard(PrefillShardPlan& shard);
   void release_prefill_shard(PrefillShardPlan& shard);
+  void release_prefill_shard_backing_after_load(PrefillShardPlan& shard);
   std::shared_ptr<PteRebuildBuffer> acquire_prefill_rebuild_buffer(
       size_t required_size);
   void release_prefill_rebuild_buffer(
@@ -374,6 +428,7 @@ class DecoderRunner {
   PrefillShardRebuildConfig prefill_shard_rebuild_;
   std::function<void(size_t, size_t, size_t)>
       prefill_shard_release_callback_;
+  std::function<void()> prefill_active_execute_callback_;
   std::shared_ptr<PteQatRebuildContext> prefill_qat_rebuild_context_;
   std::shared_ptr<PteGgufRebuildContext> prefill_gguf_rebuild_context_;
   double prefill_qnn_backend_prewarm_ms_{0.0};
@@ -382,6 +437,13 @@ class DecoderRunner {
   bool prefill_persistent_shard0_prepared_{false};
   std::mutex prefill_rebuild_buffer_pool_mutex_;
   std::vector<std::shared_ptr<PteRebuildBuffer>> prefill_rebuild_buffer_pool_;
+  // Guarded by prefill_rebuild_buffer_pool_mutex_. Once the final rebuild has
+  // completed, no later release should retain an idle backing.
+  bool prefill_rebuild_buffer_pool_accepting_{true};
+  std::vector<executorch::extension::TensorPtr>
+      prefill_intermediate_aux_workspace_;
+  std::vector<executorch::extension::TensorPtr>
+      prefill_intermediate_hidden_workspace_;
   std::vector<PrefillShardPlan> prefill_shards_;
   std::vector<executorch::aten::Tensor> prefill_output_values_;
   int64_t prefill_num_layers_{0};
@@ -394,6 +456,7 @@ class DecoderRunner {
   int32_t prefill_static_hidden_size_{2048};
   bool prefill_outputs_logits_{true};
   bool prefill_separate_embed_{false};
+  int32_t logits_bit_width_{16};
   PrefillEtDumpConfig prefill_etdump_config_;
   std::vector<std::chrono::steady_clock::time_point> prefill_shard_stage_starts_;
   std::future<PteRebuildResult> prefill_shard_stage_pending_rebuild_;

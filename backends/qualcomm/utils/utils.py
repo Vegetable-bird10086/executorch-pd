@@ -430,7 +430,9 @@ def to_edge_transform_and_lower_to_qnn(
             m,
             inputs[graph_name],
             dynamic_shapes=dynamic_shapes[graph_name],
-            strict=True,
+            strict=(
+                os.environ.get("ET_QNN_NONSTRICT_REEXPORT", "") != "1"
+            ),
         )
         # This transformation is primarily intended for the LiftConstantScalarOperands pass
         # to avoid creating temporary tensors in the operation builder.

@@ -75,6 +75,14 @@ DEFINE_string(
     "tokenizer.bin",
     "Tokenizer path. Kept for compatibility with the runner interface.");
 DEFINE_string(
+    embedding_matrix_path,
+    "",
+    "Path to a separate embedding matrix used by models exported without an embedded token table.");
+DEFINE_bool(
+    embedding_resident,
+    false,
+    "Keep the separate embedding matrix resident in memory.");
+DEFINE_string(
     performance_output_path,
     "inference_speed.txt",
     "Path used by runner internals to store speed for each run.");
@@ -479,7 +487,9 @@ void run_benchmarks(
       FLAGS_window,
       FLAGS_gcap,
       std::move(tokenizer),
-      std::move(attention_sink_rope_module));
+      std::move(attention_sink_rope_module),
+      FLAGS_embedding_matrix_path,
+      FLAGS_embedding_resident);
 
   if (module_bundle.rebuilt_from_stripped) {
     ET_LOG(

@@ -79,6 +79,10 @@ class QuantDtype(IntEnum):
     use_16a4w_block = 3
     use_8a8w = 4
     use_8a4w = 5
+    # Experimental LLM path: keep LPBQ INT4 block weights while calibrating
+    # activations in the native QNN U8 domain.  This is deliberately a new
+    # enum value so existing 16a4w_block recipes retain their exact behavior.
+    use_8a4w_block = 6
 
 
 QUANT_CONFIG_DICT = {
@@ -136,6 +140,19 @@ QUANT_CONFIG_DICT = {
             weight_dtype=torch.int4,
         ),
         None,
+    ),
+    (QuantDtype.use_8a4w_block, False): (
+        get_8a4w_qnn_ptq_config,
+        partial(
+            get_ptq_per_channel_quant_config,
+            act_dtype=torch.uint8,
+            weight_dtype=torch.int4,
+        ),
+        partial(
+            get_ptq_per_block_quant_config,
+            act_dtype=torch.uint8,
+            weight_dtype=torch.int4,
+        ),
     ),
     # QAT,
     (QuantDtype.use_16a4w, True): (

@@ -506,10 +506,13 @@ def get_master_rot_emb(config, dtype, **kwargs):
     )
     length = int(config.max_position_embeddings * config.ntk_scaling_factor)
 
+    rope_theta = getattr(config, "rope_theta", 10000)
     if config.ntk_scaling_factor != 1.0:
-        base = (10000 * config.ntk_scaling_factor) ** (rot_dim / (rot_dim - 2))
+        base = (rope_theta * config.ntk_scaling_factor) ** (
+            rot_dim / (rot_dim - 2)
+        )
     else:
-        base = 10000
+        base = rope_theta
 
     if getattr(config, "rope_scaling", None) is not None:
         if config.rope_scaling["type"] == "longrope":

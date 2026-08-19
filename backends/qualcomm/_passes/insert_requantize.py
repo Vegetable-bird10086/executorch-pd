@@ -51,6 +51,50 @@ class InsertRequantize(ExportPass):
             inverted_dict[hashable_quant_attr].append(user_node_name)
         return inverted_dict
 
+    def _quant_values_equal(self, lhs, rhs) -> bool:
+        if lhs is None or rhs is None:
+            return lhs is rhs
+        if isinstance(lhs, torch.Tensor) or isinstance(rhs, torch.Tensor):
+            try:
+                return torch.equal(torch.as_tensor(lhs), torch.as_tensor(rhs))
+            except (TypeError, ValueError, RuntimeError):
+                return False
+        if isinstance(lhs, dict) and isinstance(rhs, dict):
+            return lhs.keys() == rhs.keys() and all(
+                self._quant_values_equal(lhs[key], rhs[key]) for key in lhs
+            )
+        if isinstance(lhs, (list, tuple)) and isinstance(rhs, (list, tuple)):
+            return len(lhs) == len(rhs) and all(
+                self._quant_values_equal(left, right)
+                for left, right in zip(lhs, rhs)
+            )
+        try:
+            return bool(lhs == rhs)
+        except (TypeError, ValueError):
+            return False
+
+    def _quant_attrs_equal(self, lhs: Dict, rhs: Dict) -> bool:
+        def encoding_family(encoding):
+            name = str(encoding)
+            for family in ("per_tensor", "per_channel", "per_block"):
+                if family in name:
+                    return family
+            return name
+
+        if encoding_family(lhs.get("encoding")) != encoding_family(
+            rhs.get("encoding")
+        ):
+            return False
+        # Quantize and Dequantize overloads describe the same stored encoding
+        # but use different operator objects, and Dequantize may additionally
+        # expose an out_dtype=None schema field. Compare every numerical/storage
+        # attribute while normalizing only those two representation details.
+        ignored = {"encoding", "out_dtype"}
+        for key in (lhs.keys() | rhs.keys()) - ignored:
+            if not self._quant_values_equal(lhs.get(key), rhs.get(key)):
+                return False
+        return True
+
     def _insert_to_copy(
         self,
         graph_module: torch.fx.GraphModule,
@@ -58,6 +102,15 @@ class InsertRequantize(ExportPass):
         quant_attr: Dict,
         user_nodes: List[str],
     ):
+        source_quant_attr = node.meta.get(QCOM_QUANT_ATTRS)
+        if source_quant_attr is not None and self._quant_attrs_equal(
+            source_quant_attr, quant_attr
+        ):
+            # The annotation graph can carry an explicit requant edge even
+            # when both sides resolve to exactly the same encoding. Emitting a
+            # QNN Convert for that identity is unnecessary, and QAIRT 2.37's
+            # HTP optimizer has no QNN_Convert_w_scale kernel for PCQ tensors.
+            return
         with graph_module.graph.inserting_after(node):
             users = list(node.users.keys())
             inserted_n = graph_module.graph.create_node(

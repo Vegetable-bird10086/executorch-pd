@@ -158,14 +158,20 @@ bool should_undo_r3_on_export(
     return false;
   }
 
-  const bool looks_like_qwen3_1_7b_shape =
-      num_layers == 28 && num_heads == 8 && head_dim == 128;
-  const bool looks_like_qwen3_1_7b_path =
+  const bool looks_like_qwen3_r3_shape =
+      (num_layers == 28 || num_layers == 36 || num_layers == 40) &&
+      num_heads == 8 &&
+      head_dim == 128;
+  const bool looks_like_qwen3_r3_path =
       model_path.find("1_7b") != std::string::npos ||
       model_path.find("1.7b") != std::string::npos ||
-      model_path.find("1-7b") != std::string::npos;
+      model_path.find("1-7b") != std::string::npos ||
+      model_path.find("4b") != std::string::npos ||
+      model_path.find("4B") != std::string::npos ||
+      model_path.find("14b") != std::string::npos ||
+      model_path.find("14B") != std::string::npos;
 
-  return looks_like_qwen3_1_7b_shape || looks_like_qwen3_1_7b_path;
+  return looks_like_qwen3_r3_shape || looks_like_qwen3_r3_path;
 }
 
 std::vector<uint8_t> read_binary_file(const std::string& path) {
@@ -1172,13 +1178,53 @@ Error PDPrefillRunner<T>::load() {
     }
   }
 
+  int32_t elastic_prefill_slot_layers = 0;
+  int32_t elastic_prefill_initial_slots = 0;
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    const char* elastic_env = std::getenv("ET_PREFILL_KV_SLOT_POOL");
+    const bool explicitly_disabled =
+        elastic_env != nullptr && std::strcmp(elastic_env, "0") == 0;
+    const bool explicitly_enabled = elastic_env != nullptr &&
+        elastic_env[0] != 0 && !explicitly_disabled;
+    const bool structurally_eligible = static_metadata_.enabled &&
+        prefill_qwen3_static_plan_ &&
+        prefill_shard_rebuild_.stage_major_execution &&
+        !prefill_shard_paths_.empty() &&
+        num_layers_ % static_cast<int64_t>(prefill_shard_paths_.size()) == 0;
+    if (explicitly_enabled) {
+      ET_CHECK_MSG(
+          structurally_eligible,
+          "Elastic Prefill KV slots require evenly sharded, manifest-only "
+          "stage-major QNN Prefill");
+    }
+    if (structurally_eligible && !explicitly_disabled) {
+      elastic_prefill_slot_layers = static_cast<int32_t>(
+          num_layers_ / static_cast<int64_t>(prefill_shard_paths_.size()));
+      elastic_prefill_initial_slots = 2;
+      if (const char* initial_env =
+              std::getenv("ET_PREFILL_KV_SLOT_INITIAL")) {
+        elastic_prefill_initial_slots = std::atoi(initial_env);
+      }
+      ET_CHECK_MSG(
+          elastic_prefill_initial_slots >= 2,
+          "Elastic Prefill KV pool requires at least two initial slots");
+      ET_LOG(
+          Info,
+          "elastic Prefill KV pool selected: default=%d initial_slots=%d",
+          static_cast<int>(elastic_env == nullptr || elastic_env[0] == 0),
+          elastic_prefill_initial_slots);
+    }
+  }
+
   kv_manager_ = std::make_unique<KVManager<T>>(typename KVManager<T>::Metadata{
       context_len_,
       head_dim_,
       max_ar_len,
       max_cache_len,
       num_heads_,
-      num_layers_});
+      num_layers_,
+      elastic_prefill_slot_layers,
+      elastic_prefill_initial_slots});
 
   if (attention_sink_rope_module_ != nullptr) {
     attention_sink_rope_runner_ = std::make_unique<AttentionSinkRopeRunner>(
@@ -1205,7 +1251,10 @@ Error PDPrefillRunner<T>::load() {
           embedding_dim,
           embedding_row_bytes,
           embedding_scalar_type,
-          separate_embed_ ? &separate_embedding_ : nullptr});
+          separate_embed_ ? &separate_embedding_ : nullptr,
+          static_metadata_.embedding_qnn_u16_input,
+          static_metadata_.embedding_qnn_u16_scale,
+          static_metadata_.embedding_qnn_u16_zero_point});
 
   buffer_manager_ = std::make_unique<ClientMem>();
   if (shared_buffer_) {
@@ -1392,6 +1441,13 @@ bool PDPrefillRunner<T>::prefill_persistent_shard0_prepared() const {
 }
 
 template <typename T>
+void PDPrefillRunner<T>::release_prefill_resources_before_decode() {
+  if (decoder_runner_ != nullptr) {
+    decoder_runner_->release_prefill_resources_before_decode();
+  }
+}
+
+template <typename T>
 void PDPrefillRunner<T>::set_prefill_etdump_config(
     DecoderRunner::PrefillEtDumpConfig config) {
   ET_CHECK_MSG(
@@ -1514,6 +1570,9 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
   std::deque<std::array<size_t, 3>> incremental_pack_jobs;
   bool incremental_pack_stop = false;
   std::thread incremental_pack_worker;
+  ET_CHECK_MSG(
+      !kv_manager_->uses_elastic_prefill_slots() || memory_handoff != nullptr,
+      "Elastic Prefill KV slots require incremental in-memory PD handoff");
   if (memory_handoff != nullptr) {
     if constexpr (std::is_same_v<T, uint8_t>) {
       incremental_handoff_prompt_bytes =
@@ -1593,6 +1652,11 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
           for (size_t layer = layer_offset; layer < layer_end; ++layer) {
             incremental_layers_copied[layer] = true;
           }
+          if (kv_manager_->uses_elastic_prefill_slots()) {
+            kv_manager_->release_prefill_kv_slot(
+                static_cast<int32_t>(layer_offset),
+                static_cast<int32_t>(layer_end));
+          }
           const double pack_ms = elapsed_ms(pack_start);
           incremental_kv_pack_ms += pack_ms;
           ET_LOG(
@@ -1646,14 +1710,21 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
           : size_t{0},
       last_runtime_stats_.embedding_prepare_ms);
 
-  const auto prefill_start = SteadyClock::now();
+  auto prefill_active_start = SteadyClock::time_point{};
+  decoder_runner_->set_prefill_active_execute_callback([&]() {
+    prefill_active_start = SteadyClock::now();
+    ET_LOG(Info, "active Prefill timing started at shard 0 QNN execute");
+  });
   auto prefill_res = prompt_processor_->prefill(
       cached_prompt_tokens,
       cur_pos_,
       false,
       attention_sink_rope_runner_.get());
   decoder_runner_->set_prefill_shard_release_callback({});
-  last_runtime_stats_.prefill_ms = elapsed_ms(prefill_start);
+  last_runtime_stats_.prefill_ms =
+      prefill_active_start == SteadyClock::time_point{}
+      ? 0.0
+      : elapsed_ms(prefill_active_start);
   prompt_processor_->clear_prompt_embeddings();
   const auto handoff_start = SteadyClock::now();
   if (incremental_pack_worker.joinable()) {
@@ -1663,6 +1734,17 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
     }
     incremental_pack_cv.notify_one();
     incremental_pack_worker.join();
+  }
+  if (kv_manager_->uses_elastic_prefill_slots()) {
+    ET_LOG(
+        Info,
+        "elastic Prefill KV pool complete: slots=%zu peak_slots=%zu "
+        "slot_bytes=%zu total_bytes=%zu",
+        kv_manager_->elastic_prefill_slot_count(),
+        kv_manager_->elastic_prefill_peak_slot_count(),
+        kv_manager_->elastic_prefill_slot_bytes(),
+        kv_manager_->elastic_prefill_slot_count() *
+            kv_manager_->elastic_prefill_slot_bytes());
   }
   if (prefill_res.error() != Error::Ok) {
     if (incremental_handoff_mapping != MAP_FAILED &&
@@ -1726,6 +1808,12 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
           incremental_layers_copied.begin(),
           incremental_layers_copied.end(),
           [](bool copied) { return copied; });
+      if (!all_layers_copied &&
+          kv_manager_->uses_elastic_prefill_slots()) {
+        ET_CHECK_MSG(
+            false,
+            "Elastic Prefill KV handoff did not copy every layer before slot reuse");
+      }
       if (!all_layers_copied) {
         build_qnn_u8_kv_handoff(
             kv_manager_.get(),

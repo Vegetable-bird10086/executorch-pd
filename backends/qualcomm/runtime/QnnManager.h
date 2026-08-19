@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace executorch {
 namespace backends {
@@ -27,7 +28,7 @@ class QnnManager {
  public:
   // Construct QnnManager
   explicit QnnManager(
-      const QnnExecuTorchOptions* options,
+      std::shared_ptr<std::vector<uint8_t>> options_storage,
       const QnnExecuTorchContextBinary& qnn_executorch_context_binary);
 
   ~QnnManager();
@@ -118,6 +119,9 @@ class QnnManager {
   }
 
  private:
+  // QNN runtime objects keep pointers into the FlatBuffer options. Own a
+  // compact copy so an initialized manager can outlive its ExecuTorch PTE.
+  std::shared_ptr<std::vector<uint8_t>> options_storage_;
   QnnExecuTorchContextBinary qnn_context_blob_;
   std::unique_ptr<BackendConfigParameters> backend_params_ptr_;
   std::shared_ptr<QnnBackendBundle>

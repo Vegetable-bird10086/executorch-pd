@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a validated llama QNN runtime profile JSON to its mmap binary form."""
+"""Convert a validated QNN runtime profile to V5 meta + payload sidecars."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import tempfile
 
 MAGIC = b"LQNNPRF\0"
 HEADER = struct.Struct("<8sIIQQ")
-VERSION = 2
+VERSION = 5
 ENDIAN_TAG = 0x01020304
 
 
@@ -45,21 +45,28 @@ def find_converter(explicit: str | None) -> Path:
     )
 
 
+def payload_path(meta: Path) -> Path:
+    return meta.with_suffix(".bin") if meta.suffix == ".meta" else Path(f"{meta}.sidecar.bin")
+
+
 def validate_binary(path: Path) -> None:
     size = path.stat().st_size
     if size < HEADER.size:
-        raise SystemExit(f"binary profile is truncated: {path}")
+        raise SystemExit(f"sidecar metadata is truncated: {path}")
     with path.open("rb") as stream:
         magic, version, endian_tag, payload_bytes, _payload_checksum = HEADER.unpack(
             stream.read(HEADER.size)
         )
     if magic != MAGIC or version != VERSION or endian_tag != ENDIAN_TAG:
-        raise SystemExit(f"binary profile header is invalid: {path}")
+        raise SystemExit(f"sidecar metadata header is invalid: {path}")
     if payload_bytes != size - HEADER.size:
         raise SystemExit(
-            f"binary profile payload size mismatch: header={payload_bytes} "
+            f"sidecar metadata payload size mismatch: header={payload_bytes} "
             f"actual={size - HEADER.size}"
         )
+    payload = payload_path(path)
+    if not payload.is_file() or payload.stat().st_size == 0:
+        raise SystemExit(f"sidecar payload is missing or empty: {payload}")
 
 
 def convert_profile(
@@ -80,20 +87,19 @@ def convert_profile(
 
     converter = find_converter(converter_arg)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
-    )
-    os.close(fd)
-    temporary = Path(temporary_name)
-    try:
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.", dir=output.parent
+    ) as temporary_directory:
+        temporary = Path(temporary_directory) / "qnn_u16_runtime_profile.meta"
         subprocess.run(
             [str(converter), str(source), str(model), str(temporary)],
             check=True,
         )
         validate_binary(temporary)
+        temporary_payload = payload_path(temporary)
+        final_payload = payload_path(output)
+        os.replace(temporary_payload, final_payload)
         os.replace(temporary, output)
-    finally:
-        temporary.unlink(missing_ok=True)
     return output
 
 
@@ -101,7 +107,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", required=True, type=Path, help="runtime profile JSON")
     parser.add_argument("--gguf", required=True, type=Path, help="Decode GGUF model")
-    parser.add_argument("--out", required=True, type=Path, help="output mmap binary")
+    parser.add_argument("--out", required=True, type=Path, help="output V5 sidecar metadata")
     parser.add_argument("--converter", help="qnn-u16-profile-convert executable")
     args = parser.parse_args()
 
@@ -110,7 +116,8 @@ def main() -> None:
 
     print(
         f"qnn-profile-bin-export: status=pass json_bytes={source.stat().st_size} "
-        f"bin_bytes={output.stat().st_size} output={output}"
+        f"meta_bytes={output.stat().st_size} payload_bytes={payload_path(output).stat().st_size} "
+        f"meta={output} payload={payload_path(output)}"
     )
 
 

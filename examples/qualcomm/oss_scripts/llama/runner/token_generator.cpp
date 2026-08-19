@@ -7,7 +7,9 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
+#include <array>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 
@@ -52,26 +54,26 @@ TokenGenerator<T>::TokenGenerator(
   }
   input_pos_.size = metadata_.ar_len * sizeof(int32_t);
   attention_mask_.size =
-      metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
+      metadata_.ar_len * metadata_.context_len * sizeof(T);
 
   switch (metadata_.cache_mode) {
     case CacheMode::StaticCahce:
       attention_mask_.size =
-          metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
+          metadata_.ar_len * metadata_.context_len * sizeof(T);
       window_attention_mask_.size = 0;
       break;
     case CacheMode::HybridCache:
       attention_mask_.size =
-          metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
+          metadata_.ar_len * metadata_.context_len * sizeof(T);
       window_attention_mask_.size =
-          metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
+          metadata_.ar_len * metadata_.context_len * sizeof(T);
       break;
     default:
       ET_CHECK_MSG(false, "Unsupported llama cache mode");
       break;
   }
 
-  logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(uint16_t);
+  logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(T);
 }
 template <typename T>
 void TokenGenerator<T>::init_io(
@@ -114,7 +116,7 @@ void TokenGenerator<T>::init_io(
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
-  attention_mask_.data = reinterpret_cast<uint16_t*>(
+  attention_mask_.data = reinterpret_cast<T*>(
       buffer_manager->allocate(attention_mask_.size));
   attention_mask_.tensor = std::make_unique<TensorImpl>(
       attention_mask->scalar_type(),
@@ -131,7 +133,7 @@ void TokenGenerator<T>::init_io(
   if (metadata_.cache_mode == CacheMode::HybridCache) {
     Result<TensorInfo> window_attention_mask =
         method_meta->input_tensor_meta(idx++);
-    window_attention_mask_.data = reinterpret_cast<uint16_t*>(
+    window_attention_mask_.data = reinterpret_cast<T*>(
         buffer_manager->allocate(window_attention_mask_.size));
     window_attention_mask_.tensor = std::make_unique<TensorImpl>(
         window_attention_mask->scalar_type(),
@@ -192,8 +194,7 @@ void TokenGenerator<T>::init_io(
 
   // [O]: logits
   Result<TensorInfo> logits = method_meta->output_tensor_meta(0);
-  logits_.data =
-      reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
+  logits_.data = reinterpret_cast<T*>(buffer_manager->allocate(logits_.size));
   logits_.tensor = std::make_unique<TensorImpl>(
       logits->scalar_type(),
       logits->sizes().size(),
@@ -313,6 +314,7 @@ Result<int64_t> TokenGenerator<T>::generate(
       method_name_.c_str());
 
   // Generate our tokens
+  bool io_diag_pending = std::getenv("ET_A8_IO_DIAG") != nullptr;
   while (pos < seq_len - 1) {
     // The current position plus the future generated cache exceeds the cache
     // size, which means we need to remove eviction_batch_size key-value cache
@@ -342,6 +344,51 @@ Result<int64_t> TokenGenerator<T>::generate(
 
     // Run inference
     auto logits_res = decoder_runner_->step(method_name_, inputs_);
+    if (io_diag_pending) {
+      T raw_min = std::numeric_limits<T>::max();
+      T raw_max = std::numeric_limits<T>::min();
+      std::array<bool, 1u << (sizeof(T) * 8)> seen{};
+      size_t distinct = 0;
+      int32_t raw_top1 = 0;
+      for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
+        const T raw = logits_.data[i];
+        raw_min = std::min(raw_min, raw);
+        raw_max = std::max(raw_max, raw);
+        if (!seen[static_cast<size_t>(raw)]) {
+          seen[static_cast<size_t>(raw)] = true;
+          ++distinct;
+        }
+        if (raw > logits_.data[raw_top1]) raw_top1 = i;
+      }
+      const size_t mask_numel =
+          static_cast<size_t>(metadata_.ar_len) * metadata_.context_len;
+      size_t mask_nonzero = 0;
+      for (size_t i = 0; i < mask_numel; ++i)
+        mask_nonzero += attention_mask_.data[i] != 0;
+      const auto& k0 = kv_manager_->get_k_cache_().front();
+      T k_min = std::numeric_limits<T>::max();
+      T k_max = std::numeric_limits<T>::min();
+      for (size_t i = 0; i < 64; ++i) {
+        k_min = std::min(k_min, k0.buffer[i]);
+        k_max = std::max(k_max, k0.buffer[i]);
+      }
+      ET_LOG(
+          Info,
+          "A8_IO_DIAG generate pos=%d token=%lu mask_nonzero=%zu mask_max=%u "
+          "k0_first64_min=%u k0_first64_max=%u logits_min=%u logits_max=%u "
+          "logits_distinct=%zu raw_top1=%d",
+          shifted_pos,
+          cur_token,
+          mask_nonzero,
+          static_cast<unsigned>(std::numeric_limits<T>::max()),
+          static_cast<unsigned>(k_min),
+          static_cast<unsigned>(k_max),
+          static_cast<unsigned>(raw_min),
+          static_cast<unsigned>(raw_max),
+          distinct,
+          raw_top1);
+      io_diag_pending = false;
+    }
     if (dump_logits) {
       token_all_logits_.insert(
           token_all_logits_.end(),
@@ -457,6 +504,7 @@ Result<double> TokenGenerator<T>::evaluate_teacher_forced(
       method_name_.c_str());
 
   double total_nll = 0.0;
+  bool io_diag_pending = std::getenv("ET_A8_IO_DIAG") != nullptr;
   for (size_t token_index = 0; token_index + 1 < tokens.size();
        ++token_index) {
     prepare_io(tokens[token_index], shifted_pos);
@@ -469,6 +517,44 @@ Result<double> TokenGenerator<T>::evaluate_teacher_forced(
         "Target token %lu exceeds vocab size %d",
         target,
         metadata_.vocab_size);
+    if (io_diag_pending) {
+      T raw_min = std::numeric_limits<T>::max();
+      T raw_max = std::numeric_limits<T>::min();
+      std::array<bool, 1u << (sizeof(T) * 8)> seen{};
+      size_t distinct = 0;
+      int32_t raw_top1 = 0;
+      for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
+        const T raw = logits_.data[i];
+        raw_min = std::min(raw_min, raw);
+        raw_max = std::max(raw_max, raw);
+        if (!seen[static_cast<size_t>(raw)]) {
+          seen[static_cast<size_t>(raw)] = true;
+          ++distinct;
+        }
+        if (raw > logits_.data[raw_top1]) raw_top1 = i;
+      }
+      size_t mask_nonzero = 0;
+      for (int32_t i = 0; i < metadata_.context_len; ++i)
+        mask_nonzero += attention_mask_.data[i] != 0;
+      ET_LOG(
+          Info,
+          "A8_IO_DIAG teacher pos=%ld input=%lu target=%lu mask_nonzero=%zu "
+          "mask_max=%u logits_min=%u logits_max=%u logits_distinct=%zu "
+          "raw_top1=%d target_raw=%u scale=%.9g zp=%d",
+          shifted_pos,
+          tokens[token_index],
+          target,
+          mask_nonzero,
+          static_cast<unsigned>(std::numeric_limits<T>::max()),
+          static_cast<unsigned>(raw_min),
+          static_cast<unsigned>(raw_max),
+          distinct,
+          raw_top1,
+          static_cast<unsigned>(logits_.data[target]),
+          logits_scale,
+          logits_zero_point);
+      io_diag_pending = false;
+    }
     double max_logit = -std::numeric_limits<double>::infinity();
     for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
       const double value =

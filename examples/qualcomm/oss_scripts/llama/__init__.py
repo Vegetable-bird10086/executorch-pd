@@ -79,6 +79,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Qwen2_5_1_5BQuantRecipe,
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
+    Qwen3_4BQuantRecipe,
     Smollm2QuantRecipe,
     Smollm3QuantRecipe,
     SmolVLMQuantRecipe,
@@ -505,7 +506,7 @@ class Qwen3_0_6B(LLMModelConfig):
 @register_llm_model("qwen3-1_7b")
 @dataclass(init=False, frozen=True)
 class Qwen3_1_7B(LLMModelConfig):
-    repo_id: str = "/root/autodl-tmp/Qwen3-1.7b-dequantized-e2e"
+    repo_id: str = "/root/autodl-tmp/Qwen3-1.7B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3/config/1_7b_config.json"
     )
@@ -519,6 +520,63 @@ class Qwen3_1_7B(LLMModelConfig):
     r2 = False
     r3 = True
     quant_recipe = Qwen3_1_7BQuantRecipe
+
+
+@register_llm_model("qwen3-4b")
+@dataclass(init=False, frozen=True)
+class Qwen3_4B(LLMModelConfig):
+    repo_id: str = "/root/autodl-tmp/Qwen3-4B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 18
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Qwen3_4BQuantRecipe
+
+
+@register_llm_model("qwen3-8b")
+@dataclass(init=False, frozen=True)
+class Qwen3_8B(LLMModelConfig):
+    repo_id: str = "/root/autodl-tmp/Qwen3-8B-E2E-QP-dequantized-bundle/fp16"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/8b_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 18
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Qwen3_4BQuantRecipe
+
+
+@register_llm_model("qwen3-14b")
+@dataclass(init=False, frozen=True)
+class Qwen3_14B(LLMModelConfig):
+    repo_id: str = "/root/autodl-tmp/Qwen3-14B-E2E-QP-dequantized-bundle/fp16"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/14b_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 20
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Qwen3_4BQuantRecipe
 
 
 @register_llm_model("smollm2_135m")
@@ -599,5 +657,3 @@ class SmolVLM_500M(LLMModelConfig):
     r2 = False
     r3 = False
     quant_recipe = SmolVLMQuantRecipe
-
-

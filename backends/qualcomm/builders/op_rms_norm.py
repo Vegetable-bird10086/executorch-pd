@@ -98,10 +98,16 @@ class RmsNormVisitor(NodeVisitor):
             (),  # args
             {},  # kwargs
         )
-        if quant_attrs := node.meta.get(QCOM_QUANT_ATTRS):
-            quant_attrs = quant_attrs.copy()
-            quant_attrs[QCOM_ZERO_POINT] = 0
-            bias_node.meta[QCOM_QUANT_ATTRS] = quant_attrs
+        # The synthetic zero bias is a rank-1 static tensor, not an activation.
+        # Copying token-axis activation qparams here gives it 128 axis qparams
+        # (and even an invalid axis=1 for rank 1), so RMSNorm receives two PCQ
+        # inputs and QNN rejects the graph. Reuse the real rank-1 weight's
+        # per-tensor encoding instead; zp=0 represents the all-zero bias exactly.
+        bias_quant_attrs = weight_node.meta.get(QCOM_QUANT_ATTRS)
+        if bias_quant_attrs is not None:
+            bias_quant_attrs = bias_quant_attrs.copy()
+            bias_quant_attrs[QCOM_ZERO_POINT] = 0
+            bias_node.meta[QCOM_QUANT_ATTRS] = bias_quant_attrs
         bias_tensor_wrapper = self.define_tensor(
             bias_node,
             node,

@@ -73,7 +73,7 @@ void MultimodalTokenGenerator<T>::init_io(
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
-  attention_mask_.data = reinterpret_cast<uint16_t*>(
+  attention_mask_.data = reinterpret_cast<T*>(
       buffer_manager->allocate(attention_mask_.size));
   attention_mask_.tensor = std::make_unique<TensorImpl>(
       attention_mask->scalar_type(),
@@ -90,7 +90,7 @@ void MultimodalTokenGenerator<T>::init_io(
   if (metadata_.cache_mode == CacheMode::HybridCache) {
     Result<TensorInfo> window_attention_mask =
         method_meta->input_tensor_meta(idx++);
-    window_attention_mask_.data = reinterpret_cast<uint16_t*>(
+    window_attention_mask_.data = reinterpret_cast<T*>(
         buffer_manager->allocate(window_attention_mask_.size));
     window_attention_mask_.tensor = std::make_unique<TensorImpl>(
         window_attention_mask->scalar_type(),

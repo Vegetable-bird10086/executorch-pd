@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from executorch.backends.qualcomm._passes import FoldQDQ, I64toI32, TagQuantIO
+from executorch.backends.qualcomm._passes.build_quant_io import BuildQuantIo
 from executorch.backends.qualcomm.qnn_preprocess import (
     consume_llama_quant_profile_batches,
     reset_llama_quant_profile_batches,
@@ -77,6 +78,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
 )
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_utils import (
     graph_module_inference,
+    smart_mask_updater,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_quant_recipe import (
     EncoderQuantRecipe,
@@ -89,6 +91,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     ModelArgs,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
+    Qwen3_4BA8QuantRecipe,
     StaticLLMQuantRecipe,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers.base_component import (
@@ -143,9 +146,24 @@ class TextDecoder(Component):
         self.dep_table = get_passes_dependency_for_capture_program()
         self.meta = {}
         self.kv_quant_attrs_sidecar = {"output": []}
-        self.quant_recipe: StaticLLMQuantRecipe = (
-            self.config.quant_recipe(True) if self.config.quant_recipe else None
+        self.calibration_tokenizer = None
+        activation_bits = int(
+            getattr(self.control_args, "llama_qnn_activation_bits", 16)
         )
+        if activation_bits == 8:
+            if getattr(self.control_args, "decoder_model", None) not in {
+                "qwen3-1_7b",
+                "qwen3-4b",
+            }:
+                raise ValueError(
+                    "--llama_qnn_activation_bits 8 is currently an experimental "
+                    "Qwen3 path"
+                )
+            self.quant_recipe = Qwen3_4BA8QuantRecipe(True)
+        else:
+            self.quant_recipe: StaticLLMQuantRecipe = (
+                self.config.quant_recipe(True) if self.config.quant_recipe else None
+            )
         self.separate_embedding_weight = None
 
         # For multimodal embedding
@@ -188,6 +206,15 @@ class TextDecoder(Component):
         qnn_kv_profiles_by_graph: Optional[Dict[str, Dict[str, Any]]] = None,
         gptq_source_recipe: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        logging.info(
+            "Starting standalone QNN shard serialization: graphs=%s base=%s",
+            graph_names,
+            base_name,
+        )
+        skip_debug_graph_code = (
+            os.environ.get("ET_QNN_SKIP_SHARD_DEBUG_GRAPH_CODE", "") == "1"
+        )
+
         def _node_shape(node):
             val = node.meta.get("val") if hasattr(node, "meta") else None
             shape = getattr(val, "shape", None)
@@ -304,13 +331,20 @@ class TextDecoder(Component):
         qnn_compile_spec = None
         for graph_name in graph_names:
             exported_program = edge_prog_mgr.exported_program(graph_name)
-            graph_code_path = os.path.join(
-                artifact_dir,
-                f"{base_name}.{graph_name}.lowered_graph.py",
-            )
-            with open(graph_code_path, "w", encoding="utf-8") as file:
-                file.write(exported_program.graph_module.code)
+            graph_code_path = None
+            if not skip_debug_graph_code:
+                graph_code_path = os.path.join(
+                    artifact_dir,
+                    f"{base_name}.{graph_name}.lowered_graph.py",
+                )
+                with open(graph_code_path, "w", encoding="utf-8") as file:
+                    file.write(exported_program.graph_module.code)
             lowered_submodules = get_lowered_submodules(exported_program.graph_module)
+            logging.info(
+                "Discovered %d standalone QNN delegates for graph=%s",
+                len(lowered_submodules),
+                graph_name,
+            )
             if not lowered_submodules:
                 raise RuntimeError(
                     f"no lowered submodules found for sharded graph {graph_name}"
@@ -376,19 +410,73 @@ class TextDecoder(Component):
             diagnostic_shard_limit = int(
                 os.environ.get("ET_QNN_DIAGNOSTIC_SHARD_LIMIT", "0") or 0
             )
-            if diagnostic_shard_limit:
-                retained_shards = min(
-                    diagnostic_shard_limit, len(lowered_submodules)
+            diagnostic_shard_start = int(
+                os.environ.get("ET_QNN_DIAGNOSTIC_SHARD_START", "0") or 0
+            )
+            prelower_shard_limit = int(
+                os.environ.get("ET_QNN_PRELOWER_SHARD_LIMIT", "0") or 0
+            )
+            prelower_shard_start = int(
+                os.environ.get("ET_QNN_PRELOWER_SHARD_START", "0") or 0
+            )
+            retained_indices = list(range(len(lowered_submodules)))
+            global_shard_indices = list(range(len(lowered_submodules)))
+            if prelower_shard_limit:
+                if len(lowered_submodules) != prelower_shard_limit:
+                    raise RuntimeError(
+                        "pre-lowering shard count mismatch after lowering: "
+                        f"actual={len(lowered_submodules)} "
+                        f"expected={prelower_shard_limit}"
+                    )
+                global_shard_indices = list(
+                    range(
+                        prelower_shard_start,
+                        prelower_shard_start + len(lowered_submodules),
+                    )
                 )
-                lowered_submodules = lowered_submodules[:retained_shards]
-                shard_layer_ranges = shard_layer_ranges[:retained_shards]
+                diagnostic_shard_limit = 0
+                diagnostic_shard_start = prelower_shard_start
+                configured_shard_count = int(self.config.num_sharding)
+                if num_decoder_layers % configured_shard_count != 0:
+                    raise RuntimeError(
+                        "bounded QNN export requires a uniform configured "
+                        "decoder-layer split"
+                    )
+                layers_per_shard = (
+                    num_decoder_layers // configured_shard_count
+                )
+                shard_layer_ranges = [
+                    (
+                        shard_idx * layers_per_shard,
+                        (shard_idx + 1) * layers_per_shard,
+                    )
+                    for shard_idx in global_shard_indices
+                ]
+                graph_manifest["layer_range_source"] = (
+                    "bounded_uniform_split_graph"
+                )
+            if diagnostic_shard_limit:
+                retained_end = min(
+                    diagnostic_shard_start + diagnostic_shard_limit,
+                    len(lowered_submodules),
+                )
+                retained_indices = list(
+                    range(diagnostic_shard_start, retained_end)
+                )
+                lowered_submodules = [
+                    lowered_submodules[index] for index in retained_indices
+                ]
+                shard_layer_ranges = [
+                    shard_layer_ranges[index] for index in retained_indices
+                ]
+                global_shard_indices = list(retained_indices)
                 graph_manifest["delegate_names"] = [
                     name for name, _, _ in lowered_submodules
                 ]
                 logging.warning(
-                    "Diagnostic shard serialization retained the first %d QNN "
-                    "delegate(s); uncompiled placeholders will not enter a PTE",
-                    retained_shards,
+                    "Diagnostic shard serialization retained QNN delegates %s; "
+                    "uncompiled placeholders will not enter a PTE",
+                    retained_indices,
                 )
             shard_manifest["num_shards"] = max(
                 shard_manifest["num_shards"], len(lowered_submodules)
@@ -398,9 +486,11 @@ class TextDecoder(Component):
             ]
             profile_shards: List[Dict[str, Any]] = []
             if qnn_quant_profiles is not None:
-                for shard_idx, (layer_start, layer_end_exclusive) in enumerate(
-                    shard_layer_ranges
-                ):
+                for local_shard_idx, (
+                    layer_start,
+                    layer_end_exclusive,
+                ) in enumerate(shard_layer_ranges):
+                    shard_idx = global_shard_indices[local_shard_idx]
                     scope = f"{graph_name}.context_{shard_idx}"
                     profile = profile_by_scope.pop(scope, None)
                     captured_scope = scope
@@ -411,6 +501,10 @@ class TextDecoder(Component):
                         fallback_scopes = profile_scopes_by_context_index.get(
                             shard_idx, []
                         )
+                        if not fallback_scopes and prelower_shard_limit:
+                            fallback_scopes = profile_scopes_by_context_index.get(
+                                local_shard_idx, []
+                            )
                         captured_scope = (
                             fallback_scopes[0] if len(fallback_scopes) == 1 else ""
                         )
@@ -436,12 +530,19 @@ class TextDecoder(Component):
                             "capabilities": profile["capabilities"],
                         }
                     )
-            for shard_idx, (delegate_name, lowered_module, _) in enumerate(
+            for local_shard_idx, (delegate_name, lowered_module, _) in enumerate(
                 lowered_submodules
             ):
+                shard_idx = global_shard_indices[local_shard_idx]
                 shard_pte_path = os.path.join(
                     artifact_dir,
                     f"{base_name}.{graph_name}.shard{shard_idx}.pte",
+                )
+                logging.info(
+                    "Serializing standalone QNN delegate graph=%s shard=%d name=%s",
+                    graph_name,
+                    shard_idx,
+                    delegate_name,
                 )
                 shard_program = lowered_module.program(
                     memory_planning=MemoryPlanningPass(
@@ -471,13 +572,15 @@ class TextDecoder(Component):
                     not in lowered_module.original_module.graph_signature.inputs_to_parameters
                 ]
                 output_nodes = _flatten_output_nodes(original_graph.output_node())
-                original_code_path = os.path.join(
-                    artifact_dir,
-                    f"{base_name}.{graph_name}.shard{shard_idx}.original_graph.py",
-                )
-                with open(original_code_path, "w", encoding="utf-8") as file:
-                    file.write(lowered_module.original_module.graph_module.code)
-                layer_start, layer_end_exclusive = shard_layer_ranges[shard_idx]
+                original_code_path = None
+                if not skip_debug_graph_code:
+                    original_code_path = os.path.join(
+                        artifact_dir,
+                        f"{base_name}.{graph_name}.shard{shard_idx}.original_graph.py",
+                    )
+                    with open(original_code_path, "w", encoding="utf-8") as file:
+                        file.write(lowered_module.original_module.graph_module.code)
+                layer_start, layer_end_exclusive = shard_layer_ranges[local_shard_idx]
                 graph_manifest["shards"].append(
                     {
                         "index": shard_idx,
@@ -491,8 +594,8 @@ class TextDecoder(Component):
                     }
                 )
                 if profile_shards:
-                    profile_shards[shard_idx]["delegate_name"] = delegate_name
-                    profile_shards[shard_idx]["pte_path"] = shard_pte_path
+                    profile_shards[local_shard_idx]["delegate_name"] = delegate_name
+                    profile_shards[local_shard_idx]["pte_path"] = shard_pte_path
                 logging.info(
                     "exported shard pte graph=%s shard=%d delegate=%s path=%s",
                     graph_name,
@@ -778,6 +881,8 @@ class TextDecoder(Component):
                             break
 
     def _json_safe_value(self, value):
+        if isinstance(value, torch.fx.Node) and value.op == "get_attr":
+            value = getattr(self.decoder, value.target)
         if isinstance(value, dict):
             return {
                 str(key): self._json_safe_value(item)
@@ -810,6 +915,220 @@ class TextDecoder(Component):
             f"Unable to classify KV output node {node.name} from stack_trace: {stack_trace}"
         )
 
+    def _override_prefill_kv_output_qparams(self):
+        """Make only Prefill's terminal KV Q/DQ match an AR1 Decode sidecar."""
+
+        qparams_path = os.environ.get("ET_QNN_A8_KV_OUTPUT_QPARAMS_PATH", "")
+        if not qparams_path or self.mode != Mode.PREFILL:
+            return
+        with open(qparams_path, encoding="utf-8") as source:
+            payload = json.load(source)
+        qparams = payload.get("output", {})
+        expected_layers = int(self.meta["get_n_layers"])
+        for kind in ("k", "v"):
+            if len(qparams.get(kind, [])) != expected_layers:
+                raise RuntimeError(
+                    f"KV qparam sidecar has {len(qparams.get(kind, []))} {kind} "
+                    f"records; expected {expected_layers}"
+                )
+
+        per_channel_q = torch.ops.quantized_decomposed.quantize_per_channel.default
+        per_channel_dq = (
+            torch.ops.quantized_decomposed.dequantize_per_channel.default
+        )
+        per_tensor_q = torch.ops.quantized_decomposed.quantize_per_tensor.default
+        per_tensor_dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        counters = {"k": 0, "v": 0}
+        changed = 0
+        replacements = {}
+        output_node = next(
+            node for node in self.decoder.graph.nodes if node.op == "output"
+        )
+        for dq_node in list(self.decoder.graph.nodes):
+            if not is_graph_output(dq_node) or dq_node.target not in {
+                per_channel_dq,
+                per_tensor_dq,
+            }:
+                continue
+            q_node = dq_node.args[0]
+            if not isinstance(q_node, torch.fx.Node) or q_node.target not in {
+                per_channel_q,
+                per_tensor_q,
+            }:
+                continue
+            cache_node = q_node.args[0]
+            if cache_node.meta["val"].size()[-2:] not in self.kv_cache_shape:
+                continue
+            kind = self._classify_kv_output_kind(cache_node)
+            record = qparams[kind][counters[kind]]
+            counters[kind] += 1
+            scale = float(record["scale"])
+            zero_point = int(record["zero_point"])
+            with self.decoder.graph.inserting_before(output_node):
+                boundary_q = self.decoder.graph.call_function(
+                    per_tensor_q,
+                    args=(cache_node, scale, zero_point, 0, 255, torch.uint8),
+                )
+                boundary_q.meta = q_node.meta.copy()
+                boundary_dq = self.decoder.graph.call_function(
+                    per_tensor_dq,
+                    args=(boundary_q, scale, zero_point, 0, 255, torch.uint8),
+                )
+                boundary_dq.meta = dq_node.meta.copy()
+            replacements[dq_node] = boundary_dq
+            changed += 1
+        if changed != expected_layers * 2 or counters != {
+            "k": expected_layers,
+            "v": expected_layers,
+        }:
+            raise RuntimeError(
+                "Failed to override every Prefill KV output qparam: "
+                f"changed={changed} counters={counters}"
+            )
+
+        def replace(value):
+            if isinstance(value, torch.fx.Node):
+                return replacements.get(value, value)
+            if isinstance(value, tuple):
+                return tuple(replace(item) for item in value)
+            if isinstance(value, list):
+                return [replace(item) for item in value]
+            if isinstance(value, dict):
+                return {key: replace(item) for key, item in value.items()}
+            return value
+
+        output_node.args = (replace(output_node.args[0]),)
+        self.decoder.graph.lint()
+        self.decoder.recompile()
+        logging.info(
+            "Overrode %d terminal Prefill KV Q/DQ encodings from %s",
+            changed,
+            qparams_path,
+        )
+
+    def _override_decode_kv_input_qparams(self):
+        """Consume token-axis Prefill KV codes without collapsing them to one scale."""
+
+        qparams_path = os.environ.get("ET_QNN_A8_DECODE_KV_QPARAMS_PATH", "")
+        if not qparams_path or self.mode != Mode.DECODE:
+            return
+        with open(qparams_path, encoding="utf-8") as source:
+            payload = json.load(source)
+        records = payload.get("output", {})
+        n_layers = int(self.meta["get_n_layers"])
+        context_len = int(self.meta["get_max_context_len"]) - 1
+        for kind in ("k", "v"):
+            if len(records.get(kind, [])) != n_layers:
+                raise RuntimeError(f"Invalid Prefill {kind} qparam record count")
+
+        per_channel_q = torch.ops.quantized_decomposed.quantize_per_channel.default
+        per_channel_dq = (
+            torch.ops.quantized_decomposed.dequantize_per_channel.default
+        )
+        per_tensor_q = torch.ops.quantized_decomposed.quantize_per_tensor.default
+        per_tensor_dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        counters = {"k": 0, "v": 0}
+        changed = 0
+        for placeholder in list(self.decoder.graph.nodes):
+            if placeholder.op != "placeholder":
+                continue
+            value = placeholder.meta.get("val")
+            if not isinstance(value, torch.Tensor) or value.dim() != 4:
+                continue
+            shape = tuple(value.shape)
+            if shape[-1] == context_len:
+                kind, axis = "k", 3
+            elif shape[-2] == context_len:
+                kind, axis = "v", 2
+            else:
+                continue
+            layer = counters[kind]
+            record = records[kind][layer]
+            counters[kind] += 1
+            q_users = [
+                user
+                for user in placeholder.users
+                if user.target in {per_tensor_q, per_channel_q}
+            ]
+            if len(q_users) != 1:
+                raise RuntimeError(
+                    f"Decode KV placeholder {placeholder.name} has {len(q_users)} Q users"
+                )
+            q_node = q_users[0]
+            dq_users = [
+                user
+                for user in q_node.users
+                if user.target in {per_tensor_dq, per_channel_dq}
+            ]
+            if not dq_users:
+                raise RuntimeError(f"Decode KV input {placeholder.name} has no DQ user")
+            if kind == "k":
+                scale = float(record["scale"])
+                zero_point = int(record["zero_point"])
+                q_node.target = per_tensor_q
+                q_node.args = (placeholder, scale, zero_point, 0, 255, torch.uint8)
+                for dq_node in dq_users:
+                    dq_node.target = per_tensor_dq
+                    dq_node.args = (q_node, scale, zero_point, 0, 255, torch.uint8)
+            else:
+                base_scales = record["scale"]
+                base_zero_points = record["zero_point"]
+                if not isinstance(base_scales, list) or not isinstance(
+                    base_zero_points, list
+                ):
+                    raise RuntimeError(f"Prefill V layer {layer} is not per-axis")
+                scales = torch.tensor(
+                    [base_scales[i % len(base_scales)] for i in range(context_len)],
+                    dtype=torch.float32,
+                )
+                zero_points = torch.tensor(
+                    [
+                        base_zero_points[i % len(base_zero_points)]
+                        for i in range(context_len)
+                    ],
+                    dtype=torch.int64,
+                )
+                scale_name = f"decode_v_cache_input_scale_{layer}"
+                zero_name = f"decode_v_cache_input_zero_point_{layer}"
+                self.decoder.register_buffer(scale_name, scales)
+                self.decoder.register_buffer(zero_name, zero_points)
+                with self.decoder.graph.inserting_before(q_node):
+                    scale_node = self.decoder.graph.get_attr(scale_name)
+                    zero_node = self.decoder.graph.get_attr(zero_name)
+                q_node.target = per_channel_q
+                q_node.args = (
+                    placeholder,
+                    scale_node,
+                    zero_node,
+                    axis,
+                    0,
+                    255,
+                    torch.uint8,
+                )
+                for dq_node in dq_users:
+                    dq_node.target = per_channel_dq
+                    dq_node.args = (
+                        q_node,
+                        scale_node,
+                        zero_node,
+                        axis,
+                        0,
+                        255,
+                        torch.uint8,
+                    )
+            changed += 1
+        if changed != n_layers * 2 or counters != {"k": n_layers, "v": n_layers}:
+            raise RuntimeError(
+                f"Decode KV input qparam override incomplete: {changed}, {counters}"
+            )
+        self.decoder.graph.lint()
+        self.decoder.recompile()
+        logging.info(
+            "Overrode %d Decode KV inputs from token-axis Prefill sidecar %s",
+            changed,
+            qparams_path,
+        )
+
     def _save_output_kv_cache_quant_attrs(self):
         output_records = []
         explicit_output = {"combined": [], "k": [], "v": []}
@@ -820,14 +1139,22 @@ class TextDecoder(Component):
                 continue
             cache_output_node = node.args[0].args[0]
             if cache_output_node.meta["val"].size()[-2:] in self.kv_cache_shape:
+                is_per_channel = (
+                    node.target
+                    == torch.ops.quantized_decomposed.dequantize_per_channel.default
+                )
+                axis = node.args[3] if is_per_channel else None
+                quant_min = node.args[4] if is_per_channel else node.args[3]
+                quant_max = node.args[5] if is_per_channel else node.args[4]
+                dtype = node.args[6] if is_per_channel else node.args[5]
                 # [QCOM_SCALE, QCOM_ZERO_POINT, QCOM_QUANT_MIN, QCOM_QUANT_MAX, QCOM_DTYPE]
                 # This meta is for attention sink feature
                 self.meta[f"get_kv_output_{len(output_records)}_quant_attr"] = [
                     node.args[1],
                     node.args[2],
-                    node.args[3],
-                    node.args[4],
-                    str(node.args[5]),
+                    quant_min,
+                    quant_max,
+                    str(dtype),
                 ]
                 record = {
                     "index": len(output_records),
@@ -835,9 +1162,11 @@ class TextDecoder(Component):
                     "node_target": str(cache_output_node.target),
                     "scale": self._json_safe_value(node.args[1]),
                     "zero_point": self._json_safe_value(node.args[2]),
-                    "quant_min": self._json_safe_value(node.args[3]),
-                    "quant_max": self._json_safe_value(node.args[4]),
-                    "dtype": self._json_safe_value(node.args[5]),
+                    "encoding": "per_axis" if is_per_channel else "per_tensor",
+                    "axis": self._json_safe_value(axis),
+                    "quant_min": self._json_safe_value(quant_min),
+                    "quant_max": self._json_safe_value(quant_max),
+                    "dtype": self._json_safe_value(dtype),
                     "stack_trace": str(cache_output_node.meta.get("stack_trace", "")),
                     "source_fn_stack": str(
                         cache_output_node.meta.get("source_fn_stack", "")
@@ -3854,7 +4183,10 @@ class TextDecoder(Component):
                 use_i64_token=self.control_args.embedding_quantize is not None,
                 event_name=f"{event}_prompt",
                 lookahead_config=lookahead_config,
-                generate_tokens=not has_task_calibration,
+                generate_tokens=(
+                    not has_task_calibration
+                    and os.environ.get("ET_QNN_PROMPT_ONLY_CALIBRATION", "") != "1"
+                ),
             )
 
     def _run_post_replace_smoke_test(self, model):
@@ -3935,6 +4267,14 @@ class TextDecoder(Component):
         if not getattr(self.control_args, "qat_post_replace_generate_text", False):
             return
 
+        # The ordinary post-replacement diagnostic still owns the token
+        # embedding inside the converted graph.  A separate-embedding export
+        # removes that subgraph later in HybridTextDecoder.compile().  Skip the
+        # early diagnostic when the caller requests the phone-equivalent path;
+        # HybridTextDecoder will run it after rewriting the graph input.
+        if os.environ.get("ET_QNN_POST_REPLACE_EXTERNAL_EMBED_GENERATE", "") == "1":
+            return
+
         logger = getattr(self, "logger", None)
         if logger is None:
             logger = logging.getLogger(__name__)
@@ -3997,6 +4337,113 @@ class TextDecoder(Component):
         except Exception as error:
             logger.exception("[qat_generate] failed post-replace generation: %s", error)
 
+    def _capture_prefill_residuals(self, model, tokenizer, stage):
+        capture_path = os.environ.get("ET_QNN_PREFILL_RESIDUAL_CAPTURE_PATH", "")
+        if not capture_path or self.mode != Mode.PREFILL:
+            return
+        prompt = os.environ.get("ET_QNN_PREFILL_RESIDUAL_CAPTURE_PROMPT", "")
+        if not prompt:
+            raise RuntimeError(
+                "ET_QNN_PREFILL_RESIDUAL_CAPTURE_PROMPT is required for capture"
+            )
+
+        captures = {}
+        layer_counts = {}
+
+        class ResidualInterpreter(torch.fx.Interpreter):
+            def run_node(interpreter_self, node):
+                result = super(ResidualInterpreter, interpreter_self).run_node(node)
+                if node.op != "call_function" or str(node.target) != "aten.add.Tensor":
+                    return result
+                stack = node.meta.get("nn_module_stack", {})
+                paths = []
+                for value in stack.values():
+                    if isinstance(value, (tuple, list)) and value:
+                        paths.append(str(value[0]))
+                    else:
+                        paths.append(str(value))
+                layer = None
+                for path in paths:
+                    match = re.search(r"(?:^|\.)layers\.(\d+)$", path)
+                    if match:
+                        layer = int(match.group(1))
+                        break
+                if layer is None or not isinstance(result, torch.Tensor):
+                    return result
+                ordinal = layer_counts.get(layer, 0)
+                layer_counts[layer] = ordinal + 1
+                captures[f"layer.{layer}.residual.{ordinal}"] = (
+                    result.detach().to(dtype=torch.float32, device="cpu").clone()
+                )
+                return result
+
+        interpreter = ResidualInterpreter(model, garbage_collect_values=True)
+
+        class CaptureRunner(torch.nn.Module):
+            def forward(runner_self, *args):
+                return interpreter.run(*args)
+
+        diagnostic_inputs = self.get_example_inputs()
+
+        def _get_capture_inputs():
+            return diagnostic_inputs
+
+        graph_module_inference(
+            use_kv_cache=True,
+            get_example_inputs=_get_capture_inputs,
+            module=CaptureRunner(),
+            tokenizer=tokenizer,
+            ar_len=self.meta["get_ar_len"],
+            max_seq_len=self.meta["get_max_context_len"],
+            prompt=prompt,
+            tok_embedding=None,
+            image_token_id=None,
+            use_i64_token=False,
+            event_name=f"prefill_residual_capture_{stage}",
+            generate_tokens=False,
+            collect_logits=True,
+        )
+        if stage == "float":
+            torch.save(captures, capture_path)
+            logging.info(
+                "[prefill_residual_capture] saved %d float tensors to %s",
+                len(captures),
+                capture_path,
+            )
+            return
+
+        references = torch.load(capture_path, map_location="cpu", weights_only=True)
+        rows = []
+        for key, actual in captures.items():
+            reference = references.get(key)
+            if reference is None or reference.shape != actual.shape:
+                continue
+            reference = reference.to(torch.float32)
+            diff = actual - reference
+            signal = torch.sum(reference * reference).item()
+            noise = torch.sum(diff * diff).item()
+            sqnr_db = 10.0 * math.log10(signal / max(noise, 1.0e-30))
+            cosine = torch.nn.functional.cosine_similarity(
+                reference.flatten(), actual.flatten(), dim=0
+            ).item()
+            rows.append(
+                {
+                    "key": key,
+                    "sqnr_db": sqnr_db,
+                    "cosine": cosine,
+                    "max_abs_error": torch.max(torch.abs(diff)).item(),
+                    "reference_abs_max": torch.max(torch.abs(reference)).item(),
+                }
+            )
+        report_path = capture_path + ".qdq.json"
+        with open(report_path, "w") as output:
+            json.dump(rows, output, indent=2)
+        logging.info(
+            "[prefill_residual_capture] compared %d tensors; report=%s",
+            len(rows),
+            report_path,
+        )
+
     @log_info
     def quantize(self, request: Request):  # noqa: C901
         if self.quant_recipe is None:
@@ -4020,12 +4467,36 @@ class TextDecoder(Component):
 
         if self.quant_recipe.get_logits_output_bit_width() == 16:
             fixed_point_type["io_type"] = torch.uint16
+        elif self.quant_recipe.get_logits_output_bit_width() == 8:
+            fixed_point_type["io_type"] = torch.uint8
         else:
             raise RuntimeError(
                 f"unknown logits io bit width {self.quant_recipe.get_logits_output_bit_width()}"
             )
 
         data = request.method_data[TEXT_DECODER]
+        self.calibration_tokenizer = data.tokenizer
+
+        evict_paths = os.environ.get("ET_QNN_EVICT_CHECKPOINT_CACHE", "")
+        if evict_paths:
+            for evict_path in evict_paths.split(os.pathsep):
+                if not evict_path:
+                    continue
+                try:
+                    with open(evict_path, "rb") as evict_file:
+                        os.posix_fadvise(
+                            evict_file.fileno(),
+                            0,
+                            0,
+                            os.POSIX_FADV_DONTNEED,
+                        )
+                    logging.info("Evicted clean checkpoint cache: %s", evict_path)
+                except (AttributeError, OSError) as error:
+                    logging.warning(
+                        "Unable to evict checkpoint cache %s: %s",
+                        evict_path,
+                        error,
+                    )
         audio_turns = request.method_data[
             AUDIO_ENCODER
         ].calibration_data.intermediate_outputs
@@ -4067,8 +4538,95 @@ class TextDecoder(Component):
                 self.decoder, self.export_input, strict=True
             ).module()
 
+            self._capture_prefill_residuals(
+                self.decoder, data.tokenizer, stage="float"
+            )
+
+            float_snapshot_path = os.environ.get(
+                "ET_QNN_FLOAT_EXTERNAL_EMBED_SNAPSHOT_SAVE", ""
+            )
+            if float_snapshot_path:
+                if (
+                    self.separate_embedding_weight is None
+                    or not self.model_args.use_kv_cache
+                ):
+                    raise RuntimeError(
+                        "float external-embedding snapshot requires separate "
+                        "embedding and a KV-cache decoder"
+                    )
+                prompt = os.environ.get(
+                    "ET_QNN_FLOAT_EXTERNAL_EMBED_PROMPT", ""
+                ) or getattr(
+                    self.control_args, "qat_post_replace_generate_prompt", None
+                ) or getattr(self.control_args, "prompt", None)
+                if isinstance(prompt, (list, tuple)):
+                    prompt = prompt[0]
+                diagnostic_inputs = self.get_example_inputs()
+
+                def _get_float_diagnostic_inputs():
+                    return diagnostic_inputs
+
+                # The separate-embedding graph rewrite happens later in compile().
+                # At this point the exported float graph still consumes token IDs;
+                # its internal table is the exact source of the external matrix.
+                float_logits = graph_module_inference(
+                    use_kv_cache=True,
+                    get_example_inputs=_get_float_diagnostic_inputs,
+                    module=self.decoder,
+                    tokenizer=data.tokenizer,
+                    ar_len=self.meta["get_ar_len"],
+                    max_seq_len=self.meta["get_max_context_len"],
+                    prompt=prompt,
+                    tok_embedding=None,
+                    image_token_id=None,
+                    use_i64_token=False,
+                    event_name="float_external_embed_snapshot",
+                    generate_tokens=False,
+                    collect_logits=True,
+                )
+                pos = int(float_logits.shape[1])
+                next_token = int(torch.argmax(float_logits[:, -1], dim=-1).item())
+                _, _, _, k_caches, v_caches = diagnostic_inputs
+                torch.save(
+                    {
+                        "pos": pos,
+                        "next_token": next_token,
+                        "k_caches": [
+                            cache[:, :, :, :pos].clone() for cache in k_caches
+                        ],
+                        "v_caches": [
+                            cache[:, :, :pos, :].clone() for cache in v_caches
+                        ],
+                    },
+                    float_snapshot_path,
+                )
+                logging.info(
+                    "[float_external_embed_snapshot] saved path=%s pos=%d "
+                    "next_token=%d text=%r",
+                    float_snapshot_path,
+                    pos,
+                    next_token,
+                    data.tokenizer.decode([next_token]),
+                )
+                if (
+                    os.environ.get(
+                        "ET_QNN_FLOAT_EXTERNAL_EMBED_SNAPSHOT_ONLY", ""
+                    )
+                    == "1"
+                ):
+                    raise SystemExit(0)
+
             self.decoder = prepare_pt2e(self.decoder, quantizer)
             print("\n=== After prepare_pt2e for decoder ===")
+            prepared_code_path = os.environ.get(
+                "ET_QNN_PREPARED_CODE_DUMP_PATH", ""
+            )
+            if prepared_code_path:
+                with open(prepared_code_path, "w") as output:
+                    output.write(self.decoder.code)
+                logging.info("Saved prepared decoder code to %s", prepared_code_path)
+                if os.environ.get("ET_QNN_PREPARED_CODE_DUMP_ONLY", "") == "1":
+                    raise SystemExit(0)
             if getattr(self.control_args, "dump_quant_info", False):
                 self._dump_quant_info(
                     self.decoder,
@@ -4092,10 +4650,14 @@ class TextDecoder(Component):
             # Task calibration supports the prefill KV graph through
             # GraphModuleCalibrationWrapper's chunked KV inference path.
             has_task_calibration = self.control_args.tasks is not None
+            prompt_only_no_generate = (
+                os.environ.get("ET_QNN_PROMPT_ONLY_CALIBRATION", "") == "1"
+            )
             if (
                 self.mode == Mode.DECODE
                 or not self.model_args.use_kv_cache
                 or has_task_calibration
+                or prompt_only_no_generate
             ):
                 if has_task_calibration:
                     logging.info(
@@ -4105,6 +4667,13 @@ class TextDecoder(Component):
                         self.model_args.use_kv_cache,
                         self.control_args.tasks,
                         self.control_args.limit,
+                    )
+                if prompt_only_no_generate:
+                    logging.info(
+                        "Running prompt-only calibration without generation: "
+                        "mode=%s use_kv_cache=%s",
+                        self.mode.name,
+                        self.model_args.use_kv_cache,
                     )
                 self._calibrate(
                     model=self.decoder,
@@ -4119,11 +4688,96 @@ class TextDecoder(Component):
                 # error happened in convert_pt2e
                 self.decoder(*self.export_input)
 
+            if (
+                os.environ.get("ET_QNN_EARLY_PREFILL_PRUNE", "") == "1"
+                and self.mode == Mode.PREFILL
+            ):
+                if getattr(self.control_args, "separate_embed", False):
+                    graph_info, self.export_input = (
+                        HybridTextDecoder._rewrite_decoder_input_for_separate_embed(
+                            None,
+                            self.decoder,
+                            "prefill_forward",
+                            self.export_input,
+                        )
+                    )
+                    self._early_separate_embed_info = graph_info
+                tail_layer_start = os.environ.get(
+                    "ET_QNN_PREFILL_LOGITS_TAIL_LAYER_START", ""
+                )
+                if tail_layer_start:
+                    if getattr(self.control_args, "prefill_only_no_output", False):
+                        raise RuntimeError(
+                            "logits tail profile probe is incompatible with no-output export"
+                        )
+                    self.export_input = HybridTextDecoder._retain_prefill_logits_layer_tail(
+                        self.decoder,
+                        "prefill_forward",
+                        self.export_input,
+                        int(tail_layer_start),
+                    )
+                if getattr(self.control_args, "prefill_only_no_output", False):
+                    self.export_input = HybridTextDecoder._remove_logits_output(
+                        None,
+                        self.decoder,
+                        "prefill_forward",
+                        self.export_input,
+                    )
+                    self._early_logits_removed = True
+                self.decoder.delete_all_unused_submodules()
+                gc.collect()
+                logging.info(
+                    "Applied calibrated early prefill pruning: separate_embed=%s "
+                    "no_output=%s",
+                    bool(getattr(self, "_early_separate_embed_info", None)),
+                    bool(getattr(self, "_early_logits_removed", False)),
+                )
+
             self.decoder = convert_pt2e(self.decoder)
             print("\n=== After convert_pt2e for decoder ===")
 
+            self._override_prefill_kv_output_qparams()
+            self._override_decode_kv_input_qparams()
+
+            self._capture_prefill_residuals(
+                self.decoder, data.tokenizer, stage="qdq"
+            )
+            if (
+                os.environ.get("ET_QNN_PREFILL_RESIDUAL_CAPTURE_ONLY", "") == "1"
+                and self.mode == Mode.PREFILL
+            ):
+                raise SystemExit(0)
+
             # Optional: replace quantized qweight/scale from user-provided QAT checkpoint.
             self._replace_qparams_from_qat_checkpoint(self.decoder)
+            if os.environ.get("ET_QNN_LOW_MEMORY_TRIM", "") == "1":
+                gc.collect()
+                try:
+                    import ctypes
+
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except (OSError, AttributeError) as error:
+                    logging.warning("Unable to trim host heap: %s", error)
+                for evict_path in os.environ.get(
+                    "ET_QNN_EVICT_CHECKPOINT_CACHE", ""
+                ).split(os.pathsep):
+                    if not evict_path:
+                        continue
+                    try:
+                        with open(evict_path, "rb") as evict_file:
+                            os.posix_fadvise(
+                                evict_file.fileno(),
+                                0,
+                                0,
+                                os.POSIX_FADV_DONTNEED,
+                            )
+                    except (AttributeError, OSError) as error:
+                        logging.warning(
+                            "Unable to evict post-QAT cache %s: %s",
+                            evict_path,
+                            error,
+                        )
+                logging.info("Released post-QAT temporary host memory")
 
             # Optional: run one forward smoke test right after QAT replacement,
             # before backend lowering/compilation.
@@ -4132,6 +4786,21 @@ class TextDecoder(Component):
             # Optional: run one full text generation right after QAT replacement,
             # before backend lowering/compilation.
             self._run_post_replace_text_generation(self.decoder, data.tokenizer)
+            if getattr(
+                self.control_args, "qat_post_replace_generate_only", False
+            ):
+                if not getattr(
+                    self.control_args, "qat_post_replace_generate_text", False
+                ):
+                    raise ValueError(
+                        "--qat_post_replace_generate_only requires "
+                        "--qat_post_replace_generate_text"
+                    )
+                logging.info(
+                    "[qat_generate] generation-only test completed; "
+                    "skipping backend lowering"
+                )
+                raise SystemExit(0)
 
             if getattr(self.control_args, "dump_quant_info", False):
                 dump_filter = getattr(self.control_args, "dump_quant_filter", None)
@@ -4226,13 +4895,20 @@ class TextDecoder(Component):
 
 
             # Saving Decode QDQ Model EP for SQNR evaluation
-            if self.mode == Mode.DECODE:
+            if self.mode == Mode.DECODE and os.environ.get(
+                "ET_QNN_SKIP_DECODE_QDQ_SAVE", ""
+            ) != "1":
                 qdq_ep = torch.export.export(
                     self.decoder, self.export_input, strict=True
                 )
                 qdq_ep_path = f"{self.control_args.artifact}/{DECODE_QDQ_FILENAME}"
                 torch.export.save(qdq_ep, qdq_ep_path)
                 logging.info(f"QDQ EP saved to {qdq_ep_path}")
+            elif self.mode == Mode.DECODE:
+                logging.info(
+                    "Skipping Decode QDQ EP save because "
+                    "ET_QNN_SKIP_DECODE_QDQ_SAVE=1"
+                )
 
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
@@ -4295,6 +4971,7 @@ class HybridTextDecoder(Component):
         self.prefill_only = self.prefill_only_no_output or getattr(
             control_args, "prefill_only", False
         )
+        self.decode_only = getattr(control_args, "decode_only", False)
         if getattr(control_args, "separate_embed", False) and apply_embedding:
             raise RuntimeError("--separate_embed supports text-only decoders only")
         self.decode = None
@@ -4305,16 +4982,20 @@ class HybridTextDecoder(Component):
                 Mode.DECODE,
                 apply_embedding=apply_embedding,
             )
-        self.prefill = TextDecoder(
-            control_args,
-            config,
-            Mode.PREFILL,
-            apply_embedding=apply_embedding,
-        )
+        self.prefill = None
+        if not self.decode_only:
+            self.prefill = TextDecoder(
+                control_args,
+                config,
+                Mode.PREFILL,
+                apply_embedding=apply_embedding,
+            )
         self.control_args = control_args
         self.config = config
         if self.decode is None:
             self.set_next(self.prefill)
+        elif self.prefill is None:
+            self.set_next(self.decode)
         else:
             self.set_next(self.decode).set_next(self.prefill)
 
@@ -4376,11 +5057,11 @@ class HybridTextDecoder(Component):
             node.name: value
             for node, value in zip(original_placeholders, export_input)
         }
-        tokens_node = self._find_tokens_placeholder(graph, graph_name)
+        tokens_node = HybridTextDecoder._find_tokens_placeholder(graph, graph_name)
         memo = {}
         boundary = None
         for node in graph.nodes:
-            if node.op == "placeholder" or not self._depends_on_node(
+            if node.op == "placeholder" or not HybridTextDecoder._depends_on_node(
                 node, tokens_node, memo
             ):
                 continue
@@ -4408,7 +5089,7 @@ class HybridTextDecoder(Component):
             hidden_states.meta = dict(boundary.meta)
             hidden_states.meta["val"] = value
         boundary.replace_all_uses_with(hidden_states)
-        self._prune_dead_nodes(graph)
+        HybridTextDecoder._prune_dead_nodes(graph)
         graph.lint()
 
         rewritten_inputs = []
@@ -4480,13 +5161,13 @@ class HybridTextDecoder(Component):
             for node, value in zip(original_placeholders, export_input)
         }
         output_node = next(node for node in graph.nodes if node.op == "output")
-        outputs = self._flat_graph_outputs(output_node)
+        outputs = HybridTextDecoder._flat_graph_outputs(output_node)
         if len(outputs) < 3:
             raise RuntimeError(
                 f"Graph {graph_name} has no logits plus KV output tuple to rewrite"
             )
         output_node.args = (tuple(outputs[1:]),)
-        self._prune_dead_nodes(graph)
+        HybridTextDecoder._prune_dead_nodes(graph)
         graph.lint()
 
         placeholders = [
@@ -4518,6 +5199,115 @@ class HybridTextDecoder(Component):
         return tuple(rewritten_inputs)
 
     @staticmethod
+    def _retain_prefill_logits_layer_tail(
+        decoder_graph_module, graph_name, export_input, layer_start
+    ):
+        """Retain a calibrated tail solely for a bounded logits-profile probe."""
+        graph = decoder_graph_module.graph
+        original_placeholders = [node for node in graph.nodes if node.op == "placeholder"]
+        if len(original_placeholders) != len(export_input):
+            raise RuntimeError(
+                f"Graph {graph_name} placeholder/example-input mismatch before "
+                f"tail retention: {len(original_placeholders)} vs {len(export_input)}"
+            )
+        original_inputs = {
+            node.name: value for node, value in zip(original_placeholders, export_input)
+        }
+        hidden_states = next(
+            (node for node in original_placeholders if node.name == "hidden_states"),
+            None,
+        )
+        if hidden_states is None:
+            raise RuntimeError(
+                "calibrated tail retention requires the separate-embedding rewrite"
+            )
+
+        def node_layers(node):
+            layers = set()
+            for value in node.meta.get("nn_module_stack", {}).values():
+                path = str(value[0] if isinstance(value, (tuple, list)) and value else value)
+                match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", path)
+                if match:
+                    layers.add(int(match.group(1)))
+            return layers
+
+        output_node = next(node for node in graph.nodes if node.op == "output")
+        outputs = HybridTextDecoder._flat_graph_outputs(output_node)
+        if not outputs or not isinstance(outputs[0], torch.fx.Node):
+            raise RuntimeError(f"Graph {graph_name} has no logits node to retain")
+        logits = outputs[0]
+
+        required = set()
+        boundaries = []
+        stack = [(None, logits)]
+        while stack:
+            user, node = stack.pop()
+            layers = node_layers(node)
+            if layers and max(layers) < layer_start:
+                if user is None:
+                    raise RuntimeError("logits unexpectedly precede retained layer tail")
+                boundaries.append((user, node))
+                continue
+            if node in required:
+                continue
+            required.add(node)
+            for input_node in node.all_input_nodes:
+                stack.append((node, input_node))
+
+        if not boundaries:
+            raise RuntimeError(
+                f"Graph {graph_name} found no residual boundary before layer {layer_start}"
+            )
+        hidden_val = hidden_states.meta.get("val")
+        hidden_shape = tuple(getattr(hidden_val, "shape", ()))
+        replaced = set()
+        for user, boundary in boundaries:
+            boundary_val = boundary.meta.get("val")
+            boundary_shape = tuple(getattr(boundary_val, "shape", ()))
+            if boundary_shape != hidden_shape:
+                raise RuntimeError(
+                    "unsafe calibrated tail boundary shape: "
+                    f"node={boundary.name} shape={boundary_shape} hidden={hidden_shape}"
+                )
+            user.replace_input_with(boundary, hidden_states)
+            replaced.add(boundary.name)
+
+        output_node.args = ((logits,),)
+        HybridTextDecoder._prune_dead_nodes(graph)
+        graph.lint()
+        placeholders = [node for node in graph.nodes if node.op == "placeholder"]
+        rewritten_inputs = []
+        for node in placeholders:
+            if node.name not in original_inputs:
+                raise RuntimeError(
+                    f"Graph {graph_name} introduced unexpected placeholder {node.name} "
+                    "while retaining the calibrated tail"
+                )
+            rewritten_inputs.append(original_inputs[node.name])
+        input_spec = torch.utils._pytree.tree_flatten((tuple(rewritten_inputs), {}))[1]
+        codegen = graph._codegen
+        pytree_info = getattr(codegen, "pytree_info", None)
+        if pytree_info is not None:
+            codegen.pytree_info = pytree_info._replace(
+                orig_args=[node.name for node in placeholders],
+                in_spec=input_spec,
+                out_spec=None,
+            )
+        decoder_graph_module._in_spec = input_spec
+        decoder_graph_module._out_spec = None
+        decoder_graph_module.recompile()
+        logging.info(
+            "Retained calibrated Prefill logits tail: graph=%s layer_start=%d "
+            "boundaries=%s nodes=%d inputs=%d",
+            graph_name,
+            layer_start,
+            sorted(replaced),
+            len(list(graph.nodes)),
+            len(rewritten_inputs),
+        )
+        return tuple(rewritten_inputs)
+
+    @staticmethod
     def _embedding_dtype_code(dtype):
         codes = {
             torch.float32: 1,
@@ -4534,16 +5324,46 @@ class HybridTextDecoder(Component):
         return codes[dtype]
 
     def _dump_separate_embedding_matrix(self):
-        weight = self.prefill.separate_embedding_weight
+        embedding_owner = self.prefill if self.prefill is not None else self.decode
+        weight = embedding_owner.separate_embedding_weight
         if weight is None or weight.dim() != 2:
             raise RuntimeError("Missing 2D token embedding weight for separate export")
         weight = weight.detach().cpu().contiguous()
         if weight.dtype == torch.bfloat16:
             weight = weight.to(torch.float32)
-        raw = weight.numpy().tobytes(order="C")
         matrix_path = os.path.join(
             self.control_args.artifact, SEPARATE_EMBED_MATRIX_FILENAME
         )
+        reuse_path = os.environ.get("ET_QNN_SEPARATE_EMBED_REUSE_PATH")
+        if reuse_path:
+            reuse_path = os.path.realpath(reuse_path)
+            matrix_path_real = os.path.realpath(matrix_path)
+            if reuse_path == matrix_path_real:
+                raise RuntimeError(
+                    "ET_QNN_SEPARATE_EMBED_REUSE_PATH must not name the output file"
+                )
+            raw_size = weight.numel() * weight.element_size()
+            # SEMB_v1 has a 36-byte header plus three 16-byte reserved records.
+            expected_size = raw_size + 84
+            actual_size = os.path.getsize(reuse_path)
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"Reusable embedding size mismatch: {actual_size} != {expected_size}"
+                )
+            if os.path.lexists(matrix_path):
+                os.unlink(matrix_path)
+            # Diagnostics run on the same filesystem as the canonical export.  A
+            # hard link prevents every QDQ experiment from consuming another 742 MiB.
+            os.link(reuse_path, matrix_path)
+            return matrix_path, {
+                "format": "SEMB_v1",
+                "quantized": False,
+                "dtype": str(weight.dtype),
+                "shape": list(weight.shape),
+                "reused_from": reuse_path,
+            }
+
+        raw = weight.numpy().tobytes(order="C")
         with open(matrix_path, "wb") as output:
             output.write(struct.pack("<4sII", b"SEMB", 1, 0))
             output.write(
@@ -4667,7 +5487,12 @@ class HybridTextDecoder(Component):
         # here we use a mechanism to make sure the encoding align correctly and
         # save AoT quantization time as well.
         # ---
-        if self.decode is not None and self.prefill.decoder is not None and self.prefill.model_args.use_kv_cache:
+        if (
+            self.decode is not None
+            and self.prefill is not None
+            and self.prefill.decoder is not None
+            and self.prefill.model_args.use_kv_cache
+        ):
             self._encoding_override(
                 decode_model=self.decode.decoder,
                 prefill_model=self.prefill.decoder,
@@ -4688,7 +5513,9 @@ class HybridTextDecoder(Component):
         if self.apply_embedding:
             tok_embedding_data = request.method_data[TOK_EMBEDDING]
             models = [
-                d for d in [self.decode, self.prefill] if d.tok_embedding is not None
+                d
+                for d in [self.decode, self.prefill]
+                if d is not None and d.tok_embedding is not None
             ]
             tok_embedding_example_inputs = [
                 m.tok_embedding_export_input for m in models if m is not None
@@ -4700,20 +5527,29 @@ class HybridTextDecoder(Component):
         if self.prefill_only:
             models = [self.prefill]
             graph_names = ["prefill_forward"]
+        elif self.decode_only:
+            models = [self.decode]
+            graph_names = ["kv_forward"]
         else:
-            models = [d for d in [self.decode, self.prefill] if d.decoder is not None]
+            models = [
+                d
+                for d in [self.decode, self.prefill]
+                if d is not None and d.decoder is not None
+            ]
             graph_names = DECODER_GRAPH_NAMES[: len(models)]
 
         if getattr(self.control_args, "separate_embed", False):
             matrix_path, matrix_meta = self._dump_separate_embedding_matrix()
             separate_embed_info = []
             for graph_name, model in zip(graph_names, models):
-                graph_info, rewritten_export_input = (
-                    self._rewrite_decoder_input_for_separate_embed(
-                        model.decoder, graph_name, model.export_input
+                graph_info = getattr(model, "_early_separate_embed_info", None)
+                if graph_info is None:
+                    graph_info, rewritten_export_input = (
+                        self._rewrite_decoder_input_for_separate_embed(
+                            model.decoder, graph_name, model.export_input
+                        )
                     )
-                )
-                model.export_input = rewritten_export_input
+                    model.export_input = rewritten_export_input
                 separate_embed_info.append(graph_info)
             sidecar_path = os.path.join(
                 self.control_args.artifact, SEPARATE_EMBED_INFO_FILENAME
@@ -4734,7 +5570,169 @@ class HybridTextDecoder(Component):
             logging.info("Saved separate embedding matrix to %s", matrix_path)
             logging.info("Saved separate embedding sidecar to %s", sidecar_path)
 
-        if self.prefill_only_no_output:
+            if (
+                os.environ.get("ET_QNN_POST_REPLACE_EXTERNAL_EMBED_GENERATE", "")
+                == "1"
+            ):
+                if len(models) != 1 or graph_names not in (
+                    ["kv_forward"],
+                    ["prefill_forward"],
+                ):
+                    raise RuntimeError(
+                        "external-embedding QDQ generation requires a single "
+                        "decode-only or prefill-only graph"
+                    )
+                model = models[0]
+                prompt = getattr(
+                    self.control_args, "qat_post_replace_generate_prompt", None
+                ) or getattr(self.control_args, "prompt", None)
+                if isinstance(prompt, (list, tuple)):
+                    prompt = prompt[0]
+                max_seq_len = getattr(
+                    self.control_args,
+                    "qat_post_replace_generate_max_seq_len",
+                    None,
+                ) or model.meta["get_max_context_len"]
+                embedding = torch.nn.Embedding.from_pretrained(
+                    model.separate_embedding_weight.to(torch.float32),
+                    freeze=True,
+                )
+                logging.info(
+                    "[qat_generate_external_embed] running phone-equivalent "
+                    "post-replacement generation"
+                )
+                snapshot_load_path = os.environ.get(
+                    "ET_QNN_POST_REPLACE_EXTERNAL_EMBED_SNAPSHOT_LOAD", ""
+                )
+                if snapshot_load_path:
+                    snapshot = torch.load(
+                        snapshot_load_path, map_location="cpu", weights_only=True
+                    )
+                    _, attention_mask, _, k_caches, v_caches = (
+                        model.get_example_inputs()
+                    )
+                    pos = int(snapshot["pos"])
+                    for target, source in zip(k_caches, snapshot["k_caches"]):
+                        target[:, :, :, :pos].copy_(source)
+                    for target, source in zip(v_caches, snapshot["v_caches"]):
+                        target[:, :, :pos, :].copy_(source)
+                    attention_mask.smart_mask_init(pos)
+                    snapshot_token_override = os.environ.get(
+                        "ET_QNN_POST_REPLACE_EXTERNAL_EMBED_SNAPSHOT_NEXT_TOKEN", ""
+                    )
+                    generated = [
+                        int(snapshot_token_override)
+                        if snapshot_token_override
+                        else int(snapshot["next_token"])
+                    ]
+                    max_new_tokens = int(
+                        os.environ.get(
+                            "ET_QNN_POST_REPLACE_EXTERNAL_EMBED_SNAPSHOT_STEPS", "7"
+                        )
+                    )
+                    with torch.no_grad():
+                        while len(generated) < max_new_tokens:
+                            token_tensor = torch.tensor(
+                                [[generated[-1]]], dtype=torch.int64
+                            )
+                            hidden = embedding(token_tensor)
+                            position = torch.tensor([[pos]], dtype=torch.int32)
+                            logits, new_k_caches, new_v_caches = model.decoder(
+                                hidden,
+                                *attention_mask,
+                                position,
+                                *k_caches,
+                                *v_caches,
+                            )
+                            next_token = int(
+                                torch.argmax(logits[:, 0], dim=-1).item()
+                            )
+                            generated.append(next_token)
+                            pos, k_caches, v_caches = smart_mask_updater(
+                                1,
+                                attention_mask,
+                                pos,
+                                k_caches,
+                                v_caches,
+                                new_k_caches,
+                                new_v_caches,
+                            )
+                    logging.info(
+                        "[qat_generate_external_embed] snapshot continuation tokens=%s text=%r",
+                        generated,
+                        model.calibration_tokenizer.decode(generated),
+                    )
+                else:
+                    diagnostic_inputs = model.get_example_inputs()
+
+                    def _get_diagnostic_inputs():
+                        return diagnostic_inputs
+
+                    result_logits = graph_module_inference(
+                        use_kv_cache=model.meta["get_use_kv_cache"],
+                        get_example_inputs=_get_diagnostic_inputs,
+                        module=model.decoder,
+                        tokenizer=model.calibration_tokenizer,
+                        ar_len=model.meta["get_ar_len"],
+                        max_seq_len=max_seq_len,
+                        prompt=prompt,
+                        tok_embedding=embedding,
+                        # Any non-None sentinel selects the existing external
+                        # embedding input path; no image tokens are present.
+                        image_token_id=-1,
+                        use_i64_token=False,
+                        event_name="qat_post_replace_external_embed_generate",
+                        # _prefill_chunking already appends the argmax from the
+                        # final real prompt position. Avoid a second generation
+                        # phase unless explicitly requested by a diagnostic.
+                        generate_tokens=(
+                            os.environ.get(
+                                "ET_QNN_POST_REPLACE_EXTERNAL_EMBED_CONTINUE", ""
+                            )
+                            == "1"
+                        ),
+                        collect_logits=True,
+                    )
+                    snapshot_save_path = os.environ.get(
+                        "ET_QNN_POST_REPLACE_EXTERNAL_EMBED_SNAPSHOT_SAVE", ""
+                    )
+                    if snapshot_save_path:
+                        _, _, _, k_caches, v_caches = diagnostic_inputs
+                        prompt_len = int(result_logits.shape[1])
+                        next_token = int(
+                            torch.argmax(result_logits[:, -1], dim=-1).item()
+                        )
+                        torch.save(
+                            {
+                                "pos": prompt_len,
+                                "next_token": next_token,
+                                "k_caches": [
+                                    cache[:, :, :, :prompt_len].clone()
+                                    for cache in k_caches
+                                ],
+                                "v_caches": [
+                                    cache[:, :, :prompt_len, :].clone()
+                                    for cache in v_caches
+                                ],
+                            },
+                            snapshot_save_path,
+                        )
+                        logging.info(
+                            "[qat_generate_external_embed] saved snapshot path=%s "
+                            "pos=%d next_token=%d",
+                            snapshot_save_path,
+                            prompt_len,
+                            next_token,
+                        )
+                logging.info(
+                    "[qat_generate_external_embed] generation-only test "
+                    "completed; skipping backend lowering"
+                )
+                raise SystemExit(0)
+
+        if self.prefill_only_no_output and not getattr(
+            self.prefill, "_early_logits_removed", False
+        ):
             self.prefill.export_input = self._remove_logits_output(
                 self.prefill.decoder,
                 "prefill_forward",
@@ -4802,10 +5800,17 @@ class HybridTextDecoder(Component):
         )
         qnn_quant_profiles = None
         previous_profile_flag = None
+        previous_activation_bits = None
         if emit_llama_qnn_quant_profile:
             previous_profile_flag = os.environ.get("ET_QNN_LLAMA_QUANT_PROFILE")
+            previous_activation_bits = os.environ.get(
+                "ET_QNN_LLAMA_ACTIVATION_BITS"
+            )
             reset_llama_quant_profile_batches()
             os.environ["ET_QNN_LLAMA_QUANT_PROFILE"] = "1"
+            os.environ["ET_QNN_LLAMA_ACTIVATION_BITS"] = str(
+                getattr(self.control_args, "llama_qnn_activation_bits", 16)
+            )
 
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             module=dict(zip(graph_names, [model.decoder for model in models])),
@@ -4821,15 +5826,79 @@ class HybridTextDecoder(Component):
             "ET_QNN_DIAGNOSTIC_SHARD_LIMIT", ""
         )
         if diagnostic_shard_limit:
-            if not getattr(self.control_args, "dump_intermediate_outputs", False):
+            diagnostic_shard_start = os.environ.get(
+                "ET_QNN_DIAGNOSTIC_SHARD_START", ""
+            )
+            if (
+                not diagnostic_shard_start
+                and not getattr(self.control_args, "dump_intermediate_outputs", False)
+            ):
                 raise RuntimeError(
                     "ET_QNN_DIAGNOSTIC_SHARD_LIMIT is restricted to exports using "
-                    "--dump_intermediate_outputs"
+                    "--dump_intermediate_outputs unless an explicit shard start "
+                    "selects a bounded production batch"
+                )
+            qnn_kv_profiles_by_graph = {}
+            gptq_source_recipe = None
+            if emit_llama_qnn_quant_profile:
+                qnn_quant_profiles = consume_llama_quant_profile_batches()
+                if not qnn_quant_profiles:
+                    raise RuntimeError(
+                        "bounded QNN quantization profile capture produced no "
+                        "shard records"
+                    )
+                logging.info(
+                    "Captured bounded QNN quantization profile shards: "
+                    "count=%d scopes=%s",
+                    len(qnn_quant_profiles),
+                    [profile.get("scope") for profile in qnn_quant_profiles],
+                )
+                if previous_profile_flag is None:
+                    os.environ.pop("ET_QNN_LLAMA_QUANT_PROFILE", None)
+                else:
+                    os.environ["ET_QNN_LLAMA_QUANT_PROFILE"] = previous_profile_flag
+                if previous_activation_bits is None:
+                    os.environ.pop("ET_QNN_LLAMA_ACTIVATION_BITS", None)
+                else:
+                    os.environ["ET_QNN_LLAMA_ACTIVATION_BITS"] = (
+                        previous_activation_bits
+                    )
+                gptq_source_recipe = models[0]._llama_gptq_source_recipe()
+                for graph_name, model in zip(graph_names, models):
+                    if graph_name != "prefill_forward":
+                        continue
+                    kv_profile = model._llama_qnn_kv_profile()
+                    if kv_profile is None:
+                        raise RuntimeError(
+                            "bounded prefill QNN profile requested but KV metadata "
+                            "was not captured"
+                        )
+                    qnn_kv_profiles_by_graph[graph_name] = kv_profile
+            data = request.method_data[TEXT_DECODER]
+            models[0]._export_sharded_decoder_ptes(
+                edge_prog_mgr=edge_prog_mgr,
+                graph_names=graph_names,
+                artifact_dir=self.control_args.artifact,
+                base_name=data.pte_filename,
+                qnn_quant_profiles=qnn_quant_profiles,
+                qnn_kv_profiles_by_graph=qnn_kv_profiles_by_graph,
+                gptq_source_recipe=gptq_source_recipe,
+            )
+            logging.warning(
+                "Completed diagnostic-only QNN shard export; skipped combined PTE "
+                "serialization and remaining shards"
+            )
+            return
+
+        if os.environ.get("ET_QNN_SHARDED_ONLY_EXPORT", "") == "1":
+            if self.config.num_sharding <= 1:
+                raise RuntimeError(
+                    "ET_QNN_SHARDED_ONLY_EXPORT requires num_sharding > 1"
                 )
             if emit_llama_qnn_quant_profile:
                 raise RuntimeError(
-                    "ET_QNN_DIAGNOSTIC_SHARD_LIMIT cannot be combined with "
-                    "--emit_llama_qnn_quant_profile"
+                    "ET_QNN_SHARDED_ONLY_EXPORT with quant-profile capture is "
+                    "not implemented; use the bounded profile export path"
                 )
             data = request.method_data[TEXT_DECODER]
             models[0]._export_sharded_decoder_ptes(
@@ -4838,9 +5907,9 @@ class HybridTextDecoder(Component):
                 artifact_dir=self.control_args.artifact,
                 base_name=data.pte_filename,
             )
-            logging.warning(
-                "Completed diagnostic-only QNN shard export; skipped combined PTE "
-                "serialization and remaining shards"
+            logging.info(
+                "Completed production QNN sharded-only export; skipped combined "
+                "PTE serialization"
             )
             return
 
@@ -4868,6 +5937,40 @@ class HybridTextDecoder(Component):
             for graph_name in graph_names:
                 update_spill_fill_size(edge_prog_mgr.exported_program(graph_name))
 
+        if os.environ.get("ET_QNN_SANITIZE_EXECUTORCH_META", "") == "1":
+            sanitized_values = 0
+
+            def to_plain_meta(value):
+                nonlocal sanitized_values
+                if not isinstance(value, torch.Tensor):
+                    return value
+                if value.layout != torch.strided:
+                    raise RuntimeError(
+                        "ET_QNN_SANITIZE_EXECUTORCH_META only supports strided "
+                        f"metadata tensors, got {value.layout}"
+                    )
+                sanitized_values += 1
+                return torch.empty_strided(
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    dtype=value.dtype,
+                    device="meta",
+                    requires_grad=value.requires_grad,
+                )
+
+            for graph_name in graph_names:
+                graph_module = edge_prog_mgr.exported_program(graph_name).graph_module
+                for node in graph_module.graph.nodes:
+                    if "val" in node.meta:
+                        node.meta["val"] = torch.utils._pytree.tree_map(
+                            to_plain_meta, node.meta["val"]
+                        )
+            logging.info(
+                "Replaced %d ExecuTorch verifier Fake/FunctionalTensor metadata "
+                "values with plain meta tensors",
+                sanitized_values,
+            )
+
         if self.control_args.verbose:
             for ep in edge_prog_mgr._edge_programs.values():
                 print_delegation_info(ep.graph_module)
@@ -4879,6 +5982,10 @@ class HybridTextDecoder(Component):
                 alloc_graph_input=False,
                 alloc_graph_output=False,
             ),
+            # No-op for ordinary float I/O. For PCQ boundaries deliberately
+            # left to portable dequantization, preserve the delegate's real
+            # integer output dtype in the call_delegate TensorSpec.
+            passes=[BuildQuantIo()],
         )
         try:
             exec_prog_mgr = edge_prog_mgr.to_executorch(executorch_config)
@@ -4898,8 +6005,21 @@ class HybridTextDecoder(Component):
                     os.environ.pop("ET_QNN_LLAMA_QUANT_PROFILE", None)
                 else:
                     os.environ["ET_QNN_LLAMA_QUANT_PROFILE"] = previous_profile_flag
+                if previous_activation_bits is None:
+                    os.environ.pop("ET_QNN_LLAMA_ACTIVATION_BITS", None)
+                else:
+                    os.environ["ET_QNN_LLAMA_ACTIVATION_BITS"] = (
+                        previous_activation_bits
+                    )
 
-        if emit_llama_qnn_quant_profile and self.config.num_sharding <= 1:
+        allow_single_profile_shard = (
+            os.environ.get("ET_QNN_ALLOW_SINGLE_PROFILE_SHARD", "") == "1"
+        )
+        if (
+            emit_llama_qnn_quant_profile
+            and self.config.num_sharding <= 1
+            and not allow_single_profile_shard
+        ):
             raise RuntimeError(
                 "--emit_llama_qnn_quant_profile currently requires --num_sharding "
                 "so the profile can be embedded in a shard manifest"
@@ -4916,6 +6036,12 @@ class HybridTextDecoder(Component):
                     continue
                 kv_profile = model._llama_qnn_kv_profile()
                 if kv_profile is None:
+                    if allow_single_profile_shard:
+                        logging.warning(
+                            "Single-shard logits profile probe has no KV metadata; "
+                            "the primary deployment manifest remains the KV ABI source"
+                        )
+                        continue
                     raise RuntimeError(
                         "prefill QNN quantization profile requested but KV metadata "
                         "was not captured"
@@ -4925,7 +6051,7 @@ class HybridTextDecoder(Component):
         combined_pte_path = f"{self.control_args.artifact}/{data.pte_filename}.pte"
         with open(combined_pte_path, "wb") as file:
             exec_prog_mgr.write_to_file(file)
-        if self.config.num_sharding > 1:
+        if self.config.num_sharding > 1 or allow_single_profile_shard:
             models[0]._export_sharded_decoder_ptes(
                 edge_prog_mgr=edge_prog_mgr,
                 graph_names=graph_names,

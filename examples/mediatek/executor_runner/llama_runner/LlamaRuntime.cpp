@@ -9,6 +9,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
 #include <executorch/runtime/platform/log.h>
 
@@ -86,14 +89,16 @@ void LlamaRuntime::Initialize(
         initBatchSize,
         numCache,
         numRotEmbInputs,
+        chunkIdx + 1 == numChunk ? modelOptions.logit_shard_count : 1,
         enableSWA,
+        chunkIdx,
         mRotEmbMasterLut.get());
     mLlamaModelChunks.push_back(std::move(llamaChunk));
   }
 
   for (size_t i = 0; i < numChunk; i++) {
     auto& modelChunk = mLlamaModelChunks[i];
-    if (i > 0) {
+    if (i > 0 && !mModelOptions.copy_chunk_io) {
       const auto& prevModelChunk = mLlamaModelChunks[i - 1];
       modelChunk->SetInputBuffer(prevModelChunk->GetOutputBuffer());
     }
@@ -148,7 +153,8 @@ void LlamaRuntime::Reset() {
 
 void* LlamaRuntime::Run(
     const std::vector<uint64_t>& inputTokens,
-    const bool lastLogits) {
+    const bool lastLogits,
+    const ChunkCompleteCallback& chunkCompleteCallback) {
   const auto& firstLlamaChunk = mLlamaModelChunks.front();
   const auto tokenIndex =
       static_cast<LlamaModelChunk*>(firstLlamaChunk.get())->GetTokenIndex();
@@ -185,9 +191,42 @@ void* LlamaRuntime::Run(
   // Lookup token embedding
   mTokenEmbLut->lookupEmbedding(curInputTokens);
 
+  if (tokenIndex == 0 && !mModelOptions.first_chunk_input_path.empty()) {
+    const auto inputBuffer = mLlamaModelChunks.front()->GetInputBuffer();
+    std::ifstream stream(
+        mModelOptions.first_chunk_input_path, std::ios::binary | std::ios::ate);
+    ET_CHECK_MSG(
+        stream.good(),
+        "Unable to open first chunk input %s",
+        mModelOptions.first_chunk_input_path.c_str());
+    const auto fileSize = static_cast<size_t>(stream.tellg());
+    ET_CHECK_MSG(
+        fileSize == inputBuffer.nbytesUsed,
+        "First chunk input size mismatch: file=%zu, model=%zu",
+        fileSize,
+        inputBuffer.nbytesUsed);
+    stream.seekg(0);
+    stream.read(reinterpret_cast<char*>(inputBuffer.data), fileSize);
+    ET_CHECK_MSG(
+        stream.good(),
+        "Unable to read first chunk input %s",
+        mModelOptions.first_chunk_input_path.c_str());
+    ET_LOG(
+        Info,
+        "Loaded first chunk input: %zu bytes <- %s",
+        fileSize,
+        mModelOptions.first_chunk_input_path.c_str());
+  }
+
   // Decoder chunks
-  for (auto& modelChunk : mLlamaModelChunks) {
+  for (size_t chunkIdx = 0; chunkIdx < mLlamaModelChunks.size(); ++chunkIdx) {
+    auto& modelChunk = mLlamaModelChunks[chunkIdx];
     auto llamaChunk = static_cast<LlamaModelChunk*>(modelChunk.get());
+
+    if (chunkIdx > 0 && mModelOptions.copy_chunk_io) {
+      const auto& prevModelChunk = mLlamaModelChunks[chunkIdx - 1];
+      modelChunk->SetInputBuffer(prevModelChunk->GetOutputBuffer());
+    }
 
     // Set padding if needed.
     if (isLeftPadAllowed)
@@ -197,6 +236,72 @@ void* LlamaRuntime::Run(
 
     // Run model chunk
     llamaChunk->Run();
+
+    if (chunkCompleteCallback) {
+      chunkCompleteCallback(chunkIdx, *llamaChunk);
+    }
+
+    // Dump the unmodified primary output before it is consumed by the next
+    // chunk. This does not add graph outputs or change backend partitioning.
+    if (tokenIndex == 0 && !mModelOptions.chunk_debug_dump_dir.empty()) {
+      const auto buffer = modelChunk->GetOutputBuffer();
+      std::ostringstream path;
+      path << mModelOptions.chunk_debug_dump_dir << "/chunk_" << std::setfill('0')
+           << std::setw(2) << chunkIdx << "_prefill_output_f32.bin";
+      std::ofstream stream(path.str(), std::ios::binary);
+      ET_CHECK_MSG(
+          stream.good(), "Unable to open chunk dump %s", path.str().c_str());
+      stream.write(reinterpret_cast<const char*>(buffer.data), buffer.nbytesUsed);
+      ET_CHECK_MSG(
+          stream.good(), "Unable to write chunk dump %s", path.str().c_str());
+      ET_LOG(
+          Info,
+          "Chunk debug output %zu: %zu bytes -> %s",
+          chunkIdx,
+          buffer.nbytesUsed,
+          path.str().c_str());
+    }
+
+    // Dump only the first (prefill) invocation. Extra outputs are ordered after
+    // output 0 and all KV-cache outputs. The caller creates the destination dir.
+    if (tokenIndex == 0 && !mModelOptions.layer_debug_dump_dir.empty()) {
+      const size_t numCache =
+          2 * mModelOptions.num_layer / mLlamaModelChunks.size();
+      const size_t debugOutputCount =
+          mModelOptions.layer_debug_chunk_index < 0 ||
+              static_cast<size_t>(mModelOptions.layer_debug_chunk_index) ==
+                  chunkIdx
+          ? mModelOptions.layer_debug_output_count
+          : 0;
+      for (size_t localLayer = 0; localLayer < debugOutputCount; ++localLayer) {
+        const size_t outputIndex = 1 + numCache + localLayer;
+        const auto buffer = modelChunk->GetOutputBuffer(outputIndex);
+        std::ostringstream path;
+        if (mModelOptions.layer_debug_chunk_index >= 0) {
+          path << mModelOptions.layer_debug_dump_dir << "/operator_"
+               << std::setfill('0') << std::setw(2) << localLayer
+               << "_prefill_f32.bin";
+        } else {
+          const size_t globalLayer =
+              chunkIdx * mModelOptions.layer_debug_output_count + localLayer;
+          path << mModelOptions.layer_debug_dump_dir << "/layer_"
+               << std::setfill('0') << std::setw(2) << globalLayer
+               << "_prefill_f32.bin";
+        }
+        std::ofstream stream(path.str(), std::ios::binary);
+        ET_CHECK_MSG(stream.good(), "Unable to open layer dump %s", path.str().c_str());
+        stream.write(
+            reinterpret_cast<const char*>(buffer.data), buffer.nbytesUsed);
+        ET_CHECK_MSG(stream.good(), "Unable to write layer dump %s", path.str().c_str());
+        ET_LOG(
+            Info,
+            "Layer debug output %zu: %zu bytes -> %s",
+            localLayer,
+            buffer.nbytesUsed,
+            path.str().c_str());
+      }
+    }
+
   }
 
   // Only consider valid tokens by ignoring padding
@@ -204,6 +309,50 @@ void* LlamaRuntime::Run(
 
   // Return logits
   const auto& finalChunk = mLlamaModelChunks.back();
+  if (mModelOptions.logit_shard_count > 1) {
+    const size_t elementSize =
+        llm_helper::getLLMTypeSize(mModelOptions.model_output_type);
+    const size_t returnedTokens = lastLogits ? 1 : mTokenBatchSize;
+    mShardedLogits.clear();
+    mShardedLogits.reserve(
+        returnedTokens * mModelOptions.vocab_size * elementSize);
+    const size_t rightPadSize = !isLeftPadAllowed * padSize;
+    const size_t firstToken =
+        lastLogits ? mTokenBatchSize - 1 - rightPadSize : 0;
+    for (size_t tokenOffset = 0; tokenOffset < returnedTokens; ++tokenOffset) {
+      const size_t token = firstToken + tokenOffset;
+      for (size_t shard = 0; shard < mModelOptions.logit_shard_count; ++shard) {
+        const auto buffer = finalChunk->GetOutputBuffer(shard);
+        ET_CHECK_MSG(
+            buffer.nbytesUsed % mTokenBatchSize == 0,
+            "Logit shard %zu size is not divisible by token batch size",
+            shard);
+        const size_t tokenBytes = buffer.nbytesUsed / mTokenBatchSize;
+        const char* source = reinterpret_cast<const char*>(buffer.data) +
+            token * tokenBytes;
+        mShardedLogits.insert(
+            mShardedLogits.end(), source, source + tokenBytes);
+      }
+    }
+    ET_CHECK_MSG(
+        mShardedLogits.size() ==
+            returnedTokens * mModelOptions.vocab_size * elementSize,
+        "Combined logits size mismatch: got %zu expected %zu",
+        mShardedLogits.size(),
+        returnedTokens * mModelOptions.vocab_size * elementSize);
+    if (!mModelOptions.combined_logits_dump_dir.empty()) {
+      std::ostringstream path;
+      path << mModelOptions.combined_logits_dump_dir << "/logits_token_"
+           << std::setfill('0') << std::setw(5) << mTokenIndex << ".bin";
+      std::ofstream stream(path.str(), std::ios::binary);
+      ET_CHECK_MSG(
+          stream.good(), "Unable to open combined logits dump %s", path.str().c_str());
+      stream.write(mShardedLogits.data(), mShardedLogits.size());
+      ET_CHECK_MSG(
+          stream.good(), "Unable to write combined logits dump %s", path.str().c_str());
+    }
+    return mShardedLogits.data();
+  }
   const auto logitsBuffer = finalChunk->GetOutputBuffer();
   const auto logitsData = reinterpret_cast<char*>(logitsBuffer.data);
   const auto logitsSize = logitsBuffer.nbytesUsed;
@@ -227,6 +376,24 @@ size_t LlamaRuntime::GetTokenIndex() const {
 
 const LlamaModelOptions& LlamaRuntime::GetModelOptions() const {
   return mModelOptions;
+}
+
+size_t LlamaRuntime::GetNumKVHeads() const {
+  ET_CHECK_MSG(!mLlamaModelChunks.empty(), "Llama runtime is not initialized");
+  return static_cast<LlamaModelChunk*>(mLlamaModelChunks.front().get())
+      ->GetNumKVHeads();
+}
+
+size_t LlamaRuntime::GetCacheHeadDim() const {
+  ET_CHECK_MSG(!mLlamaModelChunks.empty(), "Llama runtime is not initialized");
+  return static_cast<LlamaModelChunk*>(mLlamaModelChunks.front().get())
+      ->GetCacheHeadDim();
+}
+
+size_t LlamaRuntime::GetCacheLength() const {
+  ET_CHECK_MSG(!mLlamaModelChunks.empty(), "Llama runtime is not initialized");
+  return static_cast<LlamaModelChunk*>(mLlamaModelChunks.front().get())
+      ->GetCacheLength();
 }
 
 } // namespace example

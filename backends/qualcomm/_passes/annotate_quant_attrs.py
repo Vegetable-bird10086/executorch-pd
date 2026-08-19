@@ -10,6 +10,7 @@ import torch
 from executorch.backends.qualcomm.builders.node_visitor import dq_ops, q_ops
 from executorch.backends.qualcomm.builders.utils import get_parameter
 from executorch.backends.qualcomm.utils.constants import (
+    QCOM_AXIS,
     QCOM_DTYPE,
     QCOM_ENCODING,
     QCOM_QUANT_ATTRS,
@@ -17,7 +18,9 @@ from executorch.backends.qualcomm.utils.constants import (
     QCOM_QUANT_MIN,
     QCOM_REQUANTIZE,
     QCOM_SCALE,
+    QCOM_SCALES,
     QCOM_ZERO_POINT,
+    QCOM_ZERO_POINTS,
 )
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.pass_base import ExportPass, PassResult
@@ -105,14 +108,34 @@ class AnnotateQuantAttrs(ExportPass):
                     # In full requant mode, consider requant if any key attribute differs.
                     # This aims to improve accuracy by adjusting scale, zero_point, etc.
                     # Users can disable this if it causes regressions.
+                    def attr_differs(attr):
+                        if (attr in q_attrs) != (attr in dq_attrs):
+                            return True
+                        if attr not in q_attrs:
+                            return False
+                        q_value, dq_value = q_attrs[attr], dq_attrs[attr]
+                        if q_value is None or dq_value is None:
+                            return q_value is not dq_value
+                        if isinstance(q_value, torch.Tensor) or isinstance(
+                            dq_value, torch.Tensor
+                        ):
+                            return not torch.equal(
+                                torch.as_tensor(q_value), torch.as_tensor(dq_value)
+                            )
+                        return q_value != dq_value
+
                     if any(
-                        q_attrs[attr] != dq_attrs[attr]
+                        attr_differs(attr)
                         for attr in [
                             QCOM_SCALE,
                             QCOM_ZERO_POINT,
+                            QCOM_SCALES,
+                            QCOM_ZERO_POINTS,
+                            QCOM_AXIS,
                             QCOM_QUANT_MIN,
                             QCOM_QUANT_MAX,
                             QCOM_DTYPE,
+                            QCOM_ENCODING,
                         ]
                     ):
                         is_requant_needed = True

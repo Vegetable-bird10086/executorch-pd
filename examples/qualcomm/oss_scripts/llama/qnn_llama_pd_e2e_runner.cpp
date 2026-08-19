@@ -1,4 +1,5 @@
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
+#include <executorch/backends/qualcomm/runtime/QnnExecuTorchBackend.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/pd_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/pte_rebuilder.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
@@ -14,17 +15,22 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cinttypes>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -59,8 +65,25 @@ DEFINE_string(
     "Path to the llama.cpp GPTQ2_32 GGUF model used to rebuild stripped decoder blocks in memory.");
 DEFINE_bool(
     model_ram_store,
-    false,
+    true,
     "Load the shared Prefill/Decode GGUF into a sealed memfd before E2E timing.");
+DEFINE_bool(
+    model_anonymous_buffer,
+    false,
+    "Load the shared Prefill/Decode GGUF into one read-only anonymous memory "
+    "buffer consumed directly by both PTE rebuild and joint Decode.");
+DEFINE_bool(
+    model_residency_probe,
+    false,
+    "Diagnostic: report mincore residency of the shared GGUF buffer at PD stages.");
+DEFINE_string(
+    model_residency_profile_path,
+    "",
+    "Write periodic shared-model residency and memory-pressure samples to CSV.");
+DEFINE_int32(
+    model_residency_profile_interval_ms,
+    250,
+    "Sampling interval for --model_residency_profile_path (minimum 50 ms).");
 DEFINE_string(
     prefill_shard_manifest_path,
     "",
@@ -123,7 +146,7 @@ DEFINE_string(
     "Attention sink rope PTE. Not supported in PD v1 export.");
 DEFINE_int32(
     seq_len,
-    1024,
+    4096,
     "Compiled sequence length budget to respect during prefill export.");
 DEFINE_int32(
     eval_mode,
@@ -144,8 +167,8 @@ DEFINE_bool(
     "Preload stripped shard inputs and rebuild one shard ahead on a CPU worker while QNN executes the current shard.");
 DEFINE_bool(
     prefill_shard_pipeline_3stage,
-    false,
-    "Experimental stage-major pipeline: rebuild(i+2), QNN load(i+1), and execute(i) on separate stages.");
+    true,
+    "Stage-major pipeline: rebuild(i+2), QNN load(i+1), and execute(i) on separate stages.");
 DEFINE_bool(
     prefill_qnn_backend_prewarm,
     true,
@@ -156,6 +179,85 @@ DEFINE_bool(
     "Rebuild and QNN-load prefill shard 0 during runner preparation, retain "
     "its context through the request, and start the three-stage pipeline at "
     "shard 1.");
+DEFINE_bool(
+    prefill_release_pte_backing_after_load,
+    false,
+    "Experimental: after each rebuilt Prefill shard finishes QNN method load "
+    "and output binding, return its PTE backing to the rebuild pool before "
+    "Execute. Later rebuilds may overwrite it; use only for ownership and "
+    "correctness validation.");
+DEFINE_bool(
+    prefill_detach_shard0_qnn_after_load,
+    false,
+    "Experimental: after persistent shard0 QNN Load, retain a detached QNN "
+    "execution shell and destroy its ExecuTorch Module plus complete PTE "
+    "backing before Execute.");
+DEFINE_bool(
+    prefill_detach_all_qnn_after_load,
+    true,
+    "At the end of every Prefill shard Load, retain only a "
+    "detached QNN execution shell, destroy Module/Method, return the complete "
+    "PTE backing, and limit the three-stage rebuild pool to two buffers.");
+DEFINE_bool(
+    prefill_release_stripped_pte_after_rebuild,
+    true,
+    "Single-request default: release each stripped PTE immediately "
+    "after its rebuilt PTE has been produced.");
+DEFINE_bool(
+    decode_stream_sidecar_during_prefill,
+    true,
+    "Joint-PD default: after Decode warmup discard the physical pages of each "
+    "stable per-shard sidecar malloc buffer and read that shard from the V5 "
+    "payload asynchronously after its Prefill QNN Execute.");
+DEFINE_bool(
+    prefill_release_shard0_after_execute,
+    true,
+    "Release an early-prepared shard0 immediately after its only QNN execute "
+    "so unused rebuilt-PTE pages do not remain resident during CPU Decode.");
+DEFINE_bool(
+    prefill_unload_shard0_method_after_execute,
+    false,
+    "Diagnostic: unload shard0's QNN method/graph after execute while retaining "
+    "its Module and rebuilt PTE backing.");
+DEFINE_bool(
+    prefill_destroy_shard0_module_keep_pte_after_execute,
+    false,
+    "Diagnostic: destroy shard0's complete Module after execute while retaining "
+    "its rebuilt PTE backing allocation.");
+DEFINE_bool(
+    prefill_discard_shard0_pte_pages_after_execute,
+    false,
+    "Diagnostic: after destroying shard0 Module, MADV_DONTNEED the retained "
+    "PTE backing pages while keeping the allocation and capacity.");
+DEFINE_bool(
+    prefill_release_htp_vote_before_decode,
+    false,
+    "Diagnostic: down-vote HTP before CPU Decode while retaining backend/device.");
+DEFINE_bool(
+    prefill_release_all_before_decode,
+    false,
+    "Legacy diagnostic: tear down all Prefill and process-global QNN resources "
+    "before Decode. This is not the seamless joint-PD production lifecycle.");
+DEFINE_int32(
+    decode_cooldown_ms,
+    0,
+    "Diagnostic idle interval after Prefill resource handling and before Decode handoff.");
+DEFINE_bool(
+    decode_pretouch_model,
+    false,
+    "Diagnostic: read one byte from every shared GGUF page before Decode.");
+DEFINE_string(
+    decode_sidecar_reread_path,
+    "",
+    "Diagnostic: after Prefill and immediately before the resident Decode "
+    "handoff, sequentially read the complete Decode sidecar through a small "
+    "temporary buffer. This warms file cache without retaining a second copy.");
+DEFINE_bool(
+    decode_sidecar_pretouch_mapping,
+    false,
+    "Diagnostic: after the optional boundary reread, touch every page of the "
+    "existing Decode sidecar mmap so its VMA page tables are populated before "
+    "the first post-Prefill Decode call.");
 DEFINE_string(
     prefill_etdump_dir,
     "",
@@ -171,7 +273,7 @@ DEFINE_int64(
     "Bytes reserved for the selected shard's ETDump intermediate tensor buffer.");
 DEFINE_bool(
     prefill_shard_stage_major,
-    false,
+    true,
     "For static Qwen3 shards, execute every AR block through one shard before advancing to the next shard.");
 DEFINE_bool(
     prefill_gguf_relayout_blocks,
@@ -217,6 +319,20 @@ DEFINE_bool(
     true,
     "Pass the separate Prefill embedding matrix to Decode as --pd-disk-embedding. "
     "Disable when the Decode GGUF contains its own embedding tensor.");
+DEFINE_bool(
+    decode_native_compare,
+    false,
+    "Compare imported handoff logits against native Decode prompt prefill.");
+DEFINE_bool(
+    decode_defer_runtime_until_after_prefill,
+    false,
+    "Legacy diagnostic: create and warm Decode after Prefill. Production joint "
+    "PD initializes and warms Decode before Prefill for a seamless handoff.");
+DEFINE_bool(
+    decode_stage_model_only_before_prefill,
+    false,
+    "Experimental: load model-only Decode state before Prefill while deferring "
+    "QNN metadata, context, KV, TG reserve, and warmup to the handoff boundary.");
 DEFINE_int32(
     decode_n_predict,
     128,
@@ -272,6 +388,8 @@ struct ProcessMemorySnapshot {
   uint64_t rss_bytes{0};
   uint64_t hwm_bytes{0};
   uint64_t pss_bytes{0};
+  uint64_t minor_faults{0};
+  uint64_t major_faults{0};
 };
 
 uint64_t read_proc_status_bytes(const std::string& path, const char* field) {
@@ -289,33 +407,200 @@ uint64_t read_proc_status_bytes(const std::string& path, const char* field) {
   return 0;
 }
 
+std::pair<uint64_t, uint64_t> read_proc_faults(const std::string& path) {
+  std::ifstream stat(path);
+  std::string line;
+  std::getline(stat, line);
+  const size_t command_end = line.rfind(')');
+  if (command_end == std::string::npos || command_end + 2 >= line.size()) {
+    return {};
+  }
+  std::istringstream fields(line.substr(command_end + 2));
+  char state = 0;
+  uint64_t ignored = 0;
+  uint64_t minor_faults = 0;
+  uint64_t major_faults = 0;
+  fields >> state;
+  for (int field = 4; field <= 9; ++field) {
+    fields >> ignored;
+  }
+  fields >> minor_faults >> ignored >> major_faults;
+  return fields ? std::make_pair(minor_faults, major_faults)
+                : std::pair<uint64_t, uint64_t>{};
+}
+
 ProcessMemorySnapshot process_memory_snapshot() {
+  const auto faults = read_proc_faults("/proc/self/stat");
   return {
       read_proc_status_bytes("/proc/self/status", "VmRSS:"),
       read_proc_status_bytes("/proc/self/status", "VmHWM:"),
       read_proc_status_bytes("/proc/self/smaps_rollup", "Pss:"),
+      faults.first,
+      faults.second,
   };
 }
 
 ProcessMemorySnapshot process_memory_snapshot(pid_t pid) {
   const std::string proc = "/proc/" + std::to_string(pid);
+  const auto faults = read_proc_faults(proc + "/stat");
   return {
       read_proc_status_bytes(proc + "/status", "VmRSS:"),
       read_proc_status_bytes(proc + "/status", "VmHWM:"),
       read_proc_status_bytes(proc + "/smaps_rollup", "Pss:"),
+      faults.first,
+      faults.second,
   };
 }
 
 ProcessMemorySnapshot process_memory_status_snapshot() {
+  const auto faults = read_proc_faults("/proc/self/stat");
   return {
       read_proc_status_bytes("/proc/self/status", "VmRSS:"),
       read_proc_status_bytes("/proc/self/status", "VmHWM:"),
       0,
+      faults.first,
+      faults.second,
   };
 }
 
 double bytes_to_mib(uint64_t bytes) {
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+void reread_decode_sidecar_before_handoff(const std::string& path) {
+  if (path.empty()) {
+    return;
+  }
+  constexpr size_t kReadBufferBytes = 4 * 1024 * 1024;
+  const auto start = SteadyClock::now();
+  const auto before = process_memory_status_snapshot();
+  std::ifstream input(path, std::ios::binary);
+  ET_CHECK_MSG(
+      input.is_open(),
+      "Failed to open Decode sidecar for boundary reread: %s",
+      path.c_str());
+  std::vector<char> buffer(kReadBufferBytes);
+  uint64_t bytes = 0;
+  uint64_t checksum = 0;
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const std::streamsize count = input.gcount();
+    if (count <= 0) {
+      break;
+    }
+    bytes += static_cast<uint64_t>(count);
+    checksum += static_cast<uint8_t>(buffer.front());
+    checksum += static_cast<uint8_t>(buffer[static_cast<size_t>(count) - 1]);
+  }
+  ET_CHECK_MSG(
+      input.eof(),
+      "Decode sidecar boundary reread failed before EOF: path=%s bytes=%" PRIu64,
+      path.c_str(),
+      bytes);
+  buffer.clear();
+  buffer.shrink_to_fit();
+  const auto after = process_memory_status_snapshot();
+  const double reread_ms = elapsed_ms(start);
+  ET_LOG(
+      Info,
+      "PD Decode sidecar boundary reread: path=%s bytes=%" PRIu64 " "
+      "reread_ms=%.3f throughput_mib_s=%.3f checksum=%" PRIu64 " "
+      "major_faults_before=%" PRIu64 " major_faults_after=%" PRIu64 " "
+      "minor_faults_before=%" PRIu64 " minor_faults_after=%" PRIu64 " "
+      "rss_before_mib=%.3f rss_after_mib=%.3f",
+      path.c_str(),
+      bytes,
+      reread_ms,
+      reread_ms > 0.0 ? bytes_to_mib(bytes) * 1000.0 / reread_ms : 0.0,
+      checksum,
+      before.major_faults,
+      after.major_faults,
+      before.minor_faults,
+      after.minor_faults,
+      bytes_to_mib(before.rss_bytes),
+      bytes_to_mib(after.rss_bytes));
+}
+
+void pretouch_decode_sidecar_mapping_before_handoff(
+    const std::string& path) {
+  if (!FLAGS_decode_sidecar_pretouch_mapping) {
+    return;
+  }
+  ET_CHECK_MSG(
+      !path.empty(),
+      "--decode_sidecar_pretouch_mapping requires "
+      "--decode_sidecar_reread_path");
+  const auto start = SteadyClock::now();
+  const auto before = process_memory_status_snapshot();
+  std::ifstream maps("/proc/self/maps");
+  ET_CHECK_MSG(maps.is_open(), "Failed to open /proc/self/maps");
+  const size_t page_size =
+      static_cast<size_t>(std::max<long>(sysconf(_SC_PAGESIZE), 1));
+  uint64_t touched_pages = 0;
+  uint64_t mapped_bytes = 0;
+  uint64_t checksum = 0;
+  std::string line;
+  while (std::getline(maps, line)) {
+    std::istringstream fields(line);
+    std::string address;
+    std::string permissions;
+    std::string offset;
+    std::string device;
+    std::string inode;
+    fields >> address >> permissions >> offset >> device >> inode;
+    std::string mapped_path;
+    std::getline(fields, mapped_path);
+    const size_t first = mapped_path.find_first_not_of(" \t");
+    mapped_path = first == std::string::npos
+        ? std::string()
+        : mapped_path.substr(first);
+    if (mapped_path != path || permissions.empty() || permissions[0] != 'r') {
+      continue;
+    }
+    const size_t dash = address.find('-');
+    ET_CHECK_MSG(
+        dash != std::string::npos,
+        "Malformed /proc/self/maps address: %s",
+        address.c_str());
+    const uintptr_t begin =
+        static_cast<uintptr_t>(std::stoull(address.substr(0, dash), nullptr, 16));
+    const uintptr_t end =
+        static_cast<uintptr_t>(std::stoull(address.substr(dash + 1), nullptr, 16));
+    const volatile uint8_t* bytes =
+        reinterpret_cast<const volatile uint8_t*>(begin);
+    for (uintptr_t current = begin; current < end; current += page_size) {
+      checksum += bytes[current - begin];
+      ++touched_pages;
+    }
+    if (end > begin) {
+      checksum += bytes[end - begin - 1];
+      mapped_bytes += static_cast<uint64_t>(end - begin);
+    }
+  }
+  ET_CHECK_MSG(
+      mapped_bytes != 0,
+      "Decode sidecar mapping not found for boundary pretouch: %s",
+      path.c_str());
+  const auto after = process_memory_status_snapshot();
+  const double pretouch_ms = elapsed_ms(start);
+  ET_LOG(
+      Info,
+      "PD Decode sidecar mapping pretouch: path=%s mapped_bytes=%" PRIu64 " "
+      "touched_pages=%" PRIu64 " pretouch_ms=%.3f checksum=%" PRIu64 " "
+      "major_faults_before=%" PRIu64 " major_faults_after=%" PRIu64 " "
+      "minor_faults_before=%" PRIu64 " minor_faults_after=%" PRIu64 " "
+      "rss_before_mib=%.3f rss_after_mib=%.3f",
+      path.c_str(),
+      mapped_bytes,
+      touched_pages,
+      pretouch_ms,
+      checksum,
+      before.major_faults,
+      after.major_faults,
+      before.minor_faults,
+      after.minor_faults,
+      bytes_to_mib(before.rss_bytes),
+      bytes_to_mib(after.rss_bytes));
 }
 
 struct PdE2ERuntimeStats {
@@ -493,6 +778,21 @@ void log_pd_e2e_runtime_summary(
       bytes_to_mib(std::max(prefill.after_export.hwm_bytes, decode.after.hwm_bytes)));
   ET_LOG(
       Info,
+      "PD E2E parent faults: before_runner_minflt=%" PRIu64
+      " after_runner_minflt=%" PRIu64 " after_export_minflt=%" PRIu64
+      " after_decode_minflt=%" PRIu64 " before_runner_majflt=%" PRIu64
+      " after_runner_majflt=%" PRIu64 " after_export_majflt=%" PRIu64
+      " after_decode_majflt=%" PRIu64,
+      prefill.before_runner.minor_faults,
+      prefill.after_runner.minor_faults,
+      prefill.after_export.minor_faults,
+      decode.after.minor_faults,
+      prefill.before_runner.major_faults,
+      prefill.after_runner.major_faults,
+      prefill.after_export.major_faults,
+      decode.after.major_faults);
+  ET_LOG(
+      Info,
       "PD E2E decode memory MiB: child_peak_rss=%.2f child_hwm=%.2f "
       "process_tree_peak_rss=%.2f process_tree_peak_pss=%.2f poll_interval_ms=5",
       bytes_to_mib(decode.child_peak.rss_bytes),
@@ -629,6 +929,9 @@ struct PrefillShardFiles {
   bool outputs_logits{true};
   bool use_separate_embed{false};
   std::string embedding_matrix_path;
+  bool embedding_qnn_u16_input{false};
+  float embedding_qnn_u16_scale{0.0f};
+  int32_t embedding_qnn_u16_zero_point{0};
   std::shared_ptr<std::vector<uint8_t>> qnn_compile_spec_bytes;
 };
 
@@ -787,6 +1090,23 @@ int32_t read_int_field_or(
   return static_cast<int32_t>(std::stol(manifest.substr(value_start, value_end - value_start)));
 }
 
+float read_float_field_or(
+    const std::string& manifest,
+    size_t start_pos,
+    const std::string& field_name,
+    float default_value) {
+  const size_t field_pos = manifest.find("\"" + field_name + "\"", start_pos);
+  if (field_pos == std::string::npos) return default_value;
+  const size_t colon_pos = manifest.find(":", field_pos);
+  ET_CHECK_MSG(colon_pos != std::string::npos, "Invalid %s float in shard manifest", field_name.c_str());
+  const size_t value_start = manifest.find_first_of("-+.0123456789", colon_pos + 1);
+  ET_CHECK_MSG(value_start != std::string::npos, "Invalid %s float in shard manifest", field_name.c_str());
+  size_t consumed = 0;
+  const float value = std::stof(manifest.substr(value_start), &consumed);
+  ET_CHECK_MSG(consumed > 0, "Invalid %s float in shard manifest", field_name.c_str());
+  return value;
+}
+
 bool read_bool_field_or(
     const std::string& manifest,
     size_t start_pos,
@@ -915,6 +1235,12 @@ PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
     files.head_dim = read_int_field_or(manifest, metadata_pos, "head_dim", files.head_dim);
     files.use_int64_token = read_bool_field_or(
         manifest, metadata_pos, "use_int64_token", files.use_int64_token);
+    files.embedding_qnn_u16_input = read_bool_field_or(
+        manifest, metadata_pos, "embedding_qnn_u16_input", false);
+    files.embedding_qnn_u16_scale = read_float_field_or(
+        manifest, metadata_pos, "embedding_qnn_u16_scale", 0.0f);
+    files.embedding_qnn_u16_zero_point = read_int_field_or(
+        manifest, metadata_pos, "embedding_qnn_u16_zero_point", 0);
   }
   if (files.qwen3_static_plan) {
     ET_LOG(
@@ -1192,7 +1518,23 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   if (has_gguf) {
     config.source_kind =
         example::DecoderRunner::PrefillShardRebuildConfig::SourceKind::Gguf;
-    if (FLAGS_model_ram_store) {
+    if (FLAGS_model_anonymous_buffer) {
+      ET_CHECK_MSG(
+          FLAGS_decode_gguf_path.empty() ||
+              FLAGS_decode_gguf_path == FLAGS_gguf_model_path,
+          "--model_anonymous_buffer requires Prefill and Decode to use the same GGUF");
+      const auto load_start = SteadyClock::now();
+      config.mapped_source_bytes =
+          example::ReadOnlyMappedFile::load_into_anonymous_buffer(
+              FLAGS_gguf_model_path);
+      g_model_ram_fd_spec.clear();
+      ET_LOG(
+          Info,
+          "PD anonymous model buffer ready: bytes=%zu load_ms=%.3f "
+          "timing_scope=bootstrap",
+          config.mapped_source_bytes->size(),
+          elapsed_ms(load_start));
+    } else if (FLAGS_model_ram_store) {
       ET_CHECK_MSG(
           FLAGS_decode_gguf_path.empty() ||
               FLAGS_decode_gguf_path == FLAGS_gguf_model_path,
@@ -1244,12 +1586,52 @@ example::DecoderRunner::PrefillShardRebuildConfig make_prefill_shard_rebuild_con
   config.pipeline_rebuild =
       FLAGS_prefill_shard_pipeline || FLAGS_prefill_shard_pipeline_3stage;
   config.prewarm_qnn_backend = FLAGS_prefill_qnn_backend_prewarm;
+  config.release_stripped_pte_after_rebuild =
+      FLAGS_prefill_release_stripped_pte_after_rebuild;
   ET_CHECK_MSG(
       !FLAGS_prefill_persistent_shard0 ||
           FLAGS_prefill_shard_pipeline_3stage,
       "--prefill_persistent_shard0 requires "
       "--prefill_shard_pipeline_3stage");
   config.persistent_shard0_context = FLAGS_prefill_persistent_shard0;
+  ET_CHECK_MSG(
+      !FLAGS_prefill_detach_shard0_qnn_after_load ||
+          FLAGS_prefill_persistent_shard0,
+      "--prefill_detach_shard0_qnn_after_load requires "
+      "--prefill_persistent_shard0");
+  ET_CHECK_MSG(
+      !FLAGS_prefill_detach_all_qnn_after_load ||
+          FLAGS_prefill_shard_pipeline_3stage,
+      "--prefill_detach_all_qnn_after_load requires "
+      "--prefill_shard_pipeline_3stage");
+  ET_CHECK_MSG(
+      !FLAGS_prefill_release_pte_backing_after_load ||
+          FLAGS_prefill_etdump_dir.empty(),
+      "--prefill_release_pte_backing_after_load is incompatible with ETDump "
+      "method unload/reload");
+  config.release_rebuilt_pte_backing_after_load =
+      FLAGS_prefill_release_pte_backing_after_load;
+  ET_CHECK_MSG(
+      !(FLAGS_prefill_detach_shard0_qnn_after_load ||
+        FLAGS_prefill_detach_all_qnn_after_load) ||
+          (!FLAGS_prefill_release_pte_backing_after_load &&
+           FLAGS_prefill_etdump_dir.empty() &&
+           !FLAGS_prefill_unload_shard0_method_after_execute &&
+           !FLAGS_prefill_destroy_shard0_module_keep_pte_after_execute),
+      "detached QNN execution is incompatible with whole-PTE release, "
+      "ETDump, and post-execute Module lifetime diagnostics");
+  config.detach_shard0_qnn_after_load =
+      FLAGS_prefill_detach_shard0_qnn_after_load;
+  config.detach_all_qnn_after_load =
+      FLAGS_prefill_detach_all_qnn_after_load;
+  config.release_prepared_shard0_after_execute =
+      FLAGS_prefill_release_shard0_after_execute;
+  config.unload_prepared_shard0_method_after_execute =
+      FLAGS_prefill_unload_shard0_method_after_execute;
+  config.destroy_prepared_shard0_module_keep_pte_after_execute =
+      FLAGS_prefill_destroy_shard0_module_keep_pte_after_execute;
+  config.discard_prepared_shard0_pte_pages_after_execute =
+      FLAGS_prefill_discard_shard0_pte_pages_after_execute;
   config.qnn_compile_spec_bytes = files.qnn_compile_spec_bytes;
   ET_LOG(
       Info,
@@ -1342,6 +1724,9 @@ ResidentDecodeProcess start_resident_decode_process(
   if (!shared_embedding_matrix_path.empty()) {
     args.push_back("--pd-disk-embedding");
     args.push_back(shared_embedding_matrix_path);
+  }
+  if (FLAGS_decode_native_compare) {
+    args.push_back("--pd-native-compare");
   }
   if (!FLAGS_decode_ppl_tokens_path.empty()) {
     args.push_back("--pd-ppl-tokens");
@@ -1526,6 +1911,528 @@ void begin_resident_decode_handoff(
 #else
 std::shared_ptr<example::ReadOnlyMappedFile> g_joint_model_source;
 
+void log_joint_model_residency(const char* stage) {
+  if (!FLAGS_model_residency_probe || !g_joint_model_source) {
+    return;
+  }
+  const auto start = SteadyClock::now();
+  const auto residency = g_joint_model_source->residency();
+  const double percent = residency.total_pages == 0
+      ? 0.0
+      : 100.0 * static_cast<double>(residency.resident_pages) /
+          static_cast<double>(residency.total_pages);
+  ET_LOG(
+      Info,
+      "PD model residency: stage=%s resident_pages=%zu total_pages=%zu "
+      "resident_percent=%.3f error=%d probe_ms=%.3f",
+      stage,
+      residency.resident_pages,
+      residency.total_pages,
+      percent,
+      residency.error,
+      elapsed_ms(start));
+}
+
+uint64_t g_joint_prefill_complete_major_faults{0};
+
+struct RawMemoryResidency {
+  size_t resident_pages{0};
+  size_t total_pages{0};
+  int error{0};
+};
+
+RawMemoryResidency raw_memory_residency(const void* data, size_t size) {
+  RawMemoryResidency result;
+  if (data == nullptr || size == 0) {
+    return result;
+  }
+  const long page_size_long = sysconf(_SC_PAGESIZE);
+  if (page_size_long <= 0) {
+    result.error = errno != 0 ? errno : EINVAL;
+    return result;
+  }
+  const uintptr_t page_size = static_cast<uintptr_t>(page_size_long);
+  const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+  const uintptr_t begin = address - address % page_size;
+  const uintptr_t end =
+      (address + size + page_size - 1) / page_size * page_size;
+  result.total_pages = static_cast<size_t>((end - begin) / page_size);
+  std::vector<unsigned char> state(result.total_pages);
+  if (mincore(
+          reinterpret_cast<void*>(begin),
+          static_cast<size_t>(end - begin),
+          state.data()) != 0) {
+    result.error = errno;
+    return result;
+  }
+  result.resident_pages = static_cast<size_t>(std::count_if(
+      state.begin(), state.end(), [](unsigned char value) {
+        return (value & 1U) != 0;
+      }));
+  return result;
+}
+
+const void* g_joint_sidecar_data{nullptr};
+size_t g_joint_sidecar_size{0};
+bool g_joint_sidecar_anonymous{false};
+
+void log_joint_pd_boundary_probe(
+    const char* event,
+    int32_t decode_call_index,
+    int32_t token,
+    bool establish_prefill_baseline) {
+  if (!FLAGS_model_residency_probe || !g_joint_model_source) {
+    return;
+  }
+  const auto start = SteadyClock::now();
+  const auto residency = g_joint_model_source->residency();
+  const auto sidecar_residency =
+      raw_memory_residency(g_joint_sidecar_data, g_joint_sidecar_size);
+  const auto memory = process_memory_status_snapshot();
+  if (establish_prefill_baseline) {
+    g_joint_prefill_complete_major_faults = memory.major_faults;
+  }
+  const uint64_t major_faults_since_prefill =
+      memory.major_faults >= g_joint_prefill_complete_major_faults
+      ? memory.major_faults - g_joint_prefill_complete_major_faults
+      : 0;
+  const double percent = residency.total_pages == 0
+      ? 0.0
+      : 100.0 * static_cast<double>(residency.resident_pages) /
+            static_cast<double>(residency.total_pages);
+  const double sidecar_percent = sidecar_residency.total_pages == 0
+      ? 0.0
+      : 100.0 * static_cast<double>(sidecar_residency.resident_pages) /
+            static_cast<double>(sidecar_residency.total_pages);
+  ET_LOG(
+      Info,
+      "PD boundary probe: event=%s decode_call_index=%d token=%d "
+      "resident_pages=%zu total_pages=%zu resident_percent=%.6f "
+      "sidecar_resident_pages=%zu sidecar_total_pages=%zu "
+      "sidecar_resident_percent=%.6f sidecar_error=%d sidecar_anonymous=%d "
+      "major_faults=%" PRIu64 " major_faults_since_prefill=%" PRIu64 " "
+      "minor_faults=%" PRIu64 " rss_bytes=%" PRIu64 " hwm_bytes=%" PRIu64 " "
+      "probe_ms=%.3f",
+      event,
+      decode_call_index,
+      token,
+      residency.resident_pages,
+      residency.total_pages,
+      percent,
+      sidecar_residency.resident_pages,
+      sidecar_residency.total_pages,
+      sidecar_percent,
+      sidecar_residency.error,
+      static_cast<int>(g_joint_sidecar_anonymous),
+      memory.major_faults,
+      major_faults_since_prefill,
+      memory.minor_faults,
+      memory.rss_bytes,
+      memory.hwm_bytes,
+      elapsed_ms(start));
+}
+
+void joint_pd_decode_event_probe(
+    void*,
+    const char* event,
+    int32_t decode_call_index,
+    int32_t token) {
+  char label[64];
+  std::snprintf(
+      label,
+      sizeof(label),
+      "decode_call_%d_%s",
+      decode_call_index,
+      event);
+  log_joint_pd_boundary_probe(label, decode_call_index, token, false);
+}
+
+enum class JointResidencyStage : int {
+  ModelReady,
+  DecodeModelInit,
+  PrefillSetup,
+  Prefill,
+  PrefillComplete,
+  PrefillRelease,
+  DecodeContext,
+  DecodeWarmup,
+  Handoff,
+  Decode,
+  DecodeComplete,
+  Complete,
+};
+
+const char* joint_residency_stage_name(JointResidencyStage stage) {
+  switch (stage) {
+    case JointResidencyStage::ModelReady: return "model_ready";
+    case JointResidencyStage::DecodeModelInit: return "decode_model_init";
+    case JointResidencyStage::PrefillSetup: return "prefill_setup";
+    case JointResidencyStage::Prefill: return "prefill";
+    case JointResidencyStage::PrefillComplete: return "prefill_complete";
+    case JointResidencyStage::PrefillRelease: return "prefill_release";
+    case JointResidencyStage::DecodeContext: return "decode_context";
+    case JointResidencyStage::DecodeWarmup: return "decode_warmup";
+    case JointResidencyStage::Handoff: return "handoff";
+    case JointResidencyStage::Decode: return "decode";
+    case JointResidencyStage::DecodeComplete: return "decode_complete";
+    case JointResidencyStage::Complete: return "complete";
+  }
+  return "unknown";
+}
+
+class JointModelResidencyProfiler {
+ public:
+  JointModelResidencyProfiler(
+      std::shared_ptr<example::ReadOnlyMappedFile> source,
+      const std::string& path,
+      int interval_ms)
+      : source_(std::move(source)),
+        interval_ms_(std::max(interval_ms, 50)),
+        start_(SteadyClock::now()) {
+    output_ = std::fopen(path.c_str(), "w");
+    ET_CHECK_MSG(output_ != nullptr, "Failed to open model residency profile: %s", path.c_str());
+    std::fprintf(
+        output_,
+        "elapsed_ms,stage,resident_pages,total_pages,resident_percent,"
+        "sidecar_resident_pages,sidecar_total_pages,sidecar_resident_percent,"
+        "sidecar_error,sidecar_anonymous,"
+        "rss_bytes,hwm_bytes,process_swap_bytes,mem_available_bytes,"
+        "swap_free_bytes,swap_cached_bytes,minor_faults,major_faults,sample_ms,"
+        "program_swap_bytes,rss_plus_program_swap_bytes\n");
+    sample();
+    worker_ = std::thread([this]() {
+      while (!stop_.load(std::memory_order_relaxed)) {
+        usleep(static_cast<useconds_t>(interval_ms_) * 1000U);
+        if (!stop_.load(std::memory_order_relaxed)) {
+          sample();
+        }
+      }
+    });
+  }
+
+  ~JointModelResidencyProfiler() {
+    stop();
+  }
+
+  void set_stage(JointResidencyStage stage) {
+    stage_.store(stage, std::memory_order_relaxed);
+    sample();
+  }
+
+  void set_sidecar(const void* data, size_t size, bool anonymous) {
+    {
+      std::lock_guard<std::mutex> lock(sample_mutex_);
+      sidecar_data_ = data;
+      sidecar_size_ = size;
+      sidecar_anonymous_ = anonymous;
+    }
+    sample();
+  }
+
+  void stop() {
+    if (stopped_.exchange(true, std::memory_order_relaxed)) {
+      return;
+    }
+    stop_.store(true, std::memory_order_relaxed);
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    sample();
+    if (output_ != nullptr) {
+      std::fclose(output_);
+      output_ = nullptr;
+    }
+  }
+
+ private:
+  void sample() {
+    std::lock_guard<std::mutex> lock(sample_mutex_);
+    if (output_ == nullptr) {
+      return;
+    }
+    const auto sample_start = SteadyClock::now();
+    const auto residency = source_->residency();
+    const auto sidecar_residency =
+        raw_memory_residency(sidecar_data_, sidecar_size_);
+    const auto memory = process_memory_status_snapshot();
+    const uint64_t process_swap_bytes =
+        read_proc_status_bytes("/proc/self/status", "VmSwap:");
+    const uint64_t page_size =
+        static_cast<uint64_t>(std::max<long>(sysconf(_SC_PAGESIZE), 1));
+    const uint64_t nonresident_model_bytes =
+        static_cast<uint64_t>(residency.total_pages - residency.resident_pages) *
+        page_size;
+    const uint64_t program_swap_bytes =
+        process_swap_bytes + nonresident_model_bytes;
+    const double percent = residency.total_pages == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(residency.resident_pages) /
+            static_cast<double>(residency.total_pages);
+    const double sidecar_percent = sidecar_residency.total_pages == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(sidecar_residency.resident_pages) /
+              static_cast<double>(sidecar_residency.total_pages);
+    const auto stage = stage_.load(std::memory_order_relaxed);
+    std::fprintf(
+        output_,
+        "%.3f,%s,%zu,%zu,%.6f,%zu,%zu,%.6f,%d,%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64
+        ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+        ",%.3f,%" PRIu64 ",%" PRIu64 "\n",
+        elapsed_ms(start_),
+        joint_residency_stage_name(stage),
+        residency.resident_pages,
+        residency.total_pages,
+        percent,
+        sidecar_residency.resident_pages,
+        sidecar_residency.total_pages,
+        sidecar_percent,
+        sidecar_residency.error,
+        static_cast<int>(sidecar_anonymous_),
+        memory.rss_bytes,
+        memory.hwm_bytes,
+        process_swap_bytes,
+        read_proc_status_bytes("/proc/meminfo", "MemAvailable:"),
+        read_proc_status_bytes("/proc/meminfo", "SwapFree:"),
+        read_proc_status_bytes("/proc/meminfo", "SwapCached:"),
+        memory.minor_faults,
+        memory.major_faults,
+        elapsed_ms(sample_start),
+        program_swap_bytes,
+        memory.rss_bytes + program_swap_bytes);
+    std::fflush(output_);
+  }
+
+  std::shared_ptr<example::ReadOnlyMappedFile> source_;
+  const void* sidecar_data_{nullptr};
+  size_t sidecar_size_{0};
+  bool sidecar_anonymous_{false};
+  int interval_ms_{250};
+  SteadyClock::time_point start_;
+  std::atomic<JointResidencyStage> stage_{JointResidencyStage::ModelReady};
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> stopped_{false};
+  FILE* output_{nullptr};
+  std::mutex sample_mutex_;
+  std::thread worker_;
+};
+
+std::unique_ptr<JointModelResidencyProfiler> g_joint_residency_profiler;
+
+void start_joint_model_residency_profiler() {
+  if (FLAGS_model_residency_profile_path.empty()) {
+    return;
+  }
+  g_joint_residency_profiler = std::make_unique<JointModelResidencyProfiler>(
+      g_joint_model_source,
+      FLAGS_model_residency_profile_path,
+      FLAGS_model_residency_profile_interval_ms);
+}
+
+void attach_joint_sidecar_residency_source(
+    llama_pd_inprocess_runtime* runtime) {
+  if (runtime == nullptr) {
+    return;
+  }
+  const void* data = nullptr;
+  size_t size = 0;
+  bool anonymous = false;
+  if (!llama_pd_inprocess_runtime_profile_backing(
+          runtime, &data, &size, &anonymous)) {
+    g_joint_sidecar_data = nullptr;
+    g_joint_sidecar_size = 0;
+    g_joint_sidecar_anonymous = true;
+    if (g_joint_residency_profiler) {
+      g_joint_residency_profiler->set_sidecar(nullptr, 0, true);
+    }
+    ET_LOG(
+        Info,
+        "Decode sidecar uses discontiguous per-shard buffers; contiguous "
+        "residency source is unavailable");
+    return;
+  }
+  g_joint_sidecar_data = data;
+  g_joint_sidecar_size = size;
+  g_joint_sidecar_anonymous = anonymous;
+  if (g_joint_residency_profiler) {
+    g_joint_residency_profiler->set_sidecar(data, size, anonymous);
+  }
+  const auto residency = raw_memory_residency(data, size);
+  ET_LOG(
+      Info,
+      "Decode sidecar residency source attached: ptr=%p bytes=%zu "
+      "anonymous=%d resident_pages=%zu total_pages=%zu error=%d",
+      data,
+      size,
+      static_cast<int>(anonymous),
+      residency.resident_pages,
+      residency.total_pages,
+      residency.error);
+}
+
+class JointSidecarShardStreamer {
+ public:
+  JointSidecarShardStreamer(
+      llama_pd_inprocess_runtime* runtime,
+      size_t shard_count)
+      : runtime_(runtime),
+        shard_count_(shard_count),
+        enqueued_(shard_count, false) {}
+
+  ~JointSidecarShardStreamer() {
+    stop_worker();
+  }
+
+  bool prepare() {
+    const auto start = SteadyClock::now();
+    if (!llama_pd_inprocess_runtime_profile_stream_prepare(
+            runtime_, shard_count_)) {
+      return false;
+    }
+    worker_ = std::thread([this]() { worker_loop(); });
+    ET_LOG(
+        Info,
+        "Decode per-shard sidecar buffers released for streaming: "
+        "shards=%zu ms=%.3f",
+        shard_count_,
+        elapsed_ms(start));
+    return true;
+  }
+
+  bool enqueue(size_t shard_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closing_ || failed_ || shard_index >= shard_count_ ||
+        enqueued_[shard_index]) {
+      return false;
+    }
+    enqueued_[shard_index] = true;
+    queue_.push_back(shard_index);
+    cv_.notify_one();
+    return true;
+  }
+
+  bool finish(double* boundary_wait_ms, size_t* bytes_loaded) {
+    const auto wait_start = SteadyClock::now();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      closing_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+    const double wait_ms = elapsed_ms(wait_start);
+    if (boundary_wait_ms != nullptr) {
+      *boundary_wait_ms = wait_ms;
+    }
+    bool valid = false;
+    size_t loaded = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      valid = !failed_ && completed_ == shard_count_;
+      loaded = total_bytes_loaded_;
+    }
+    if (bytes_loaded != nullptr) {
+      *bytes_loaded = loaded;
+    }
+    if (!valid ||
+        !llama_pd_inprocess_runtime_profile_stream_finish(runtime_)) {
+      return false;
+    }
+    finished_ = true;
+    ET_LOG(
+        Info,
+        "Decode sidecar streaming complete: shards=%zu bytes=%zu "
+        "boundary_wait_ms=%.3f io_total_ms=%.3f",
+        shard_count_,
+        loaded,
+        wait_ms,
+        io_total_ms_);
+    return true;
+  }
+
+ private:
+  void worker_loop() {
+    while (true) {
+      size_t shard_index = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this]() { return closing_ || !queue_.empty(); });
+        if (queue_.empty()) {
+          return;
+        }
+        shard_index = queue_.front();
+        queue_.pop_front();
+      }
+      const auto io_start = SteadyClock::now();
+      size_t loaded = 0;
+      const bool ok = llama_pd_inprocess_runtime_profile_stream_fill(
+          runtime_, shard_index, &loaded);
+      const double io_ms = elapsed_ms(io_start);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ok) {
+          failed_ = true;
+          return;
+        }
+        ++completed_;
+        total_bytes_loaded_ += loaded;
+        io_total_ms_ += io_ms;
+      }
+      const auto memory = process_memory_status_snapshot();
+      ET_LOG(
+          Info,
+          "Decode sidecar shard chunk loaded: shard=%zu bytes=%zu ms=%.3f "
+          "rss_mib=%.2f hwm_mib=%.2f vmswap_mib=%.2f",
+          shard_index,
+          loaded,
+          io_ms,
+          memory.rss_bytes / (1024.0 * 1024.0),
+          memory.hwm_bytes / (1024.0 * 1024.0),
+          read_proc_status_bytes("/proc/self/status", "VmSwap:") /
+              (1024.0 * 1024.0));
+    }
+  }
+
+  void stop_worker() {
+    if (finished_ || !worker_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      closing_ = true;
+    }
+    cv_.notify_all();
+    worker_.join();
+  }
+
+  llama_pd_inprocess_runtime* runtime_{nullptr};
+  size_t shard_count_{0};
+  std::vector<bool> enqueued_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<size_t> queue_;
+  std::thread worker_;
+  bool closing_{false};
+  bool failed_{false};
+  bool finished_{false};
+  size_t completed_{0};
+  size_t total_bytes_loaded_{0};
+  double io_total_ms_{0.0};
+};
+
+void set_joint_model_residency_stage(JointResidencyStage stage) {
+  if (g_joint_residency_profiler) {
+    g_joint_residency_profiler->set_stage(stage);
+  }
+}
+
+void stop_joint_model_residency_profiler() {
+  if (g_joint_residency_profiler) {
+    g_joint_residency_profiler->stop();
+    g_joint_residency_profiler.reset();
+  }
+}
+
 std::vector<uint64_t> joint_tokenize_prompt(
     const std::string& formatted_prompt,
     bool tokenized_prompt) {
@@ -1634,6 +2541,9 @@ std::vector<std::string> make_joint_decode_args(
     args.push_back("--pd-disk-embedding");
     args.push_back(shared_embedding_matrix_path);
   }
+  if (FLAGS_decode_native_compare) {
+    args.push_back("--pd-native-compare");
+  }
   if (!FLAGS_decode_ppl_tokens_path.empty()) {
     args.push_back("--pd-ppl-tokens");
     args.push_back(FLAGS_decode_ppl_tokens_path);
@@ -1662,6 +2572,41 @@ ResidentDecodeProcess start_resident_decode_process(
   resident.args = make_joint_decode_args(shared_embedding_matrix_path);
   resident.result.before = process_memory_snapshot();
   resident.result.exit_code = 0;
+  if (FLAGS_decode_defer_runtime_until_after_prefill &&
+      FLAGS_decode_stage_model_only_before_prefill) {
+    std::vector<char*> argv;
+    argv.reserve(resident.args.size() + 1);
+    for (auto& arg : resident.args) {
+      argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+    resident.runtime = llama_pd_inprocess_runtime_create_model_only(
+        static_cast<int>(resident.args.size()),
+        argv.data(),
+        g_joint_model_source->data(),
+        g_joint_model_source->size(),
+        &resident.result.startup_ms);
+    ET_CHECK_MSG(
+        resident.runtime != nullptr,
+        "failed to create model-only joint Decode runtime");
+    ET_LOG(
+        Info,
+        "Joint Decode model-only initialization complete before Prefill: "
+        "model_ptr=%p model_bytes=%zu initialization_ms=%.3f",
+        g_joint_model_source->data(),
+        g_joint_model_source->size(),
+        resident.result.startup_ms);
+    return resident;
+  }
+  if (FLAGS_decode_defer_runtime_until_after_prefill) {
+    ET_LOG(
+        Info,
+        "Joint Decode runtime creation deferred until after Prefill: "
+        "model_ptr=%p model_bytes=%zu",
+        g_joint_model_source->data(),
+        g_joint_model_source->size());
+    return resident;
+  }
   std::vector<char*> argv;
   argv.reserve(resident.args.size() + 1);
   for (auto& arg : resident.args) {
@@ -1680,7 +2625,7 @@ ResidentDecodeProcess start_resident_decode_process(
   ET_LOG(
       Info,
       "Joint Decode initialized in-process before Prefill: model_ptr=%p "
-      "model_bytes=%zu initialization_ms=%.3f threadpool_deferred=1",
+      "model_bytes=%zu initialization_ms=%.3f",
       g_joint_model_source->data(),
       g_joint_model_source->size(),
       resident.result.startup_ms);
@@ -1688,9 +2633,16 @@ ResidentDecodeProcess start_resident_decode_process(
 }
 
 void start_resident_decode_runtime_prepare(int) {
-  ET_LOG(
-      Info,
-      "Prefill rebuild buffers released; joint Decode will create context at the direct-pointer boundary");
+  if (FLAGS_decode_defer_runtime_until_after_prefill) {
+    ET_LOG(
+        Info,
+        "Prefill rebuild buffers released; deferred joint Decode will create "
+        "its runtime at the direct-pointer boundary");
+  } else {
+    ET_LOG(
+        Info,
+        "Prefill rebuild buffers released; resident joint Decode runtime is ready");
+  }
 }
 
 void begin_resident_decode_handoff(
@@ -1700,6 +2652,63 @@ void begin_resident_decode_handoff(
       memory_handoff.direct_pointer && memory_handoff.bytes &&
           !memory_handoff.bytes->empty(),
       "joint Decode requires a direct-pointer KV handoff");
+
+  if (FLAGS_decode_defer_runtime_until_after_prefill &&
+      FLAGS_decode_stage_model_only_before_prefill &&
+      resident.runtime != nullptr) {
+    set_joint_model_residency_stage(JointResidencyStage::DecodeContext);
+    double context_ms = 0.0;
+    double warmup_ms = 0.0;
+    ET_CHECK_MSG(
+        llama_pd_inprocess_runtime_prepare_context(
+            resident.runtime, &context_ms),
+        "failed to prepare deferred joint Decode context");
+    log_joint_model_residency("before_warmup");
+    set_joint_model_residency_stage(JointResidencyStage::DecodeWarmup);
+    ET_CHECK_MSG(
+        llama_pd_inprocess_runtime_warmup(
+            resident.runtime, &warmup_ms),
+        "failed to warm deferred joint Decode runtime");
+    log_joint_model_residency("after_warmup");
+    set_joint_model_residency_stage(JointResidencyStage::Handoff);
+    resident.result.startup_ms += context_ms + warmup_ms;
+    ET_LOG(
+        Info,
+        "Joint Decode deferred context ready after Prefill: "
+        "context_ms=%.3f warmup_ms=%.3f initialization_ms=%.3f",
+        context_ms,
+        warmup_ms,
+        resident.result.startup_ms);
+  }
+
+  if (resident.runtime == nullptr) {
+    set_joint_model_residency_stage(JointResidencyStage::DecodeContext);
+    const auto deferred_init_start = SteadyClock::now();
+    std::vector<char*> argv;
+    argv.reserve(resident.args.size() + 1);
+    for (auto& arg : resident.args) {
+      argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+    resident.runtime = llama_pd_inprocess_runtime_create(
+        static_cast<int>(resident.args.size()),
+        argv.data(),
+        g_joint_model_source->data(),
+        g_joint_model_source->size(),
+        &resident.result.startup_ms);
+    ET_CHECK_MSG(
+        resident.runtime != nullptr,
+        "failed to create deferred joint Decode runtime");
+    attach_joint_sidecar_residency_source(resident.runtime);
+    ET_LOG(
+        Info,
+        "Joint Decode initialized in-process after Prefill: model_ptr=%p "
+        "model_bytes=%zu initialization_ms=%.3f wall_ms=%.3f",
+        g_joint_model_source->data(),
+        g_joint_model_source->size(),
+        resident.result.startup_ms,
+        elapsed_ms(deferred_init_start));
+  }
 
   llama_pd_inprocess_request request{
       g_joint_model_source->data(),
@@ -1716,10 +2725,16 @@ void begin_resident_decode_handoff(
   };
   llama_pd_inprocess_result inprocess_result{};
   request.result = &inprocess_result;
+  if (FLAGS_model_residency_probe) {
+    request.decode_event_callback = joint_pd_decode_event_probe;
+    request.decode_event_call_limit = 2;
+  }
+  set_joint_model_residency_stage(JointResidencyStage::Decode);
   const auto decode_start = SteadyClock::now();
   resident.result.exit_code =
       llama_pd_inprocess_runtime_run(resident.runtime, &request);
   resident.result.process_wall_ms = elapsed_ms(decode_start);
+  set_joint_model_residency_stage(JointResidencyStage::DecodeComplete);
   resident.result.startup_ms = inprocess_result.initialization_ms;
   resident.result.boundary_ms = inprocess_result.boundary_ms;
   resident.result.generation_ms = inprocess_result.generation_ms;
@@ -1748,8 +2763,10 @@ void begin_resident_decode_handoff(
 
 DecodeProcessResult finish_resident_decode_process(
     ResidentDecodeProcess resident) {
-  llama_pd_inprocess_runtime_destroy(resident.runtime);
-  resident.runtime = nullptr;
+  if (resident.runtime != nullptr) {
+    llama_pd_inprocess_runtime_destroy(resident.runtime);
+    resident.runtime = nullptr;
+  }
   return resident.result;
 }
 #endif
@@ -1790,6 +2807,9 @@ void run_wikitext_ppl(
     static_metadata.use_separate_embed = effective_separate_embed;
     static_metadata.embedding_matrix_path = effective_embedding_matrix_path;
     static_metadata.resident_embedding = FLAGS_prefill_embedding_resident;
+    static_metadata.embedding_qnn_u16_input = prefill_shard_files.embedding_qnn_u16_input;
+    static_metadata.embedding_qnn_u16_scale = prefill_shard_files.embedding_qnn_u16_scale;
+    static_metadata.embedding_qnn_u16_zero_point = prefill_shard_files.embedding_qnn_u16_zero_point;
   }
 
   example::PDPrefillRunner<T> runner(
@@ -1896,6 +2916,9 @@ PdPrefillSession<T> create_pd_prefill_session(
     static_metadata.use_separate_embed = effective_separate_embed;
     static_metadata.embedding_matrix_path = effective_embedding_matrix_path;
     static_metadata.resident_embedding = false;
+    static_metadata.embedding_qnn_u16_input = prefill_shard_files.embedding_qnn_u16_input;
+    static_metadata.embedding_qnn_u16_scale = prefill_shard_files.embedding_qnn_u16_scale;
+    static_metadata.embedding_qnn_u16_zero_point = prefill_shard_files.embedding_qnn_u16_zero_point;
   }
 
   PdPrefillSession<T> session;
@@ -2139,17 +3162,75 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
   auto prefill_shard_rebuild =
       make_prefill_shard_rebuild_config(prefill_shard_files);
   const size_t request_count = use_tokenized_prompt ? 1 : prompts.size();
-  prefill_shard_rebuild.retain_session_rebuild_resources = request_count > 1;
+  const bool use_decode_sidecar_streaming =
+      FLAGS_decode_stream_sidecar_during_prefill && !FLAGS_prefill_only &&
+      request_count == 1;
+  if (FLAGS_decode_stream_sidecar_during_prefill &&
+      !use_decode_sidecar_streaming) {
+    ET_LOG(
+        Info,
+        "Decode sidecar streaming disabled for this run: prefill_only=%d "
+        "request_count=%zu",
+        FLAGS_prefill_only,
+        request_count);
+  }
+  if (prefill_shard_rebuild.release_stripped_pte_after_rebuild &&
+      (FLAGS_prefill_only || request_count > 1)) {
+    prefill_shard_rebuild.release_stripped_pte_after_rebuild = false;
+    ET_LOG(
+        Info,
+        "retaining stripped Prefill PTE for reusable session: "
+        "prefill_only=%d request_count=%zu",
+        FLAGS_prefill_only,
+        request_count);
+  }
+  if (request_count > 1 &&
+      prefill_shard_rebuild.release_prepared_shard0_after_execute) {
+    prefill_shard_rebuild.release_prepared_shard0_after_execute = false;
+    ET_LOG(
+        Info,
+        "retaining persistent shard0 across a multi-request session: "
+        "request_count=%zu",
+        request_count);
+  }
+  ET_CHECK_MSG(
+      !FLAGS_prefill_unload_shard0_method_after_execute ||
+          request_count == 1,
+      "--prefill_unload_shard0_method_after_execute is single-request only");
+  ET_CHECK_MSG(
+      !FLAGS_prefill_destroy_shard0_module_keep_pte_after_execute ||
+          request_count == 1,
+      "--prefill_destroy_shard0_module_keep_pte_after_execute is "
+      "single-request only");
+  ET_CHECK_MSG(
+      !FLAGS_prefill_discard_shard0_pte_pages_after_execute ||
+          FLAGS_prefill_destroy_shard0_module_keep_pte_after_execute,
+      "--prefill_discard_shard0_pte_pages_after_execute requires "
+      "--prefill_destroy_shard0_module_keep_pte_after_execute");
+  ET_CHECK_MSG(
+      !(FLAGS_prefill_unload_shard0_method_after_execute &&
+        FLAGS_prefill_destroy_shard0_module_keep_pte_after_execute),
+      "shard0 method-only and Module-only diagnostics are mutually exclusive");
 #ifdef QNN_LLAMA_PD_JOINT
   ET_CHECK_MSG(
-      FLAGS_model_ram_store,
-      "joint PD runner requires --model_ram_store=true so the one-time GGUF "
-      "read completes before Prefill/Decode timing");
+      FLAGS_model_ram_store || FLAGS_model_anonymous_buffer,
+      "joint PD runner requires --model_ram_store=true or "
+      "--model_anonymous_buffer=true so the one-time GGUF read completes "
+      "before Prefill/Decode timing");
   ET_CHECK_MSG(
       prefill_shard_rebuild.mapped_source_bytes &&
           !prefill_shard_rebuild.mapped_source_bytes->empty(),
       "joint PD runner requires --gguf_model_path as the shared Prefill/Decode model");
   g_joint_model_source = prefill_shard_rebuild.mapped_source_bytes;
+  log_joint_model_residency("after_model_load");
+  ET_CHECK_MSG(
+      !use_decode_sidecar_streaming ||
+          (FLAGS_prefill_release_stripped_pte_after_rebuild &&
+           FLAGS_decode_sidecar_reread_path.empty() &&
+           !FLAGS_decode_sidecar_pretouch_mapping),
+      "Decode sidecar streaming requires "
+      "--prefill_release_stripped_pte_after_rebuild and no legacy "
+      "sidecar reread/pretouch diagnostics");
 #endif
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module;
 
@@ -2177,6 +3258,9 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
     return 0;
   }
 
+#ifdef QNN_LLAMA_PD_JOINT
+  start_joint_model_residency_profiler();
+#endif
   const auto e2e_start = SteadyClock::now();
   ET_CHECK_MSG(
       module_meta.kv_bitwidth == example::KvBitWidth::kWidth8,
@@ -2190,9 +3274,37 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
              : prefill_shard_files.embedding_matrix_path)
       : std::string{};
   ResidentDecodeProcess resident_decode;
+#ifdef QNN_LLAMA_PD_JOINT
+  std::unique_ptr<JointSidecarShardStreamer> sidecar_streamer;
+#endif
   if (!FLAGS_prefill_only) {
+#ifdef QNN_LLAMA_PD_JOINT
+    set_joint_model_residency_stage(JointResidencyStage::DecodeModelInit);
+#endif
     resident_decode =
         start_resident_decode_process(resident_embedding_matrix_path);
+    attach_joint_sidecar_residency_source(resident_decode.runtime);
+#ifdef QNN_LLAMA_PD_JOINT
+    if (use_decode_sidecar_streaming) {
+      const size_t sidecar_shard_count = prefill_shard_files.pte_paths.size();
+      ET_CHECK_MSG(
+          sidecar_shard_count != 0,
+          "sidecar streaming requires Prefill shards");
+      sidecar_streamer = std::make_unique<JointSidecarShardStreamer>(
+          resident_decode.runtime, sidecar_shard_count);
+      ET_CHECK_MSG(
+          sidecar_streamer->prepare(),
+          "failed to prepare Decode sidecar streaming arena");
+      attach_joint_sidecar_residency_source(resident_decode.runtime);
+      prefill_shard_rebuild.shard_execute_begin_callback =
+          [streamer = sidecar_streamer.get()](size_t shard_index) {
+            ET_CHECK_MSG(
+                streamer->enqueue(shard_index),
+                "failed to enqueue Decode sidecar chunk for shard %zu",
+                shard_index);
+          };
+    }
+#endif
     prefill_shard_rebuild.final_shard_overlap_callback =
         [&resident_decode]() {
           start_resident_decode_runtime_prepare(resident_decode.control_fd);
@@ -2200,6 +3312,9 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
         };
   }
 
+#ifdef QNN_LLAMA_PD_JOINT
+  set_joint_model_residency_stage(JointResidencyStage::PrefillSetup);
+#endif
   PdPrefillSession<uint8_t> prefill_session =
       create_pd_prefill_session<uint8_t>(
           std::move(module_bundle),
@@ -2261,8 +3376,15 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
     const std::string prompt_input = use_tokenized_prompt
         ? FLAGS_tokenized_prompt
         : prompts[request_index];
+#ifdef QNN_LLAMA_PD_JOINT
+    set_joint_model_residency_stage(JointResidencyStage::Prefill);
+#endif
     PdE2ERuntimeStats prefill_runtime = run_pd_e2e_request<uint8_t>(
         prefill_session, prompt_input, use_tokenized_prompt);
+#ifdef QNN_LLAMA_PD_JOINT
+    set_joint_model_residency_stage(JointResidencyStage::PrefillComplete);
+    log_joint_pd_boundary_probe("prefill_complete", -1, -1, true);
+#endif
 
     if (FLAGS_prefill_only) {
       if (prefill_runtime.memory_handoff.fd >= 0) {
@@ -2284,6 +3406,71 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
       continue;
     }
 
+#ifdef QNN_LLAMA_PD_JOINT
+    if (sidecar_streamer) {
+      double sidecar_boundary_wait_ms = 0.0;
+      size_t sidecar_bytes_loaded = 0;
+      ET_CHECK_MSG(
+          sidecar_streamer->finish(
+              &sidecar_boundary_wait_ms, &sidecar_bytes_loaded),
+          "Decode sidecar streaming did not complete before handoff");
+      attach_joint_sidecar_residency_source(resident_decode.runtime);
+    }
+#endif
+
+    reread_decode_sidecar_before_handoff(
+        FLAGS_decode_sidecar_reread_path);
+    pretouch_decode_sidecar_mapping_before_handoff(
+        FLAGS_decode_sidecar_reread_path);
+
+#ifdef QNN_LLAMA_PD_JOINT
+    set_joint_model_residency_stage(JointResidencyStage::PrefillRelease);
+#endif
+    // Production joint PD reaches this boundary with Decode already warm and
+    // all request-scoped Prefill resources retired by their normal shard
+    // lifetimes. Whole-runtime teardown remains a legacy diagnostic only.
+    if (FLAGS_prefill_release_all_before_decode) {
+      prefill_session.runner->release_prefill_resources_before_decode();
+      executorch::backends::qnn::ReleaseQnnBackendBundles();
+      ET_LOG(Info, "All QNN Prefill resources released before Decode handoff");
+    } else if (FLAGS_prefill_release_htp_vote_before_decode) {
+      executorch::backends::qnn::ReleaseQnnPerformanceVotes();
+      ET_LOG(Info, "HTP performance vote released before Decode handoff");
+    }
+    if (FLAGS_decode_cooldown_ms > 0) {
+      ET_LOG(
+          Info,
+          "Decode cooldown after Prefill: ms=%d",
+          FLAGS_decode_cooldown_ms);
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(FLAGS_decode_cooldown_ms));
+    }
+#ifdef QNN_LLAMA_PD_JOINT
+    set_joint_model_residency_stage(JointResidencyStage::Handoff);
+    log_joint_model_residency("after_prefill_release");
+#endif
+#ifdef QNN_LLAMA_PD_JOINT
+    if (FLAGS_decode_pretouch_model) {
+      const auto pretouch_start = SteadyClock::now();
+      const volatile uint8_t* bytes = g_joint_model_source->data();
+      uint64_t checksum = 0;
+      for (size_t offset = 0; offset < g_joint_model_source->size();
+           offset += 4096) {
+        checksum += bytes[offset];
+      }
+      checksum += bytes[g_joint_model_source->size() - 1];
+      ET_LOG(
+          Info,
+          "Decode model page pretouch complete: bytes=%zu checksum=%" PRIu64
+          " ms=%.3f",
+          g_joint_model_source->size(),
+          checksum,
+          elapsed_ms(pretouch_start));
+    }
+
+    // Send the ready KV
+#endif
+
     // Send the ready KV immediately. Joining the dense PSS monitor can take
     // tens of milliseconds on Android and must not sit on the PD boundary.
     begin_resident_decode_handoff(
@@ -2291,6 +3478,13 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
         prefill_runtime.memory_handoff);
     stop_memory_monitor.store(true, std::memory_order_relaxed);
     memory_monitor.join();
+#ifndef QNN_LLAMA_PD_JOINT
+    // The forked Decode path completes asynchronously after the handoff. Wait
+    // for the child before reading its result; the joint path is synchronous
+    // and has already populated resident_decode.result at this point.
+    resident_decode.result =
+        finish_resident_decode_process(std::move(resident_decode));
+#endif
 
     const DecodeProcessResult decode = resident_decode.result;
     if (prefill_runtime.memory_handoff.fd >= 0) {
@@ -2315,8 +3509,14 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
   }
 
   if (!FLAGS_prefill_only) {
+#ifdef QNN_LLAMA_PD_JOINT
     finish_resident_decode_process(std::move(resident_decode));
+#endif
   }
+#ifdef QNN_LLAMA_PD_JOINT
+  set_joint_model_residency_stage(JointResidencyStage::Complete);
+  stop_joint_model_residency_profiler();
+#endif
   ET_LOG(
       Info,
       "PD session complete: requests=%zu wall_ms=%.3f",

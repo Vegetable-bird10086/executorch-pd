@@ -7,8 +7,10 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
-#include <cstring>
+#include <array>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <numeric>
@@ -20,6 +22,28 @@ using executorch::runtime::Result;
 using executorch::runtime::Span;
 using executorch::runtime::TensorInfo;
 namespace example {
+
+template <typename T>
+int64_t PromptProcessor<T>::prepare_logits_row_for_sampling(
+    int64_t logits_pos) {
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    if (metadata_.ar_len > 1 &&
+        std::getenv("ET_QNN_A8_VOCAB_MAJOR_LOGITS") != nullptr) {
+      std::vector<T> selected(static_cast<size_t>(metadata_.vocab_size));
+      for (int32_t token = 0; token < metadata_.vocab_size; ++token) {
+        selected[static_cast<size_t>(token)] =
+            logits_.data[static_cast<size_t>(token) * metadata_.ar_len +
+                         logits_pos];
+      }
+      std::memcpy(
+          logits_.data +
+              static_cast<size_t>(logits_pos) * metadata_.vocab_size,
+          selected.data(),
+          selected.size() * sizeof(T));
+    }
+  }
+  return logits_pos;
+}
 
 template <typename T>
 PromptProcessor<T>::PromptProcessor(
@@ -69,7 +93,7 @@ PromptProcessor<T>::PromptProcessor(
   }
 
   if (metadata_.outputs_logits) {
-    logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(uint16_t);
+    logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(T);
   }
 };
 template <typename T>
@@ -196,8 +220,7 @@ void PromptProcessor<T>::init_io(
   if (metadata_.outputs_logits) {
     // [O]: logits
     Result<TensorInfo> logits = method_meta->output_tensor_meta(index++);
-    logits_.data =
-        reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
+    logits_.data = reinterpret_cast<T*>(buffer_manager->allocate(logits_.size));
     logits_.tensor = std::make_unique<TensorImpl>(
         logits->scalar_type(),
         logits->sizes().size(),
@@ -361,8 +384,7 @@ void PromptProcessor<T>::init_io_from_metadata(IMemAlloc* buffer_manager) {
   }
 
   if (metadata_.outputs_logits) {
-    logits_.data =
-        reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
+    logits_.data = reinterpret_cast<T*>(buffer_manager->allocate(logits_.size));
     logits_.tensor = make_tensor(
         logits_type,
         {1,
@@ -488,6 +510,52 @@ void PromptProcessor<T>::prepare_io(
       input_toks_ptr[i] = static_cast<int32_t>(token);
     }
   }
+  if (metadata_.use_separate_embed && prepare_embedding &&
+      metadata_.embedding_qnn_u16_input) {
+    ET_CHECK_MSG(
+        metadata_.embedding_qnn_u16_scale > 0.0f,
+        "Folded QNN U16 embedding input requires a positive scale");
+    const size_t elements =
+        static_cast<size_t>(metadata_.ar_len) * embedding_dim;
+    float* source = reinterpret_cast<float*>(input_embedding_.data);
+    uint16_t* destination = reinterpret_cast<uint16_t*>(input_embedding_.data);
+    const float inverse_scale = 1.0f / metadata_.embedding_qnn_u16_scale;
+    for (size_t i = 0; i < elements; ++i) {
+      const long code = std::lround(source[i] * inverse_scale) +
+          metadata_.embedding_qnn_u16_zero_point;
+      destination[i] = static_cast<uint16_t>(
+          std::min<long>(65535, std::max<long>(0, code)));
+    }
+  }
+}
+
+template <typename T>
+void PromptProcessor<T>::acquire_prefill_kv_slot_and_rebind(
+    int32_t layer_begin,
+    int32_t layer_end_exclusive) {
+  ET_CHECK_MSG(
+      kv_manager_->uses_elastic_prefill_slots(),
+      "Elastic Prefill KV rebinding requested while the pool is disabled");
+  kv_manager_->acquire_prefill_kv_slot(layer_begin, layer_end_exclusive);
+  const auto& k_cache = kv_manager_->get_k_cache_();
+  const auto& v_cache = kv_manager_->get_v_cache_();
+  for (int32_t layer = layer_begin; layer < layer_end_exclusive; ++layer) {
+    ET_CHECK_MSG(
+        k_cache_in_.at(static_cast<size_t>(layer)) != nullptr &&
+            k_cache_out_.at(static_cast<size_t>(layer)) != nullptr &&
+            v_cache_in_.at(static_cast<size_t>(layer)) != nullptr &&
+            v_cache_out_.at(static_cast<size_t>(layer)) != nullptr,
+        "Elastic Prefill KV tensors are not initialized for layer %d",
+        layer);
+    k_cache_in_[static_cast<size_t>(layer)]->set_data(
+        k_cache[static_cast<size_t>(layer)].buffer);
+    k_cache_out_[static_cast<size_t>(layer)]->set_data(
+        k_cache[static_cast<size_t>(layer)].output_buffer);
+    v_cache_in_[static_cast<size_t>(layer)]->set_data(
+        v_cache[static_cast<size_t>(layer)].buffer);
+    v_cache_out_[static_cast<size_t>(layer)]->set_data(
+        v_cache[static_cast<size_t>(layer)].output_buffer);
+  }
 }
 
 template <typename T>
@@ -603,16 +671,22 @@ Result<uint64_t> PromptProcessor<T>::prefill(
         shard_count,
         num_iters);
 
+    bool final_overlap_prepared = false;
     for (size_t shard_index = 0; shard_index < shard_count; ++shard_index) {
       if (shard_index + 1 == shard_count) {
-        decoder_runner_->prepare_final_prefill_shard_overlap();
+        final_overlap_prepared =
+            decoder_runner_->prepare_final_prefill_shard_overlap();
       }
-      ET_CHECK_OK_OR_RETURN_ERROR(
-          decoder_runner_->begin_prefill_shard_stage(shard_index));
       const int32_t layer_begin = static_cast<int32_t>(
           decoder_runner_->prefill_shard_layer_offset(shard_index));
       const int32_t layer_end_exclusive = layer_begin + static_cast<int32_t>(
           decoder_runner_->prefill_shard_layer_count(shard_index));
+      if (kv_manager_->uses_elastic_prefill_slots()) {
+        acquire_prefill_kv_slot_and_rebind(
+            layer_begin, layer_end_exclusive);
+      }
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          decoder_runner_->begin_prefill_shard_stage(shard_index));
 
       for (int i = 0; i < num_iters; ++i) {
         const int64_t stage_prompt_pos = static_cast<int64_t>(i) * metadata_.ar_len;
@@ -661,15 +735,24 @@ Result<uint64_t> PromptProcessor<T>::prefill(
       ET_CHECK_OK_OR_RETURN_ERROR(
           decoder_runner_->end_prefill_shard_stage(shard_index));
     }
+    if (!final_overlap_prepared) {
+      ET_CHECK_MSG(
+          decoder_runner_->prepare_final_prefill_shard_overlap(),
+          "Unable to release final Prefill rebuild resources");
+    }
 
     if (!metadata_.outputs_logits) {
       return 0;
     }
     const int64_t logits_pos =
         (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
+    const int64_t sampling_logits_pos =
+        prepare_logits_row_for_sampling(logits_pos);
     cur_token = force_greedy_argmax
-        ? decoder_runner_->logits_to_argmax_token(output_tensors_[0], logits_pos)
-        : decoder_runner_->logits_to_token(output_tensors_[0], logits_pos);
+        ? decoder_runner_->logits_to_argmax_token(
+              output_tensors_[0], sampling_logits_pos)
+        : decoder_runner_->logits_to_token(
+              output_tensors_[0], sampling_logits_pos);
     return cur_token;
   }
 
@@ -701,7 +784,8 @@ Result<uint64_t> PromptProcessor<T>::prefill(
     prepare_io(prompt_tokens, prompt_pos, shifted_pos);
 
     // Run inference
-    decoder_runner_->step(method_name_, inputs_);
+    auto step_result = decoder_runner_->step(method_name_, inputs_);
+    ET_CHECK_OK_OR_RETURN_ERROR(step_result.error());
     if (metadata_.outputs_logits && dump_logits) {
       prompt_all_logits_.insert(
           prompt_all_logits_.end(),
@@ -735,9 +819,78 @@ Result<uint64_t> PromptProcessor<T>::prefill(
   }
   const int64_t logits_pos =
       (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
+  if (std::getenv("ET_A8_IO_DIAG") != nullptr) {
+    const T* row = logits_.data + logits_pos * metadata_.vocab_size;
+    T raw_min = std::numeric_limits<T>::max();
+    T raw_max = std::numeric_limits<T>::min();
+    std::array<bool, 1u << (sizeof(T) * 8)> seen{};
+    size_t distinct = 0;
+    int32_t raw_top1 = 0;
+    for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
+      const T raw = row[i];
+      raw_min = std::min(raw_min, raw);
+      raw_max = std::max(raw_max, raw);
+      if (!seen[static_cast<size_t>(raw)]) {
+        seen[static_cast<size_t>(raw)] = true;
+        ++distinct;
+      }
+      if (raw > row[raw_top1]) raw_top1 = i;
+    }
+    size_t mask_nonzero = 0;
+    const size_t mask_numel =
+        static_cast<size_t>(metadata_.ar_len) * metadata_.context_len;
+    for (size_t i = 0; i < mask_numel; ++i)
+      mask_nonzero += attention_mask_.data[i] != 0;
+    ET_LOG(
+        Info,
+        "A8_IO_DIAG prefill logits_pos=%ld mask_nonzero=%zu mask_max=%u "
+        "logits_min=%u logits_max=%u logits_distinct=%zu raw_top1=%d",
+        logits_pos,
+        mask_nonzero,
+        static_cast<unsigned>(std::numeric_limits<T>::max()),
+        static_cast<unsigned>(raw_min),
+        static_cast<unsigned>(raw_max),
+        distinct,
+        raw_top1);
+    if (metadata_.ar_len > 1) {
+      T strided_min = std::numeric_limits<T>::max();
+      T strided_max = std::numeric_limits<T>::min();
+      std::array<bool, 1u << (sizeof(T) * 8)> strided_seen{};
+      size_t strided_distinct = 0;
+      int32_t strided_top1 = 0;
+      for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
+        const T raw = logits_.data[
+            static_cast<size_t>(i) * metadata_.ar_len + logits_pos];
+        strided_min = std::min(strided_min, raw);
+        strided_max = std::max(strided_max, raw);
+        if (!strided_seen[static_cast<size_t>(raw)]) {
+          strided_seen[static_cast<size_t>(raw)] = true;
+          ++strided_distinct;
+        }
+        if (raw > logits_.data[
+                      static_cast<size_t>(strided_top1) * metadata_.ar_len +
+                      logits_pos]) {
+          strided_top1 = i;
+        }
+      }
+      ET_LOG(
+          Info,
+          "A8_IO_DIAG prefill_strided logits_pos=%ld logits_min=%u "
+          "logits_max=%u logits_distinct=%zu raw_top1=%d",
+          logits_pos,
+          static_cast<unsigned>(strided_min),
+          static_cast<unsigned>(strided_max),
+          strided_distinct,
+          strided_top1);
+    }
+  }
+  const int64_t sampling_logits_pos =
+      prepare_logits_row_for_sampling(logits_pos);
   cur_token = force_greedy_argmax
-      ? decoder_runner_->logits_to_argmax_token(output_tensors_[0], logits_pos)
-      : decoder_runner_->logits_to_token(output_tensors_[0], logits_pos);
+      ? decoder_runner_->logits_to_argmax_token(
+            output_tensors_[0], sampling_logits_pos)
+      : decoder_runner_->logits_to_token(
+            output_tensors_[0], sampling_logits_pos);
   return cur_token;
 }
 

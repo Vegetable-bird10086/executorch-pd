@@ -17,6 +17,10 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <new>
+#include <utility>
+#include <vector>
 namespace executorch {
 namespace backends {
 namespace qnn {
@@ -61,7 +65,55 @@ int ParseIndexedQnnTensorName(const std::string& name, const char* prefix) {
   return value;
 }
 
+thread_local const QnnExecuTorchBackend* g_last_initialized_backend = nullptr;
+thread_local DelegateHandle* g_last_initialized_handle = nullptr;
+thread_local std::string g_last_initialized_method;
+
 } // namespace
+
+QnnDetachedExecution::QnnDetachedExecution(
+    const QnnExecuTorchBackend* backend,
+    DelegateHandle* handle,
+    std::string method_name)
+    : backend_(backend), handle_(handle), method_name_(std::move(method_name)) {}
+
+QnnDetachedExecution::~QnnDetachedExecution() {
+  if (backend_ != nullptr && handle_ != nullptr) {
+    backend_->release_detached_delegate(handle_);
+  }
+}
+
+Error QnnDetachedExecution::execute(Span<EValue*> args) const {
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_ != nullptr && handle_ != nullptr,
+      InvalidState,
+      "Detached QNN execution has no delegate handle");
+  BackendExecutionContext context(
+      /*event_tracer=*/nullptr,
+      /*temp_allocator=*/nullptr,
+      method_name_.c_str());
+  return backend_->execute(context, handle_, args);
+}
+
+std::unique_ptr<QnnDetachedExecution> AcquireLastInitializedQnnExecution(
+    const char* method_name) {
+  if (g_last_initialized_backend == nullptr ||
+      g_last_initialized_handle == nullptr || method_name == nullptr ||
+      g_last_initialized_method != method_name ||
+      !g_last_initialized_backend->retain_detached_delegate(
+          g_last_initialized_handle)) {
+    return nullptr;
+  }
+  auto detached = std::unique_ptr<QnnDetachedExecution>(
+      new QnnDetachedExecution(
+          g_last_initialized_backend,
+          g_last_initialized_handle,
+          g_last_initialized_method));
+  g_last_initialized_backend = nullptr;
+  g_last_initialized_handle = nullptr;
+  g_last_initialized_method.clear();
+  return detached;
+}
 
 // ========== Public method implementations =========================
 namespace {
@@ -103,6 +155,14 @@ Error PrewarmQnnBackend(
   return Error::Ok;
 }
 
+void ReleaseQnnBackendBundles() {
+  QnnBackendUnifiedRegistry::GetInstance().ReleaseBackendBundles();
+}
+
+void ReleaseQnnPerformanceVotes() {
+  QnnBackendUnifiedRegistry::GetInstance().ReleasePerformanceVotes();
+}
+
 Result<DelegateHandle*> QnnExecuTorchBackend::init(
     BackendInitContext& context,
     FreeableBuffer* processed,
@@ -112,6 +172,7 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
   // covert SizedBuffer to qnn ExecuTorch option
   QnnExecuTorchContextBinary qnn_context_blob;
   const qnn_delegate::QnnExecuTorchOptions* qnn_executorch_options = nullptr;
+  const CompileSpec* qnn_compile_spec = nullptr;
   auto [status, signature, ctx_size, ctx_bin] =
       QnnContextCustomProtocol().DeserializeContextCustomBuffer(
           const_cast<void*>(processed->data()));
@@ -132,23 +193,14 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
 
   // convert CompileSpec to qnn ExecuTorch option
   for (auto& compile_spec : compile_specs) {
-    if (std::strcmp(compile_spec.key, kQnnCompileSpec) == 0)
+    if (std::strcmp(compile_spec.key, kQnnCompileSpec) == 0) {
+      qnn_compile_spec = &compile_spec;
       qnn_executorch_options =
           GetQnnExecuTorchOptions(compile_spec.value.buffer);
-    else
+    } else {
       QNN_EXECUTORCH_LOG_WARN("unknown argument: %s", compile_spec.key);
+    }
   }
-
-  // Create QnnManager
-  MemoryAllocator* runtime_allocator = context.get_runtime_allocator();
-  QnnManager* qnn_manager = runtime_allocator->allocateInstance<QnnManager>();
-  if (qnn_manager == nullptr) {
-    return Error::MemoryAllocationFailed;
-  }
-
-  // NOTE: Since we use placement new and since this type is not trivially
-  // destructible, we must call the destructor manually in destroy().
-  new (qnn_manager) QnnManager(qnn_executorch_options, qnn_context_blob);
   // TODO: this is a temporal solution for multi-graph support, will be
   //       removed once framework starts to accept runtime configuration
   // ---
@@ -164,11 +216,32 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
     }
   }
   if (cached_delegate != nullptr) {
+    retain_cached_method_delegate(cached_delegate);
+    g_last_initialized_backend = this;
+    g_last_initialized_handle = cached_delegate;
+    g_last_initialized_method = context.get_method_name();
     QNN_EXECUTORCH_LOG_INFO(
         "Use cached delegate handle for current method: %s",
         context.get_method_name());
     return cached_delegate;
   }
+
+  ET_CHECK_OR_RETURN_ERROR(
+      qnn_compile_spec != nullptr && qnn_executorch_options != nullptr,
+      InvalidArgument,
+      "Missing qnn_compile_spec");
+  auto options_storage = std::make_shared<std::vector<uint8_t>>(
+      qnn_compile_spec->value.nbytes);
+  std::memcpy(
+      options_storage->data(),
+      qnn_compile_spec->value.buffer,
+      qnn_compile_spec->value.nbytes);
+  auto qnn_manager_owner = std::unique_ptr<QnnManager>(
+      new (std::nothrow) QnnManager(options_storage, qnn_context_blob));
+  if (qnn_manager_owner == nullptr) {
+    return Error::MemoryAllocationFailed;
+  }
+  QnnManager* qnn_manager = qnn_manager_owner.get();
 
   const auto init_backend_start = Clock::now();
   ET_CHECK_OR_RETURN_ERROR(
@@ -200,6 +273,10 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
   }
   const double allocate_tensors_ms = elapsed_ms(allocate_tensors_start);
   add_cached_delegate(signature, qnn_manager);
+  qnn_manager_owner.release();
+  g_last_initialized_backend = this;
+  g_last_initialized_handle = qnn_manager;
+  g_last_initialized_method = context.get_method_name();
 
 #ifndef __hexagon__
   // This backend does not need its processed data after Init.
@@ -399,16 +476,29 @@ Error QnnExecuTorchBackend::execute(
 }
 
 void QnnExecuTorchBackend::destroy(DelegateHandle* handle) const {
-  bool delegate_exists = false;
+  QnnManager* manager_to_delete = nullptr;
   if (handle != nullptr) {
     std::lock_guard<std::mutex> guard(mutex_);
-    delegate_exists = delegate_map_rev_.count(handle) != 0;
+    auto owner_it = delegate_ownership_.find(handle);
+    if (owner_it != delegate_ownership_.end()) {
+      if (owner_it->second.method_refs > 0) {
+        --owner_it->second.method_refs;
+      }
+      if (owner_it->second.method_refs == 0 &&
+          owner_it->second.detached_refs == 0) {
+        const auto signature = owner_it->second.signature;
+        auto signature_it = delegate_map_.find(signature);
+        if (signature_it != delegate_map_.end() &&
+            signature_it->second == handle) {
+          delegate_map_.erase(signature_it);
+        }
+        delegate_map_rev_.erase(handle);
+        delegate_ownership_.erase(owner_it);
+        manager_to_delete = static_cast<QnnManager*>(handle);
+      }
+    }
   }
-  if (delegate_exists) {
-    QnnManager* qnn_manager = static_cast<QnnManager*>(handle);
-    qnn_manager->Destroy();
-    erase_cached_delegate(handle);
-  }
+  delete manager_to_delete;
 }
 
 executorch::runtime::Error QnnExecuTorchBackend::set_option(
@@ -492,17 +582,55 @@ void QnnExecuTorchBackend::add_cached_delegate(
   std::lock_guard<std::mutex> guard(mutex_);
   delegate_map_[signature] = handle;
   delegate_map_rev_[handle] = signature;
+  delegate_ownership_[handle] = DelegateOwnership{signature, 1, 0};
 }
 
-void QnnExecuTorchBackend::erase_cached_delegate(
+void QnnExecuTorchBackend::retain_cached_method_delegate(
     executorch::runtime::DelegateHandle* handle) const {
   std::lock_guard<std::mutex> guard(mutex_);
-  auto iter = delegate_map_rev_.find(handle);
-  if (iter == delegate_map_rev_.end()) {
-    return;
+  auto owner_it = delegate_ownership_.find(handle);
+  if (owner_it != delegate_ownership_.end()) {
+    ++owner_it->second.method_refs;
   }
-  delegate_map_.erase(iter->second);
-  delegate_map_rev_.erase(handle);
+}
+
+bool QnnExecuTorchBackend::retain_detached_delegate(
+    DelegateHandle* handle) const {
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto owner_it = delegate_ownership_.find(handle);
+  if (owner_it == delegate_ownership_.end()) {
+    return false;
+  }
+  ++owner_it->second.detached_refs;
+  return true;
+}
+
+void QnnExecuTorchBackend::release_detached_delegate(
+    DelegateHandle* handle) const {
+  QnnManager* manager_to_delete = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto owner_it = delegate_ownership_.find(handle);
+    if (owner_it == delegate_ownership_.end()) {
+      return;
+    }
+    if (owner_it->second.detached_refs > 0) {
+      --owner_it->second.detached_refs;
+    }
+    if (owner_it->second.method_refs == 0 &&
+        owner_it->second.detached_refs == 0) {
+      const auto signature = owner_it->second.signature;
+      auto signature_it = delegate_map_.find(signature);
+      if (signature_it != delegate_map_.end() &&
+          signature_it->second == handle) {
+        delegate_map_.erase(signature_it);
+      }
+      delegate_map_rev_.erase(handle);
+      delegate_ownership_.erase(owner_it);
+      manager_to_delete = static_cast<QnnManager*>(handle);
+    }
+  }
+  delete manager_to_delete;
 }
 
 namespace {

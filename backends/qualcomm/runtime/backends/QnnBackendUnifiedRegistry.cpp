@@ -142,6 +142,26 @@ Error QnnBackendUnifiedRegistry::GetOrCreateBackendBundle(
   return Error::Ok;
 }
 
+void QnnBackendUnifiedRegistry::ReleaseBackendBundles() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  QNN_EXECUTORCH_LOG_INFO(
+      "Releasing %zu process-lifetime QNN backend bundle(s)",
+      qnn_backend_bundles_map_.size());
+  qnn_backend_bundles_map_.clear();
+}
+
+void QnnBackendUnifiedRegistry::ReleasePerformanceVotes() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  QNN_EXECUTORCH_LOG_INFO(
+      "Releasing performance votes for %zu process-lifetime QNN backend bundle(s)",
+      qnn_backend_bundles_map_.size());
+  for (auto& entry : qnn_backend_bundles_map_) {
+    if (entry.second && entry.second->qnn_device_ptr) {
+      entry.second->qnn_device_ptr->ReleasePerformanceVote();
+    }
+  }
+}
+
 } // namespace qnn
 } // namespace backends
 } // namespace executorch

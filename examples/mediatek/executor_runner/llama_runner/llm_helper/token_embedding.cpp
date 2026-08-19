@@ -84,6 +84,9 @@ void TokenEmbeddingLut::lookupEmbedding(const std::vector<uint64_t>& tokens) {
     const size_t lutOffset = rowIdx * kLutRowSizeBytes;
     std::memcpy(
         mOutputBuffer + outputOffset, mLutBuffer + lutOffset, kLutRowSizeBytes);
+    if (mDiscardAfterLookup) {
+      mMemMappedEmbFile->discardRange(lutOffset, kLutRowSizeBytes);
+    }
     outputOffset += kLutRowSizeBytes;
   }
   return;

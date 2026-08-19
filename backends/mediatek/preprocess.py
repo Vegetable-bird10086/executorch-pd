@@ -6,6 +6,8 @@
 
 import collections
 import contextlib
+import hashlib
+import os
 import struct
 
 from typing import Dict, final, List
@@ -21,7 +23,7 @@ from executorch.exir.backend.backend_details import (
 )
 from executorch.exir.backend.compile_spec_schema import CompileSpec
 
-SKIP_COMPILE_SPEC_KEYS = {"ImportForever"}
+SKIP_COMPILE_SPEC_KEYS = {"ImportForever", "ConverterDumpDir"}
 EXTRACT_SHARED_BLOB_KEY = "ExtractSharedBlobKey"
 HEADER_SIZE = 13
 HEADER_VERSION = 1
@@ -108,7 +110,9 @@ class NeuropilotBackend(BackendDetails):
             if name_to_node_mappings[name].meta["val"].dtype == torch.float32
         ]
 
-        compile_options = ["--relax-fp32", "--opt=3"]
+        compile_options = ["--relax-fp32"]
+        if not any(spec.key == "opt" for spec in module_compile_spec):
+            compile_options.append("--opt=3")
         for spec in module_compile_spec:
             # Special compile spec handling
             if spec.key in SKIP_COMPILE_SPEC_KEYS:
@@ -132,8 +136,30 @@ class NeuropilotBackend(BackendDetails):
         converter.prepend_input_quantize_ops_indices = fp_input_indices
         converter.append_output_dequantize_ops = True
         converter.append_output_dequantize_ops_indices = fp_output_indices
+        converter_dump_dirs = [
+            spec.value.decode("utf-8")
+            for spec in module_compile_spec
+            if spec.key == "ConverterDumpDir"
+        ]
+        converter_dump_dir = converter_dump_dirs[0] if converter_dump_dirs else None
+        if converter_dump_dir:
+            signature = "\n".join([*input_names, "--", *output_names])
+            signature_hash = hashlib.sha1(signature.encode()).hexdigest()[:12]
+            converter_dump_dir = os.path.join(
+                converter_dump_dir, f"subgraph_{signature_hash}"
+            )
+            os.makedirs(converter_dump_dir, exist_ok=True)
+            converter.export_qparams_config_file = os.path.join(
+                converter_dump_dir, "qparams.json"
+            )
         with contextlib.redirect_stdout(None):
-            mlir_str = converter.convert_to_mlir()
+            mlir_str = converter.convert_to_mlir(
+                output_file=(
+                    os.path.join(converter_dump_dir, "model.mlir")
+                    if converter_dump_dir
+                    else None
+                )
+            )
             model_bytes = mtk_neuron.compile(mlir_str, " ".join(compile_options))
 
         num_inputs = len(input_names)

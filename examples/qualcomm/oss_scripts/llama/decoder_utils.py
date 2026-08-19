@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
@@ -410,6 +411,19 @@ def _prefill_chunking(
         pos = 0  # Tracks how many prompt tokens have been processed.
         while pos < num_prompt_tokens:
             chunk_start_idx, chunk_end_idx = pos, min(num_prompt_tokens, pos + ar_len)
+            # Opt-in no-BOS calibration: execute BOS alone even for an AR-N
+            # prefill graph, then reset observers below while retaining its KV.
+            # This prevents the known Qwen3 BOS activation outlier from
+            # dominating every subsequent A8 range.
+            if (
+                os.environ.get(
+                    "ET_QNN_RESET_OBSERVERS_AFTER_FIRST_PREFILL_CHUNK", ""
+                )
+                == "1"
+                and chunk_start_idx == 0
+                and num_prompt_tokens > 1
+            ):
+                chunk_end_idx = 1
 
             # Take a chunk of prompt tokens, up to ar_len length.
             if inputs.input_ids is not None:
@@ -488,6 +502,35 @@ def _prefill_chunking(
                 new_k_caches,
                 new_v_caches,
             )
+
+            # Decode calibration must not inherit the BOS-only activation
+            # outlier, but the BOS forward still has to populate the KV cache.
+            if (
+                os.environ.get(
+                    "ET_QNN_RESET_OBSERVERS_AFTER_FIRST_PREFILL_CHUNK", ""
+                )
+                == "1"
+                and chunk_start_idx == 0
+                and pos < num_prompt_tokens
+            ):
+                reset_count = 0
+                unsupported_reset_types = set()
+                for submodule in module.modules():
+                    reset = getattr(submodule, "reset_min_max_vals", None)
+                    if callable(reset):
+                        try:
+                            reset()
+                            reset_count += 1
+                        except NotImplementedError:
+                            unsupported_reset_types.add(
+                                type(submodule).__qualname__
+                            )
+                logging.info(
+                    "Reset %d min/max observers after the first prefill chunk; "
+                    "unsupported reset types=%s",
+                    reset_count,
+                    sorted(unsupported_reset_types),
+                )
 
         # Append the last run logits to the total_token_list.
         total_token_list.append(
@@ -910,6 +953,7 @@ def graph_module_inference(
     seq_mse_candidates: int = 0,
     lookahead_config: Optional[Tuple[int]] = None,
     generate_tokens: bool = True,
+    collect_logits: bool = False,
 ):
     """
     This function supports model execution from static nn.Module decoder model
@@ -927,7 +971,7 @@ def graph_module_inference(
             kwargs["lookahead_config"] = lookahead_config
             kwargs["generate_tokens"] = generate_tokens
 
-        INFERENCE_REGISTRY[use_kv_cache](
+        result = INFERENCE_REGISTRY[use_kv_cache](
             get_example_inputs,
             prompt,
             module,
@@ -937,10 +981,11 @@ def graph_module_inference(
             image_token_id=image_token_id,
             max_seq_len=max_seq_len,
             use_i64_token=use_i64_token,
-            collect_logits=False,
+            collect_logits=collect_logits,
             **kwargs,
         )
         logging.info(f"Prompt summary for {event_name}")
+        return result
     else:
         calibration_wrapper = GraphModuleCalibrationWrapper(
             model=module,

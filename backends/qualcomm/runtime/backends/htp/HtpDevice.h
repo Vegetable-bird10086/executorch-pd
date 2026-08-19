@@ -38,6 +38,8 @@ class HtpDevice : public QnnDevice {
   }
   ~HtpDevice();
 
+  void ReleasePerformanceVote() override;
+
   // Defines Qnn performance mode vote types for htp
   enum PerformanceModeVoteType {
     kNoVote = 0,
@@ -53,7 +55,6 @@ class HtpDevice : public QnnDevice {
 
  private:
   void PerformanceVote();
-  void ReleasePerformanceVote();
 
   inline bool IsPerfModeEnabled() {
     return get_option(htp_options_->performance_mode()) !=

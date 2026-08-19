@@ -63,7 +63,12 @@ from executorch.examples.qualcomm.utils import (
 from torchao.quantization.utils import compute_error
 
 
-sys.setrecursionlimit(4096)
+# Large sharded QNN graphs can exceed the historical 4096-frame limit while
+# ExecuTorch deep-copies the lowered ExportedProgram for PTE serialization.
+# Keep the override process-local and configurable.
+sys.setrecursionlimit(
+    max(sys.getrecursionlimit(), int(os.getenv("ET_QNN_EXPORT_RECURSION_LIMIT", "100000")))
+)
 FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=FORMAT)
 logging.getLogger().setLevel(logging.INFO)
@@ -165,7 +170,9 @@ def compile(
                     backend_options=backend_options,
                     # x86 emulator does not support shared buffer
                     shared_buffer=not args.enable_x86_64,
-                    use_mha2sha=True,
+                    use_mha2sha=(
+                        os.environ.get("ET_QNN_DISABLE_MHA2SHA", "") != "1"
+                    ),
                     dump_intermediate_outputs=args.dump_intermediate_outputs,
                 )
             ] * len(DECODER_GRAPH_NAMES)
@@ -494,6 +501,14 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        "--decode_only",
+        action="store_true",
+        help=(
+            "Export only kv_forward while retaining hybrid-mode ABI and compile "
+            "settings. Use this to bound host memory during sharded compilation."
+        ),
+    )
+    parser.add_argument(
         "--prefill_only_no_output",
         action="store_true",
         help=(
@@ -598,12 +613,24 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        "--llama_qnn_activation_bits",
+        type=int,
+        choices=(8, 16),
+        default=16,
+        help=(
+            "QNN Prefill activation width. Keep 16 for the production PD "
+            "export; llama.cpp Decode dynamically quantizes compatible GEMV "
+            "inputs to A8 without changing the QNN graph domain."
+        ),
+    )
+    parser.add_argument(
         "--llama_qnn_profile_gguf",
         type=str,
         default=None,
         help=(
             "Shared Prefill/Decode GGUF used to finalize the emitted QNN "
-            "profile as kernel-ready qnn_u16_runtime_profile.bin."
+            "profile as the kernel-ready V5 qnn_u16_runtime_profile.meta plus "
+            "its single qnn_u16_runtime_profile.bin payload."
         ),
     )
     parser.add_argument(
@@ -774,6 +801,15 @@ def _build_parser():
             "fallback to model max context len."
         ),
     )
+    parser.add_argument(
+        "--qat_post_replace_generate_only",
+        action="store_true",
+        help=(
+            "Exit successfully immediately after post-convert Python text "
+            "generation, before backend lowering. Requires "
+            "--qat_post_replace_generate_text."
+        ),
+    )
 
     return parser
 
@@ -793,6 +829,13 @@ def export_llama(args) -> None:
             raise RuntimeError("--prefill_only requires --compile_only")
         if args.model_mode != "hybrid":
             raise RuntimeError("--prefill_only requires --model_mode hybrid")
+    if args.decode_only:
+        if not args.compile_only:
+            raise RuntimeError("--decode_only requires --compile_only")
+        if args.model_mode != "hybrid":
+            raise RuntimeError("--decode_only requires --model_mode hybrid")
+        if args.prefill_only or args.prefill_only_no_output:
+            raise RuntimeError("--decode_only cannot be combined with --prefill_only")
     if (TASKS_EVAL or SQNR_EVAL) in args.eval_methods and args.model_mode not in {
         "kv",
         "hybrid",
@@ -931,6 +974,16 @@ def export_llama(args) -> None:
         logging.info("decoder shard manifest exported at %s", shard_manifest_path)
     if args.emit_llama_qnn_quant_profile:
         if not args.llama_qnn_profile_gguf:
+            bounded_profile_export = bool(
+                os.environ.get("ET_QNN_DIAGNOSTIC_SHARD_LIMIT", "")
+                and os.environ.get("ET_QNN_DIAGNOSTIC_SHARD_START") is not None
+            )
+            if bounded_profile_export:
+                logging.warning(
+                    "Deferred compact QNN runtime-profile generation for a "
+                    "bounded shard batch; compact the merged 18-shard manifest"
+                )
+                return
             raise RuntimeError(
                 "--emit_llama_qnn_quant_profile requires "
                 "--llama_qnn_profile_gguf"
@@ -940,12 +993,13 @@ def export_llama(args) -> None:
             "tools",
             "qnn_llama_quant_profile_compact.py",
         )
-        profile_json = os.path.join(
-            args.artifact, "qnn_u16_runtime_profile.json"
+        profile_stem = (
+            "qnn_u8_runtime_profile"
+            if args.llama_qnn_activation_bits == 8
+            else "qnn_u16_runtime_profile"
         )
-        profile_bin = os.path.join(
-            args.artifact, "qnn_u16_runtime_profile.bin"
-        )
+        profile_json = os.path.join(args.artifact, f"{profile_stem}.json")
+        profile_bin = os.path.join(args.artifact, f"{profile_stem}.bin")
         profile_command = [
             sys.executable,
             profile_tool,

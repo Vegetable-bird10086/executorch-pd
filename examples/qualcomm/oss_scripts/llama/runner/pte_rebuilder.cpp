@@ -40,11 +40,11 @@ ReadOnlyMappedFile::ReadOnlyMappedFile(
     int fd,
     const uint8_t* data,
     size_t size,
-    bool shared_memory_backed)
+    Backing backing)
     : fd_(fd),
       data_(data),
       size_(size),
-      shared_memory_backed_(shared_memory_backed) {}
+      backing_(backing) {}
 
 std::shared_ptr<ReadOnlyMappedFile> ReadOnlyMappedFile::open(
     const std::string& path) {
@@ -68,7 +68,7 @@ std::shared_ptr<ReadOnlyMappedFile> ReadOnlyMappedFile::open(
   }
   (void)::madvise(mapping, size, MADV_RANDOM);
   return std::shared_ptr<ReadOnlyMappedFile>(new ReadOnlyMappedFile(
-      fd, static_cast<const uint8_t*>(mapping), size, false));
+      fd, static_cast<const uint8_t*>(mapping), size, Backing::File));
 }
 
 std::shared_ptr<ReadOnlyMappedFile>
@@ -132,28 +132,78 @@ ReadOnlyMappedFile::load_into_shared_memory(const std::string& path) {
   (void)::posix_fadvise(
       source_fd, 0, static_cast<off_t>(size), POSIX_FADV_DONTNEED);
   ::close(source_fd);
-  if (::munmap(writable, size) != 0) {
+  if (::mprotect(writable, size, PROT_READ) != 0) {
+    const std::string error = std::strerror(errno);
+    ::munmap(writable, size);
     ::close(fd);
-    throw std::runtime_error("Failed to unmap writable model shared memory");
+    throw std::runtime_error(
+        "Failed to protect model shared memory read-only: " + error);
   }
 
   const int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW;
   if (::fcntl(fd, F_ADD_SEALS, seals) != 0) {
+    const std::string error = std::strerror(errno);
+    ::munmap(writable, size);
     ::close(fd);
     throw std::runtime_error(
-        "Failed to seal model shared memory: " +
-        std::string(std::strerror(errno)));
+        "Failed to seal model shared memory: " + error);
   }
-  void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
-  if (mapping == MAP_FAILED) {
-    ::close(fd);
-    throw std::runtime_error(
-        "Failed to map read-only model shared memory: " +
-        std::string(std::strerror(errno)));
-  }
-  (void)::madvise(mapping, size, MADV_WILLNEED);
+  (void)::madvise(writable, size, MADV_WILLNEED);
   return std::shared_ptr<ReadOnlyMappedFile>(new ReadOnlyMappedFile(
-      fd, static_cast<const uint8_t*>(mapping), size, true));
+      fd, static_cast<const uint8_t*>(writable), size, Backing::SharedMemory));
+}
+
+std::shared_ptr<ReadOnlyMappedFile>
+ReadOnlyMappedFile::load_into_anonymous_buffer(const std::string& path) {
+  const int source_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (source_fd < 0) {
+    throw std::runtime_error("Failed to open anonymous-buffer source: " + path);
+  }
+  struct stat metadata {};
+  if (::fstat(source_fd, &metadata) != 0 || metadata.st_size <= 0) {
+    ::close(source_fd);
+    throw std::runtime_error("Failed to stat anonymous-buffer source: " + path);
+  }
+  const size_t size = static_cast<size_t>(metadata.st_size);
+  void* writable = ::mmap(
+      nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (writable == MAP_FAILED) {
+    ::close(source_fd);
+    throw std::runtime_error(
+        "Failed to allocate anonymous model buffer: " +
+        std::string(std::strerror(errno)));
+  }
+  (void)::madvise(writable, size, MADV_SEQUENTIAL);
+  size_t copied = 0;
+  while (copied < size) {
+    const size_t chunk = std::min<size_t>(size - copied, 8U * 1024U * 1024U);
+    ssize_t count;
+    do {
+      count = ::pread(
+          source_fd, static_cast<uint8_t*>(writable) + copied, chunk,
+          static_cast<off_t>(copied));
+    } while (count < 0 && errno == EINTR);
+    if (count <= 0) {
+      ::munmap(writable, size);
+      ::close(source_fd);
+      throw std::runtime_error(
+          "Failed while loading anonymous model buffer: " +
+          std::string(std::strerror(errno)));
+    }
+    copied += static_cast<size_t>(count);
+  }
+  (void)::posix_fadvise(
+      source_fd, 0, static_cast<off_t>(size), POSIX_FADV_DONTNEED);
+  ::close(source_fd);
+  if (::mprotect(writable, size, PROT_READ) != 0) {
+    ::munmap(writable, size);
+    throw std::runtime_error(
+        "Failed to protect anonymous model buffer: " +
+        std::string(std::strerror(errno)));
+  }
+  (void)::madvise(writable, size, MADV_RANDOM);
+  return std::shared_ptr<ReadOnlyMappedFile>(new ReadOnlyMappedFile(
+      -1, static_cast<const uint8_t*>(writable), size, Backing::Anonymous));
 }
 
 ReadOnlyMappedFile::~ReadOnlyMappedFile() {
@@ -178,7 +228,11 @@ bool ReadOnlyMappedFile::empty() const {
 }
 
 bool ReadOnlyMappedFile::shared_memory_backed() const {
-  return shared_memory_backed_;
+  return backing_ == Backing::SharedMemory;
+}
+
+bool ReadOnlyMappedFile::anonymous_buffer_backed() const {
+  return backing_ == Backing::Anonymous;
 }
 
 std::string ReadOnlyMappedFile::inherited_fd_spec() const {
@@ -189,9 +243,33 @@ std::string ReadOnlyMappedFile::inherited_fd_spec() const {
 }
 
 void ReadOnlyMappedFile::discard_resident_pages() const {
-  if (!shared_memory_backed_ && data_ != nullptr && size_ > 0) {
+  if (backing_ == Backing::File && data_ != nullptr && size_ > 0) {
     (void)::madvise(const_cast<uint8_t*>(data_), size_, MADV_DONTNEED);
   }
+}
+
+ReadOnlyMappedFile::Residency ReadOnlyMappedFile::residency() const {
+  Residency result;
+  if (data_ == nullptr || size_ == 0) {
+    return result;
+  }
+  const long page_size_raw = ::sysconf(_SC_PAGESIZE);
+  if (page_size_raw <= 0) {
+    result.error = errno != 0 ? errno : EINVAL;
+    return result;
+  }
+  const size_t page_size = static_cast<size_t>(page_size_raw);
+  result.total_pages = (size_ + page_size - 1) / page_size;
+  std::vector<unsigned char> pages(result.total_pages);
+  if (::mincore(const_cast<uint8_t*>(data_), size_, pages.data()) != 0) {
+    result.error = errno;
+    return result;
+  }
+  result.resident_pages = static_cast<size_t>(std::count_if(
+      pages.begin(), pages.end(), [](unsigned char value) {
+        return (value & 1U) != 0;
+      }));
+  return result;
 }
 
 PteRebuildBuffer::PteRebuildBuffer(size_t capacity) {
@@ -204,6 +282,28 @@ void PteRebuildBuffer::resize_uninitialized(size_t size) {
     capacity_ = size;
   }
   size_ = size;
+}
+
+size_t PteRebuildBuffer::discard_resident_pages_keep_capacity() {
+  if (!bytes_ || capacity_ < 8192) {
+    return 0;
+  }
+  const long page_size_raw = ::sysconf(_SC_PAGESIZE);
+  if (page_size_raw <= 0) {
+    return 0;
+  }
+  const size_t page_size = static_cast<size_t>(page_size_raw);
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(bytes_.get());
+  const uintptr_t aligned_begin = (begin + page_size - 1) & ~(page_size - 1);
+  const uintptr_t aligned_end = (begin + capacity_) & ~(page_size - 1);
+  if (aligned_end <= aligned_begin) {
+    return 0;
+  }
+  const size_t length = aligned_end - aligned_begin;
+  if (::madvise(reinterpret_cast<void*>(aligned_begin), length, MADV_DONTNEED) != 0) {
+    return 0;
+  }
+  return length;
 }
 
 uint8_t* PteRebuildBuffer::data() {
@@ -514,6 +614,7 @@ struct GgufTensorInfo {
 struct GgufView {
   uint32_t alignment{32};
   bool gptq2_32_gs32_source{false};
+  bool gptq2_32_i8mm_native_source{false};
   std::unordered_map<std::string, GgufTensorInfo> tensors;
 };
 
@@ -569,6 +670,7 @@ struct DirectGptq2TensorView {
   size_t num_source_groups{0};
   const uint8_t* data{nullptr};
   bool gs32_source_layout{false};
+  bool i8mm_native_layout{false};
 };
 
 const TensorView& require_tensor(const SafeTensorsView& view, const std::string& name);
@@ -673,10 +775,11 @@ GgufView parse_gguf(const uint8_t* gguf_data, size_t gguf_size) {
     if (key == "general.gptq2_32.layout" &&
         value_type == GgufValueType::STRING) {
       const std::string layout = read_gguf_string(gguf_data, &cursor);
-      if (layout != "gs32_source_v1") {
+      if (layout != "gs32_source_v1" && layout != "i8mm_native_v1") {
         throw std::runtime_error("Unsupported GPTQ2_32 GGUF source layout");
       }
-      out.gptq2_32_gs32_source = true;
+      out.gptq2_32_gs32_source = layout == "gs32_source_v1";
+      out.gptq2_32_i8mm_native_source = layout == "i8mm_native_v1";
       continue;
     }
     skip_gguf_value(gguf_data, &cursor, value_type);
@@ -1187,7 +1290,8 @@ GgufTensorType gptq2_tensor_type_for_group_size(size_t group_size) {
 DirectGptq2TensorView parse_direct_gptq2_tensor(
     const GgufTensorInfo& tensor,
     size_t source_group_size,
-    bool gs32_source_layout) {
+    bool gs32_source_layout,
+    bool i8mm_native_layout = false) {
   DirectGptq2TensorView out;
   if (source_group_size == 0 || source_group_size % 32 != 0 ||
       tensor.tensor_type != gptq2_tensor_type_for_group_size(source_group_size) ||
@@ -1223,6 +1327,7 @@ DirectGptq2TensorView parse_direct_gptq2_tensor(
 
   out.data = tensor.data;
   out.gs32_source_layout = gs32_source_layout;
+  out.i8mm_native_layout = i8mm_native_layout;
   return out;
 }
 
@@ -1704,6 +1809,147 @@ void write_int4_block_from_gptq2_gs32_source(
   }
 }
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+template <int Shift>
+ET_INLINE uint32_t pack_i8mm_native_two_rows_neon(uint8x16_t rows) {
+  static_assert(Shift == 0 || Shift == 2 || Shift == 4 || Shift == 6);
+  const uint8x16_t shifted = [&]() {
+    if constexpr (Shift == 0) {
+      return rows;
+    } else {
+      return vshrq_n_u8(rows, Shift);
+    }
+  }();
+  const uint8x16_t codes = vandq_u8(shifted, vdupq_n_u8(0x3));
+  const uint8x16_t place = {
+      1, 4, 16, 64, 1, 4, 16, 64,
+      1, 4, 16, 64, 1, 4, 16, 64};
+  const uint8x16_t products = vmulq_u8(codes, place);
+  const uint8x16_t pairs = vpaddq_u8(products, products);
+  const uint8x16_t quads = vpaddq_u8(pairs, pairs);
+  return vget_lane_u32(vreinterpret_u32_u8(vget_low_u8(quads)), 0);
+}
+
+template <int Shift>
+ET_INLINE uint8x16_t pack_i8mm_native_qbytes8_neon(
+    const uint8_t* native_rows) {
+  uint32x2_t low = vdup_n_u32(0);
+  uint32x2_t high = vdup_n_u32(0);
+  low = vset_lane_u32(
+      pack_i8mm_native_two_rows_neon<Shift>(vld1q_u8(native_rows + 0)),
+      low, 0);
+  low = vset_lane_u32(
+      pack_i8mm_native_two_rows_neon<Shift>(vld1q_u8(native_rows + 16)),
+      low, 1);
+  high = vset_lane_u32(
+      pack_i8mm_native_two_rows_neon<Shift>(vld1q_u8(native_rows + 32)),
+      high, 0);
+  high = vset_lane_u32(
+      pack_i8mm_native_two_rows_neon<Shift>(vld1q_u8(native_rows + 48)),
+      high, 1);
+  return vcombine_u8(vreinterpret_u8_u32(low), vreinterpret_u8_u32(high));
+}
+#endif
+
+void write_int4_block_from_gptq2_i8mm_native(
+    const uint8_t* native_source_block,
+    size_t cols,
+    size_t num_qnn_groups,
+    uint8_t* dst) {
+  static constexpr size_t kRowsPerBlock = 64;
+  static constexpr size_t kRowsPerNativeTile = 16;
+  static constexpr size_t kNativeRowBytes = 8;
+  static constexpr size_t kNativeTileBytes =
+      kRowsPerNativeTile * kNativeRowBytes;
+  static constexpr size_t kQbytesPerGroup = 512;
+  static constexpr size_t kMetadataBytesPerRow = 4;
+  static constexpr size_t kMetadataPerGroup =
+      kRowsPerBlock * kMetadataBytesPerRow;
+  if (cols % 32 != 0 || cols / 32 != num_qnn_groups ||
+      cols > std::numeric_limits<size_t>::max() / 24) {
+    throw std::runtime_error("Invalid GPTQ INT2 I8MM-native dimensions");
+  }
+
+  const uint8_t* native_qbytes = native_source_block;
+  const uint8_t* all_metadata =
+      native_source_block + num_qnn_groups * kQbytesPerGroup;
+  for (size_t bc = 0; bc < num_qnn_groups; ++bc) {
+    const uint8_t* metadata = all_metadata + bc * kMetadataPerGroup;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    uint8_t* group_dst =
+        dst + bc * kRowsPerBlock * 32 / 2;
+    for (size_t row_base = 0; row_base < kRowsPerBlock; row_base += 8) {
+      const size_t native_tile = row_base / kRowsPerNativeTile;
+      const size_t row_in_tile = row_base % kRowsPerNativeTile;
+      const uint8_t* native_rows =
+          native_qbytes +
+          (native_tile * num_qnn_groups + bc) * kNativeTileBytes +
+          row_in_tile * kNativeRowBytes;
+      alignas(16) uint8_t tile_qbytes[4][16];
+      vst1q_u8(tile_qbytes[0],
+          pack_i8mm_native_qbytes8_neon<0>(native_rows));
+      vst1q_u8(tile_qbytes[1],
+          pack_i8mm_native_qbytes8_neon<2>(native_rows));
+      vst1q_u8(tile_qbytes[2],
+          pack_i8mm_native_qbytes8_neon<4>(native_rows));
+      vst1q_u8(tile_qbytes[3],
+          pack_i8mm_native_qbytes8_neon<6>(native_rows));
+      const uint8x8_t zp = decode_gptq2_qzeros8_neon(
+          metadata + row_base * kMetadataBytesPerRow);
+      const size_t br = row_base / 32;
+      const size_t tile_br = (row_base % 32) / 8;
+      const size_t dst_row_offset =
+          (br * 4 * 4 * 8 + tile_br * 8) * 4;
+      static constexpr size_t kDstTileStride = 4 * 8 * 4;
+      pack_gptq2_gs32_tile_pair8_neon(
+          tile_qbytes[0], tile_qbytes[1], zp,
+          group_dst + dst_row_offset,
+          group_dst + dst_row_offset + kDstTileStride);
+      pack_gptq2_gs32_tile_pair8_neon(
+          tile_qbytes[2], tile_qbytes[3], zp,
+          group_dst + dst_row_offset + 2 * kDstTileStride,
+          group_dst + dst_row_offset + 3 * kDstTileStride);
+    }
+#else
+    for (size_t br = 0; br < 2; ++br) {
+      for (size_t tile_bc = 0; tile_bc < 4; ++tile_bc) {
+        const unsigned shift = static_cast<unsigned>(tile_bc * 2);
+        for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
+          const size_t row_base = br * 32 + tile_br * 8;
+          for (size_t lane = 0; lane < 8; ++lane) {
+            const size_t row = row_base + lane;
+            const size_t native_tile = row / kRowsPerNativeTile;
+            const size_t row_in_tile = row % kRowsPerNativeTile;
+            const uint8_t* native_row =
+                native_qbytes +
+                (native_tile * num_qnn_groups + bc) * kNativeTileBytes +
+                row_in_tile * kNativeRowBytes;
+            uint8_t qbyte0 = 0;
+            uint8_t qbyte1 = 0;
+            for (size_t column = 0; column < 4; ++column) {
+              qbyte0 |= static_cast<uint8_t>(
+                  ((native_row[column] >> shift) & 0x3) << (column * 2));
+              qbyte1 |= static_cast<uint8_t>(
+                  ((native_row[column + 4] >> shift) & 0x3) << (column * 2));
+            }
+            const uint8_t zp = decode_gptq2_qzero_metadata(
+                metadata + row * kMetadataBytesPerRow);
+            const uint32_t packed_row =
+                pack_gs32_int4_from_qbytes(qbyte0, qbyte1, zp);
+            const size_t output_offset =
+                (((bc * 2 + br) * 4 + tile_bc) * 4 + tile_br) * 8 + lane;
+            std::memcpy(
+                dst + output_offset * sizeof(packed_row),
+                &packed_row,
+                sizeof(packed_row));
+          }
+        }
+      }
+    }
+#endif
+  }
+}
+
 void write_int4_block_from_gptq2_direct(
     const DirectGptq2TensorView& tensor,
     int block_id,
@@ -1715,6 +1961,14 @@ void write_int4_block_from_gptq2_direct(
       gptq2_source_block_offset(tensor, static_cast<size_t>(block_id));
   if (tensor.gs32_source_layout) {
     write_int4_block_from_gptq2_gs32_source(
+        tensor.data + source_offset,
+        tensor.cols,
+        tensor.cols / 32,
+        dst);
+    return;
+  }
+  if (tensor.i8mm_native_layout) {
+    write_int4_block_from_gptq2_i8mm_native(
         tensor.data + source_offset,
         tensor.cols,
         tensor.cols / 32,
@@ -2292,7 +2546,8 @@ PteRebuildResult rebuild_pte_from_gguf_index(
           parse_direct_gptq2_tensor(
               require_gguf_tensor(gguf, tensor_name),
               32,
-              gguf.gptq2_32_gs32_source);
+              gguf.gptq2_32_gs32_source,
+              gguf.gptq2_32_i8mm_native_source);
       current_tensor_name = tensor_name;
       have_current_tensor = true;
     }
@@ -2521,10 +2776,11 @@ std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
   impl->source_group_size = static_cast<size_t>(source_group_size);
   impl->parsed_index = parse_binary_index(*index_bytes);
   impl->selected_records = select_records_for_split(impl->parsed_index, -1);
-  if (impl->gguf_context->gguf.gptq2_32_gs32_source &&
+  if ((impl->gguf_context->gguf.gptq2_32_gs32_source ||
+       impl->gguf_context->gguf.gptq2_32_i8mm_native_source) &&
       relayout_kind != PteGgufRecipeRelayoutKind::None) {
     throw std::runtime_error(
-        "Offline GS32 source GGUF must not use runtime relayout");
+        "Offline GPTQ2 source-layout GGUF must not use runtime relayout");
   }
   impl->record_tensors.reserve(impl->selected_records.size());
   std::unordered_map<std::string, DirectGptq2TensorView> tensor_cache;
@@ -2541,7 +2797,8 @@ std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
           parse_direct_gptq2_tensor(
               require_gguf_tensor(impl->gguf_context->gguf, tensor_name),
               impl->source_group_size,
-              impl->gguf_context->gguf.gptq2_32_gs32_source)).first;
+              impl->gguf_context->gguf.gptq2_32_gs32_source,
+              impl->gguf_context->gguf.gptq2_32_i8mm_native_source)).first;
     }
     impl->record_tensors.push_back(tensor_it->second);
   }

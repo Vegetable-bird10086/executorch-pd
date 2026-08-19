@@ -41,6 +41,10 @@ class PromptProcessor {
     size_t embedding_row_bytes{0};
     executorch::aten::ScalarType embedding_scalar_type{executorch::aten::ScalarType::Float};
     const SeparateEmbedding* separate_embedding{nullptr};
+    // QNN may fold the separate-embedding Quantize into its U16 graph input.
+    bool embedding_qnn_u16_input{false};
+    float embedding_qnn_u16_scale{0.0f};
+    int32_t embedding_qnn_u16_zero_point{0};
   };
   PromptProcessor(
       DecoderRunner* decoder_runner,
@@ -128,6 +132,12 @@ class PromptProcessor {
       int64_t prompt_pos,
       int64_t start_pos,
       bool prepare_embedding = true);
+  void acquire_prefill_kv_slot_and_rebind(
+      int32_t layer_begin, int32_t layer_end_exclusive);
+  // Diagnostic-only override for testing a vocab-major AR-N output-layout
+  // hypothesis. ExecuTorch's declared [1, AR, vocab] layout remains the
+  // default sampling contract, including for uint8/A8.
+  int64_t prepare_logits_row_for_sampling(int64_t logits_pos);
   DecoderRunner* decoder_runner_;
   KVManager<T>* kv_manager_;
   std::string method_name_;
@@ -139,9 +149,10 @@ class PromptProcessor {
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint8_t> input_embedding_;
   TensorStruct<int32_t> input_pos_;
+  // Prefill masks remain A16 independently of KV storage type T.
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;
-  TensorStruct<uint16_t> logits_;
+  TensorStruct<T> logits_;
 
   // layer -> TensorImpl
   std::vector<std::unique_ptr<executorch::aten::TensorImpl>> k_cache_in_;

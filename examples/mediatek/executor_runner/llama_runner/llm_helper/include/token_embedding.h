@@ -32,6 +32,10 @@ class TokenEmbeddingLut {
 
   void lookupEmbedding(const std::vector<uint64_t>& tokens);
 
+  void setDiscardAfterLookup(bool enabled) {
+    mDiscardAfterLookup = enabled;
+  }
+
  private:
   // Source lookup table
   uint8_t* mLutBuffer = nullptr;
@@ -46,6 +50,7 @@ class TokenEmbeddingLut {
   size_t mOutputBufferSize = 0;
 
   std::unique_ptr<FileMemMapper> mMemMappedEmbFile;
+  bool mDiscardAfterLookup = false;
 };
 
 } // namespace llm_helper

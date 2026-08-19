@@ -48,6 +48,10 @@ from .utils import (
 )
 
 
+class IncompleteQuantizationEncodingError(RuntimeError):
+    """Raised when an annotated QNN quantization encoding has no qparams."""
+
+
 QNN_QUANT_TYPE_MAP = {
     torch.int8: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_SFIXED_POINT_8,
     torch.int16: PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_SFIXED_POINT_16,
@@ -150,7 +154,12 @@ class NodeVisitor:
     def make_qnn_per_block_config(self, node: torch.fx.Node, quant_attrs: Dict):
         import math
 
-        quant_config = copy.deepcopy(quant_attrs)
+        # Quantization metadata tensors can be FakeTensor/FunctionalTensor
+        # values retained by torch.export. The config builders only add or
+        # replace top-level fields and never mutate tensor payloads, so a
+        # shallow mapping copy is both sufficient and avoids invalid tensor
+        # deepcopy/data_ptr access.
+        quant_config = copy.copy(quant_attrs)
         scales, scale_offset, quantized_scales = quant_attrs[QCOM_SCALE], [], []
         # channel in observers defaults to zero
         num_channels = node.meta["val"].shape[0]
@@ -208,10 +217,15 @@ class NodeVisitor:
         )
 
     def make_qnn_per_channel_config(self, node: torch.fx.Node, quant_attrs: Dict):
-        quant_config = copy.deepcopy(quant_attrs)
+        quant_config = copy.copy(quant_attrs)
 
-        scales = quant_attrs[QCOM_SCALES]
-        zero_points = quant_attrs[QCOM_ZERO_POINTS]
+        scales = quant_attrs.get(QCOM_SCALES)
+        zero_points = quant_attrs.get(QCOM_ZERO_POINTS)
+        if scales is None or zero_points is None:
+            raise IncompleteQuantizationEncodingError(
+                f"Per-channel encoding of node {node} has incomplete qparams: "
+                f"scales={scales is not None}, zero_points={zero_points is not None}"
+            )
         assert len(scales) == len(
             zero_points
         ), f"Per channel encoding of node {node}, has different size for scales {len(scales)} and zero_points {len(zero_points)}"
@@ -224,9 +238,12 @@ class NodeVisitor:
             )
 
         # skip dequantize op, e.g. frozen_param -> dq -> conv2d
-        user_0 = self.get_first_user(node)
+        # Capability probing may define a static tensor wrapper from a
+        # temporary/detached FX node with no users (for example RMSNorm bias).
+        # Only convolution weights need the HWIO output-axis correction below.
+        user_0 = self.get_first_user(node) if node.users else None
         # Memory layout of QNN conv weight always ends in Output. Like conv2d is HWIO
-        if user_0.target == exir_ops.edge.aten.convolution.default:
+        if user_0 is not None and user_0.target == exir_ops.edge.aten.convolution.default:
             quant_config[QCOM_AXIS] = node.meta["val"].dim() - 1
         else:
             quant_config[QCOM_AXIS] = quant_attrs[QCOM_AXIS]
@@ -248,7 +265,7 @@ class NodeVisitor:
         )
 
     def make_qnn_per_tensor_config(self, quant_attrs: Dict):
-        quant_config = copy.deepcopy(quant_attrs)
+        quant_config = copy.copy(quant_attrs)
         # check Qnn_ScaleOffset_t in QNN/include/QnnTypes.h
         quant_config[QCOM_OFFSET] = -quant_attrs[QCOM_ZERO_POINT]
         # special case for 4 bits

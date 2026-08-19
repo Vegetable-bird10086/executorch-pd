@@ -283,6 +283,7 @@ Error Runner<T>::load() {
   decoder_runner_ =
       std::make_unique<DecoderRunner>(
           module_.get(), vocab_size, temperature_, prefill_shard_paths_);
+  decoder_runner_->set_logits_bit_width(sizeof(T) * 8);
 
   ET_LOG(Info, "Reading metadata from model");
   // retrieve any method meta, can be either prefill or kv
@@ -334,10 +335,42 @@ Error Runner<T>::load() {
   } else if (
       eval_mode_ == EvalMode::kHybrid ||
       eval_mode_ == EvalMode::kLookaheadDecoding) {
-    auto atten_mask_meta_prompt =
-        module_->method_meta(prompt_processor_method_name)
-            ->input_tensor_meta(1);
-    prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[1];
+    if (prefill_shard_paths_.empty()) {
+      auto atten_mask_meta_prompt =
+          module_->method_meta(prompt_processor_method_name)
+              ->input_tensor_meta(1);
+      ET_CHECK_MSG(
+          atten_mask_meta_prompt.ok(),
+          "Failed to read prefill attention mask metadata");
+      prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[1];
+    } else {
+      // A decode-only combined PTE intentionally has no prefill_forward.
+      // Read the prompt AR metadata from the first standalone prefill shard;
+      // DecoderRunner will execute all shards in place of the missing method.
+      executorch::extension::Module prefill_meta_module(
+          prefill_shard_paths_.front().c_str(),
+          executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
+      auto prefill_method_names = prefill_meta_module.method_names();
+      ET_CHECK_MSG(
+          prefill_method_names.ok() && !prefill_method_names->empty(),
+          "Failed to read prefill shard method names: %s",
+          prefill_shard_paths_.front().c_str());
+      const std::string& prefill_shard_method_name =
+          *prefill_method_names->begin();
+      auto prefill_method_meta =
+          prefill_meta_module.method_meta(prefill_shard_method_name);
+      ET_CHECK_MSG(
+          prefill_method_meta.ok(),
+          "Failed to read prefill shard method metadata: %s",
+          prefill_shard_paths_.front().c_str());
+      auto atten_mask_meta_prompt =
+          prefill_method_meta->input_tensor_meta(1);
+      ET_CHECK_MSG(
+          atten_mask_meta_prompt.ok(),
+          "Failed to read prefill attention mask metadata: %s",
+          prefill_shard_paths_.front().c_str());
+      prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[1];
+    }
   }
   prompt_processor_ar_len_ = prompt_processor_ar_len;
   if (prompt_processor_ar_len == context_len_)
@@ -347,6 +380,7 @@ Error Runner<T>::load() {
         std::min(token_generator_ar_len, prompt_processor_ar_len);
   max_ar_len = std::max(token_generator_ar_len, prompt_processor_ar_len);
 
+  decoder_runner_->set_prefill_separate_embed(use_separate_embed);
   decoder_runner_->configure_prefill_shards(
       num_layers,
       context_len_,
@@ -453,9 +487,15 @@ Error Runner<T>::load() {
   ET_LOG(Info, "creating io_memory");
   // prepare io
   kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len);
-  prompt_processor_->init_io(
-      buffer_manager_.get(),
-      module_->method_meta(prompt_processor_method_name));
+  if (prefill_shard_paths_.empty()) {
+    prompt_processor_->init_io(
+        buffer_manager_.get(),
+        module_->method_meta(prompt_processor_method_name));
+  } else {
+    // No individual shard describes the complete 36-layer prompt ABI. Build
+    // that external I/O from the already validated model metadata instead.
+    prompt_processor_->init_io_from_metadata(buffer_manager_.get());
+  }
   if (token_generator_) {
     token_generator_->init_io(
         buffer_manager_.get(), module_->method_meta(token_generator_method_name));

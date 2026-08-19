@@ -7,6 +7,7 @@
 
 import copy
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import singledispatch
@@ -566,12 +567,50 @@ def lower_all_submodules_to_backend(
     """
     Lower all submodules nodes given in the method_to_submodule_nodes map to backend_id.
     """
+    def deepcopy_program_preserving_tensor_leaves(
+        program: ExportedProgram,
+    ) -> ExportedProgram:
+        # Graph structure must be independent because backend preprocess passes
+        # mutate it. Tensor payloads and verifier values are immutable here;
+        # sharing them avoids torch 2.9 FakeTensor/FunctionalTensor deepcopy
+        # attempting data_ptr access.
+        memo = {}
+
+        def preserve_tensor(value):
+            if isinstance(value, torch.Tensor):
+                memo[id(value)] = value
+            return value
+
+        for node in program.graph_module.graph.nodes:
+            torch.utils._pytree.tree_map(preserve_tensor, node.meta)
+        torch.utils._pytree.tree_map(preserve_tensor, program.state_dict)
+        torch.utils._pytree.tree_map(preserve_tensor, program.constants)
+        for _, parameter in program.graph_module.named_parameters(recurse=True):
+            preserve_tensor(parameter)
+        for _, buffer in program.graph_module.named_buffers(recurse=True):
+            preserve_tensor(buffer)
+        original_tensor_deepcopy = torch.Tensor.__deepcopy__
+
+        def preserve_any_tensor(tensor, _memo):
+            return tensor
+
+        # FakeTensor may reference additional tensors through FakeTensorMode /
+        # ShapeEnv internals that are not reachable as ordinary pytree leaves.
+        # This copy is synchronous; restore Tensor.__deepcopy__ immediately.
+        torch.Tensor.__deepcopy__ = preserve_any_tensor
+        try:
+            return copy.deepcopy(program, memo)
+        finally:
+            torch.Tensor.__deepcopy__ = original_tensor_deepcopy
+
     # The created exported program for the submodules are in the call_module node's meta data
     # We just map the method_to_submodule_nodes directly to the method_to_partitioned_exported_programs
     method_to_partitioned_program = {
         method_name: [
             # perform deep copy here in case backends change graph inside preprocess method
-            copy.deepcopy(node.meta["submodule_program"])
+            deepcopy_program_preserving_tensor_leaves(
+                node.meta["submodule_program"]
+            )
             for node in call_submodule_nodes
         ]
         for method_name, call_submodule_nodes in method_to_submodules_nodes.items()
@@ -592,6 +631,7 @@ def lower_all_submodules_to_backend(
             method_to_partitioned_program, method_to_compile_specs
         )
     )
+    logging.info("Backend %s multimethod preprocessing completed", backend_id)
 
     for method_name in method_to_preprocess_result.keys():
         owning_program = method_to_tagged_edge_program[method_name]
@@ -604,6 +644,16 @@ def lower_all_submodules_to_backend(
             list_of_compile_specs,
         ):
             submodule_program = call_submodule_node.meta["submodule_program"]
+            if os.environ.get("ET_QNN_SANITIZE_EXECUTORCH_META", "") == "1":
+                sanitized_values = _sanitize_executorch_verifier_metadata(
+                    submodule_program
+                )
+                logging.info(
+                    "Replaced %d lowered-submodule Fake/FunctionalTensor metadata "
+                    "values with plain meta tensors for method %s",
+                    sanitized_values,
+                    method_name,
+                )
             lowered_module = LoweredBackendModule(
                 edge_program=submodule_program,
                 backend_id=backend_id,
@@ -638,6 +688,7 @@ def lower_all_submodules_to_backend(
                 toplevel_input_specs_to_delete,
                 toplevel_output_specs_to_delete,
             )
+            logging.info("Inserted lowered backend submodule for method %s", method_name)
 
 
 def remove_used_metadata(graph: torch.fx.Graph) -> None:
@@ -652,6 +703,42 @@ def remove_used_metadata(graph: torch.fx.Graph) -> None:
         node.meta.pop("toplevel_output_specs_to_delete", None)
         node.meta.pop("is_submodule", None)
         node.meta.pop("submodule_output_node", None)
+
+
+def _sanitize_executorch_verifier_metadata(exported_program: ExportedProgram) -> int:
+    """Replace fake/functional verifier values with equivalent plain meta tensors.
+
+    QNN multimethod lowering can retain FunctionalTensor values in FX node metadata.
+    They are useful while partitioning, but Python's deepcopy cannot copy them after
+    backend preprocessing has completed.  The verifier only needs tensor metadata,
+    so preserve shape, stride, dtype, and requires_grad on ordinary meta tensors.
+    """
+    sanitized_values = 0
+
+    def to_plain_meta(value):
+        nonlocal sanitized_values
+        if not isinstance(value, torch.Tensor):
+            return value
+        if value.layout != torch.strided:
+            raise RuntimeError(
+                "ET_QNN_SANITIZE_EXECUTORCH_META only supports strided metadata "
+                f"tensors, got {value.layout}"
+            )
+        sanitized_values += 1
+        return torch.empty_strided(
+            tuple(value.shape),
+            tuple(value.stride()),
+            dtype=value.dtype,
+            device="meta",
+            requires_grad=value.requires_grad,
+        )
+
+    for node in exported_program.graph_module.graph.nodes:
+        if "val" in node.meta:
+            node.meta["val"] = torch.utils._pytree.tree_map(
+                to_plain_meta, node.meta["val"]
+            )
+    return sanitized_values
 
 
 @dataclass
@@ -768,6 +855,16 @@ def _(
     for method_name in method_to_edge_program.keys():
         if method_name in method_to_tagged_exported_program:
             tagged_exported_program = method_to_tagged_exported_program[method_name]
+            if os.environ.get("ET_QNN_SANITIZE_EXECUTORCH_META", "") == "1":
+                sanitized_values = _sanitize_executorch_verifier_metadata(
+                    tagged_exported_program
+                )
+                logging.info(
+                    "Replaced %d backend verifier Fake/FunctionalTensor metadata "
+                    "values with plain meta tensors for method %s",
+                    sanitized_values,
+                    method_name,
+                )
             tagged_exported_program._validate()
             remove_used_metadata(tagged_exported_program.graph_module.graph)
             partitioned_and_lowered_exported_programs[method_name] = ExportedProgram(

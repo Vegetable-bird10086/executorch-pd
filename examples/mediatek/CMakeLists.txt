@@ -148,4 +148,58 @@ if(${ANDROID})
   target_compile_options(
     mtk_llama_executor_runner PUBLIC ${_common_compile_options}
   )
+
+  set(LLAMA_CPP_SOURCE_DIR "" CACHE PATH "Path to the llama.cpp source tree")
+  if(LLAMA_CPP_SOURCE_DIR)
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+    set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+    set(_mtk_pd_saved_build_shared_libs ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
+    add_subdirectory(
+      ${LLAMA_CPP_SOURCE_DIR}
+      ${CMAKE_BINARY_DIR}/llama-mtk-pd-joint
+      EXCLUDE_FROM_ALL
+    )
+    set(BUILD_SHARED_LIBS ${_mtk_pd_saved_build_shared_libs})
+
+    add_executable(
+      mtk_llama_pd_joint_runner
+      ${_mtk_llama_executor_runner__srcs}
+      ${LLAMA_CPP_SOURCE_DIR}/tools/pd-cli/pd_cli.cpp
+    )
+    target_compile_definitions(
+      mtk_llama_pd_joint_runner PRIVATE
+      MTK_LLAMA_PD_JOINT=1
+      LLAMA_PD_CLI_NO_MAIN=1
+    )
+    target_include_directories(
+      mtk_llama_pd_joint_runner PUBLIC
+      ${_common_include_directories}
+      ${LLAMA_CPP_SOURCE_DIR}/include
+      ${LLAMA_CPP_SOURCE_DIR}/common
+      ${LLAMA_CPP_SOURCE_DIR}/src
+      ${LLAMA_CPP_SOURCE_DIR}/tools/pd-cli
+      ${LLAMA_CPP_SOURCE_DIR}/vendor/nlohmann
+      ${EXECUTORCH_ROOT}/extension/llm/tokenizers/third-party/re2
+      ${EXECUTORCH_ROOT}/extension/llm/tokenizers/third-party/abseil-cpp
+    )
+    target_link_libraries(
+      mtk_llama_pd_joint_runner
+      ${_executor_runner_libs}
+      neuron_backend
+      gflags
+      mtk_llama_executor_lib
+      llama-common
+      llama
+      ${CMAKE_THREAD_LIBS_INIT}
+    )
+    target_compile_options(
+      mtk_llama_pd_joint_runner PUBLIC ${_common_compile_options}
+    )
+  endif()
 endif()

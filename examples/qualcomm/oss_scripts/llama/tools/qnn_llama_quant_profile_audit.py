@@ -362,6 +362,33 @@ def audit_profile(profile: Any, selected_shards: Iterable[int] | None = None) ->
             or not isinstance(u16_tensor_index, dict)
         ):
             raise AuditError(f"shard {shard_index} has invalid tensor or operation lists")
+        indexed_data_types = {
+            entry.get("data_type")
+            for entry in u16_tensor_index.values()
+            if isinstance(entry, dict)
+        }
+        if indexed_data_types not in (
+            {"QNN_DATATYPE_UFIXED_POINT_8"},
+            {"QNN_DATATYPE_UFIXED_POINT_16"},
+        ):
+            raise AuditError(
+                f"shard {shard_index} has an invalid primary activation index: "
+                f"{sorted(str(value) for value in indexed_data_types)}"
+            )
+        activation_data_type = next(iter(indexed_data_types))
+        activation_bits = DATA_TYPE_ELEMENT_BYTES[activation_data_type] * 8
+        residual_u16_names = {
+            tensor_name
+            for tensor_name, tensor in tensors.items()
+            if isinstance(tensor, dict)
+            and tensor.get("data_type") == "QNN_DATATYPE_UFIXED_POINT_16"
+        }
+        if activation_bits == 8 and residual_u16_names:
+            preview = sorted(residual_u16_names)[:8]
+            raise AuditError(
+                f"shard {shard_index} declares an A8 ABI but retains "
+                f"{len(residual_u16_names)} UFIXED16 tensor(s), e.g. {preview}"
+            )
         tensor_encodings: Counter[str] = Counter()
         static_storage: Counter[str] = Counter()
         for tensor_name, tensor in tensors.items():
@@ -420,9 +447,7 @@ def audit_profile(profile: Any, selected_shards: Iterable[int] | None = None) ->
                 for tensor_position, tensor_name in enumerate(tensor_names):
                     if tensor_name not in tensors:
                         raise AuditError(f"{location} references absent tensor {tensor_name}")
-                    if tensors[tensor_name].get("data_type") == (
-                        "QNN_DATATYPE_UFIXED_POINT_16"
-                    ):
+                    if tensors[tensor_name].get("data_type") == activation_data_type:
                         expected_u16_uses.setdefault(tensor_name, set()).add(
                             (name, direction[:-1], tensor_position)
                         )
@@ -441,9 +466,7 @@ def audit_profile(profile: Any, selected_shards: Iterable[int] | None = None) ->
                 if param.get("param_type") != "QNN_PARAMTYPE_TENSOR":
                     continue
                 tensor_name = param.get("tensor", {}).get("name")
-                if tensors.get(tensor_name, {}).get("data_type") == (
-                    "QNN_DATATYPE_UFIXED_POINT_16"
-                ):
+                if tensors.get(tensor_name, {}).get("data_type") == activation_data_type:
                     expected_u16_uses.setdefault(tensor_name, set()).add(
                         (name, "tensor_param", param_index)
                     )
@@ -452,11 +475,12 @@ def audit_profile(profile: Any, selected_shards: Iterable[int] | None = None) ->
         expected_u16_names = {
             tensor_name
             for tensor_name, tensor in tensors.items()
-            if tensor.get("data_type") == "QNN_DATATYPE_UFIXED_POINT_16"
+            if tensor.get("data_type") == activation_data_type
         }
         if set(u16_tensor_index) != expected_u16_names:
             raise AuditError(
-                f"shard {shard_index} U16 index does not cover the QNN U16 ABI"
+                f"shard {shard_index} activation index does not cover the "
+                f"QNN A{activation_bits} ABI"
             )
         for tensor_name, entry in u16_tensor_index.items():
             location = f"shard {shard_index} u16 tensor {tensor_name}"
@@ -508,7 +532,14 @@ def audit_profile(profile: Any, selected_shards: Iterable[int] | None = None) ->
                 "operation_count": len(operations),
                 "parameter_count": params,
                 "logical_tensor_count": len(logical_tensors),
-                "u16_tensor_count": len(u16_tensor_index),
+                "activation_bits": activation_bits,
+                "activation_tensor_count": len(u16_tensor_index),
+                "u8_activation_tensor_count": (
+                    len(u16_tensor_index) if activation_bits == 8 else 0
+                ),
+                "u16_tensor_count": (
+                    len(u16_tensor_index) if activation_bits == 16 else 0
+                ),
                 "u16_tensor_with_decoder_source_count": sum(
                     bool(entry["sources"]) for entry in u16_tensor_index.values()
                 ),

@@ -52,6 +52,9 @@ class PDPrefillRunner {
     bool use_separate_embed{false};
     std::string embedding_matrix_path;
     bool resident_embedding{true};
+    bool embedding_qnn_u16_input{false};
+    float embedding_qnn_u16_scale{0.0f};
+    int32_t embedding_qnn_u16_zero_point{0};
   };
 
   struct RuntimeStats {
@@ -101,6 +104,7 @@ class PDPrefillRunner {
   bool prefill_qnn_backend_prewarmed() const;
   double prefill_persistent_shard0_prepare_ms() const;
   bool prefill_persistent_shard0_prepared() const;
+  void release_prefill_resources_before_decode();
   void set_prefill_etdump_config(DecoderRunner::PrefillEtDumpConfig config);
   void set_prefill_tokens(std::vector<uint64_t> tokens);
 

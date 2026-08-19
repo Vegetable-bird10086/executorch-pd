@@ -1421,14 +1421,22 @@ def to_edge_transform_and_lower(  # noqa: C901
             if not _can_skip_using_EDGE_DO_NOT_DECOMP(curr_partitioner, program):
                 curr_op_set = _remove_invalid_ops_for_not_decompose(curr_op_set)
             ops_set_to_not_decompose = ops_set_to_not_decompose.union(curr_op_set)
-            _sanity_check_graph_for_non_decomp_ops(
-                name,
-                program,
-                ops_set_to_not_decompose,
-                check_op_support,
-                partitioner_name=curr_partitioner.__class__.__name__,
-                generate_error=True,
-            )
+            if os.environ.get("ET_QNN_PRELOWER_SHARD_LIMIT", ""):
+                logging.warning(
+                    "Skipping whole-graph non-decomposed-op sanity check for "
+                    "bounded QNN shard export; unselected segments are "
+                    "intentionally portable and discarded after delegate "
+                    "extraction"
+                )
+            else:
+                _sanity_check_graph_for_non_decomp_ops(
+                    name,
+                    program,
+                    ops_set_to_not_decompose,
+                    check_op_support,
+                    partitioner_name=curr_partitioner.__class__.__name__,
+                    generate_error=True,
+                )
 
         preserve_ops = config.preserve_ops + list(ops_set_to_not_decompose)
         if config._check_ir_validity:
@@ -1663,9 +1671,17 @@ class EdgeProgramManager:
                 new_programs[name].graph_module
             )
 
-        epm = EdgeProgramManager(
-            new_programs, copy.deepcopy(self._config_methods), compile_config
+        # Constant/config methods are passed through unchanged by graph
+        # transforms. Some QNN exports retain FakeTensor values here, for
+        # which tensor deepcopy is invalid under torch 2.9. Copy only the
+        # mapping so manager ownership remains independent while values stay
+        # immutable and shared.
+        config_methods = (
+            copy.copy(self._config_methods)
+            if self._config_methods is not None
+            else None
         )
+        epm = EdgeProgramManager(new_programs, config_methods, compile_config)
 
         epm._etrecord = self._etrecord
         return epm
@@ -1712,11 +1728,12 @@ class EdgeProgramManager:
 
         new_edge_programs = to_backend(method_to_programs_and_partitioners)
         config = EdgeCompileConfig(_check_ir_validity=False)
-        epm = EdgeProgramManager(
-            new_edge_programs,
-            copy.deepcopy(self._config_methods),
-            config,
+        config_methods = (
+            copy.copy(self._config_methods)
+            if self._config_methods is not None
+            else None
         )
+        epm = EdgeProgramManager(new_edge_programs, config_methods, config)
 
         epm._etrecord = self._etrecord
         return epm

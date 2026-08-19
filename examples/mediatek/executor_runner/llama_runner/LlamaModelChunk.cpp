@@ -18,6 +18,7 @@
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/platform/profiler.h>
 #include <executorch/runtime/platform/runtime.h>
+#include <executorch/runtime/core/portable_type/half.h>
 
 #include "LlamaConfig.h"
 #include "LlamaModelChunk.h"
@@ -47,7 +48,9 @@ LlamaModelChunk::LlamaModelChunk(
     const size_t initBatchSize,
     const size_t numCache,
     const size_t numRotEmbInputs,
+    const size_t logitShardCount,
     const bool enableSWA,
+    const size_t chunkIndex,
     const RotaryEmbeddingMasterLut* rotEmbMasterLut)
     : ModelChunk(modelPathMap, initBatchSize),
       kIsSharedWeightsUsed(useSharedWeights),
@@ -60,6 +63,13 @@ LlamaModelChunk::LlamaModelChunk(
 
       kRotEmbInputCount(numRotEmbInputs),
       kCacheCount(numCache),
+      kLogitShardCount(logitShardCount),
+      kLayerDebugOutputCount(
+          modelOptions.layer_debug_chunk_index < 0 ||
+                  static_cast<size_t>(modelOptions.layer_debug_chunk_index) ==
+                      chunkIndex
+              ? modelOptions.layer_debug_output_count
+              : 0),
       enableSWA(enableSWA),
       kCacheTypeSize(llm_helper::getLLMTypeSize(kCacheType)) {}
 
@@ -116,8 +126,9 @@ void LlamaModelChunk::defineIOs() {
   defineInput(IOKind::RotEmb, kRotEmbInputCount);
   defineInput(IOKind::KVCache, kCacheCount);
   // Outputs
-  defineOutput(IOKind::Logits);
+  defineOutput(IOKind::Logits, kLogitShardCount);
   defineOutput(IOKind::KVCache, kCacheCount);
+  defineOutput(IOKind::LayerDebug, kLayerDebugOutputCount);
 }
 
 void LlamaModelChunk::defineInput(const IOKind kind, const size_t count) {
@@ -396,6 +407,119 @@ void LlamaModelChunk::AdvanceTokenIndex() {
 
 size_t LlamaModelChunk::GetTokenIndex() const {
   return mCurrentTokenIndex;
+}
+
+size_t LlamaModelChunk::GetCacheLayerCount() const {
+  return kCacheCount / 2;
+}
+
+size_t LlamaModelChunk::GetNumKVHeads() const {
+  ET_CHECK_MSG(mCacheShape.size() == 4, "Expected a 4D KV cache");
+  return static_cast<size_t>(mCacheShape[1]);
+}
+
+size_t LlamaModelChunk::GetCacheHeadDim() const {
+  ET_CHECK_MSG(mCacheShape.size() == 4, "Expected a 4D KV cache");
+  return static_cast<size_t>(mCacheShape[3]);
+}
+
+size_t LlamaModelChunk::GetCacheLength() const {
+  return kCacheLength;
+}
+
+void LlamaModelChunk::CopyCacheToCanonicalFp16(
+    const size_t validTokenCount,
+    const size_t globalLayerOffset,
+    const size_t totalLayers,
+    std::vector<uint16_t>& destination) {
+  ET_CHECK_MSG(mCacheShape.size() == 4, "Expected a 4D KV cache");
+  ET_CHECK_MSG(mCacheShape[0] == 1, "PD export only supports cache batch 1");
+  ET_CHECK_MSG(
+      validTokenCount <= kCacheLength,
+      "PD prompt length %zu exceeds MTK cache length %zu",
+      validTokenCount,
+      kCacheLength);
+  ET_CHECK_MSG(
+      kCacheType == LLMType::FP32 || kCacheType == LLMType::FP16,
+      "PD export supports only FP32/FP16 MTK caches, got %s",
+      llm_helper::getLLMTypeName(kCacheType));
+
+  const size_t localLayers = GetCacheLayerCount();
+  const size_t numKVHeads = GetNumKVHeads();
+  const size_t headDim = GetCacheHeadDim();
+  const size_t valuesPerKind =
+      totalLayers * numKVHeads * validTokenCount * headDim;
+  ET_CHECK_MSG(
+      destination.size() == valuesPerKind * 2,
+      "Canonical KV destination has %zu values, expected %zu",
+      destination.size(),
+      valuesPerKind * 2);
+  ET_CHECK_MSG(
+      globalLayerOffset + localLayers <= totalLayers,
+      "Chunk layer range [%zu,%zu) exceeds %zu layers",
+      globalLayerOffset,
+      globalLayerOffset + localLayers,
+      totalLayers);
+
+  const size_t sourceTokenOffset = kCacheLength - validTokenCount;
+  for (size_t kind = 0; kind < 2; ++kind) {
+    for (size_t localLayer = 0; localLayer < localLayers; ++localLayer) {
+      const auto cacheInput = getInputIndex(
+          IOKind::KVCache, kind * localLayers + localLayer);
+      const auto source = GetInputBuffer(cacheInput);
+      const size_t expectedSourceBytes =
+          numKVHeads * kCacheLength * headDim * kCacheTypeSize;
+      ET_CHECK_MSG(
+          source.nbytes >= expectedSourceBytes,
+          "KV cache input %zu has %zu bytes, expected at least %zu",
+          cacheInput,
+          source.nbytes,
+          expectedSourceBytes);
+
+      const size_t globalLayer = globalLayerOffset + localLayer;
+      for (size_t head = 0; head < numKVHeads; ++head) {
+        const size_t sourceOffset =
+            (head * kCacheLength + sourceTokenOffset) * headDim;
+        const size_t destinationOffset =
+            kind * valuesPerKind +
+            ((globalLayer * numKVHeads + head) * validTokenCount * headDim);
+        const size_t valueCount = validTokenCount * headDim;
+        auto* output = destination.data() + destinationOffset;
+        if (kCacheType == LLMType::FP16) {
+          const auto* input =
+              static_cast<const uint16_t*>(source.data) + sourceOffset;
+          std::copy(input, input + valueCount, output);
+        } else {
+          const auto* input =
+              static_cast<const float*>(source.data) + sourceOffset;
+          for (size_t i = 0; i < valueCount; ++i) {
+            output[i] = executorch::runtime::etensor::internal::
+                fp16_ieee_from_fp32_value(input[i]);
+          }
+        }
+      }
+    }
+  }
+}
+
+void LlamaModelChunk::CopyCacheToLocalCanonicalFp16(
+    const size_t validTokenCount,
+    std::vector<uint16_t>& destination) {
+  const size_t localLayers = GetCacheLayerCount();
+  const size_t numKVHeads = GetNumKVHeads();
+  const size_t headDim = GetCacheHeadDim();
+  const size_t valuesPerKind =
+      localLayers * numKVHeads * validTokenCount * headDim;
+  ET_CHECK_MSG(
+      destination.size() == valuesPerKind * 2,
+      "Local canonical KV destination has %zu values, expected %zu",
+      destination.size(),
+      valuesPerKind * 2);
+
+  // Reuse the fully validated canonical copier. With totalLayers equal to the
+  // local layer count and offset zero, its output is exactly chunk-local.
+  CopyCacheToCanonicalFp16(
+      validTokenCount, 0, localLayers, destination);
 }
 
 void LlamaModelChunk::Run() {

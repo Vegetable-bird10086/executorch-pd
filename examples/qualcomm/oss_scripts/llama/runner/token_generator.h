@@ -121,9 +121,9 @@ class TokenGenerator {
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint8_t> input_embedding_;
   TensorStruct<int32_t> input_pos_;
-  TensorStruct<uint16_t> attention_mask_;
-  TensorStruct<uint16_t> window_attention_mask_;
-  TensorStruct<uint16_t> logits_;
+  TensorStruct<T> attention_mask_;
+  TensorStruct<T> window_attention_mask_;
+  TensorStruct<T> logits_;
 
   // layer -> TensorImpl
   std::vector<std::unique_ptr<executorch::aten::TensorImpl>> k_cache_in_;

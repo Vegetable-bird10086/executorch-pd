@@ -18,8 +18,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace executorch {
 namespace backends {
@@ -60,11 +62,18 @@ QnnManager::~QnnManager() {
 }
 
 QnnManager::QnnManager(
-    const QnnExecuTorchOptions* options,
+    std::shared_ptr<std::vector<uint8_t>> options_storage,
     const QnnExecuTorchContextBinary& qnn_executorch_context_binary)
-    : qnn_context_blob_(qnn_executorch_context_binary), options_(options) {
+    : options_storage_(std::move(options_storage)),
+      qnn_context_blob_(qnn_executorch_context_binary),
+      options_(options_storage_ == nullptr || options_storage_->empty()
+                   ? nullptr
+                   : GetQnnExecuTorchOptions(options_storage_->data())) {
+  if (options_ == nullptr) {
+    throw std::runtime_error("QNN options storage is empty");
+  }
   QnnExecuTorchBackendType backend_type =
-      options->backend_options()->backend_type();
+      options_->backend_options()->backend_type();
 
   if (get_option(options_->log_level()) >=
       QnnExecuTorchLogLevel::kLogLevelInfo) {
@@ -74,7 +83,7 @@ QnnManager::QnnManager(
     QNN_EXECUTORCH_LOG_INFO(
         "backend_type: %s", EnumNameQnnExecuTorchBackendType(backend_type));
     QNN_EXECUTORCH_LOG_INFO(
-        "library_path: %s", options->library_path()->str().c_str());
+        "library_path: %s", options_->library_path()->str().c_str());
     QNN_EXECUTORCH_LOG_INFO("dump intermediate outputs: %s", IsTensorDump());
     QNN_EXECUTORCH_LOG_INFO(
         "log_level: %s",
@@ -87,9 +96,9 @@ QnnManager::QnnManager(
         "the size of qnn context binary: %d",
         qnn_executorch_context_binary.nbytes);
     QNN_EXECUTORCH_LOG_INFO(
-        "Is on-device graph construction: %d", options->online_prepare());
+        "Is on-device graph construction: %d", options_->online_prepare());
     QNN_EXECUTORCH_LOG_INFO(
-        "Enable shared buffer: %d", options->shared_buffer());
+        "Enable shared buffer: %d", options_->shared_buffer());
     QNN_EXECUTORCH_LOG_INFO(
         "The number of op packages: %d",
         options_->op_package_options()->op_package_infos()->size());

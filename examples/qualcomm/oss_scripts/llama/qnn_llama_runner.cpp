@@ -225,8 +225,16 @@ std::vector<std::string> read_prefill_shard_paths(const std::string& manifest_pa
   std::sregex_iterator begin(array_body.begin(), array_body.end(), path_regex);
   std::sregex_iterator end;
   std::vector<std::string> paths;
+  const size_t manifest_slash = manifest_path.find_last_of('/');
+  const std::string manifest_dir = manifest_slash == std::string::npos
+      ? std::string()
+      : manifest_path.substr(0, manifest_slash + 1);
   for (auto it = begin; it != end; ++it) {
-    paths.push_back((*it)[1].str());
+    std::string path = (*it)[1].str();
+    if (!path.empty() && path.front() != '/' && !manifest_dir.empty()) {
+      path = manifest_dir + path;
+    }
+    paths.push_back(std::move(path));
     ET_LOG(Info, "prefill shard manifest path: %s", paths.back().c_str());
   }
   ET_CHECK_MSG(
@@ -526,15 +534,25 @@ void start_runner(
       0,
       0};
   if (use_tokenized_prompt) {
-    runner.generate_from_prompt_or_file(
-        FLAGS_tokenized_prompt.c_str(), use_tokenized_prompt, config, callback);
+    ET_CHECK_MSG(
+        runner.generate_from_prompt_or_file(
+            FLAGS_tokenized_prompt.c_str(),
+            use_tokenized_prompt,
+            config,
+            callback) == executorch::runtime::Error::Ok,
+        "Failed to generate from tokenized prompt");
   } else {
     for (int i = 0; i < FLAGS_num_iters; i++) {
       for (const auto& prompt : prompts) {
         std::string formatted_prompt =
             get_formatted_prompt(prompt, FLAGS_system_prompt, decoder_model_version.get());
-        runner.generate_from_prompt_or_file(
-            formatted_prompt.c_str(), use_tokenized_prompt, config, callback);
+        ET_CHECK_MSG(
+            runner.generate_from_prompt_or_file(
+                formatted_prompt.c_str(),
+                use_tokenized_prompt,
+                config,
+                callback) == executorch::runtime::Error::Ok,
+            "Failed to generate from prompt");
       }
     }
   }

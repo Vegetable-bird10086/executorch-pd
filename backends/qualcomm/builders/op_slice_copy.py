@@ -8,11 +8,16 @@ from typing import cast, Dict
 import executorch.backends.qualcomm.python.PyQnnManagerAdaptor as PyQnnManager
 import numpy as np
 import torch
-from executorch.backends.qualcomm.utils.constants import QCOM_AXIS_ORDER
+from executorch.backends.qualcomm.utils.constants import (
+    QCOM_AXIS_ORDER,
+    QCOM_DATA,
+    QCOM_QUANT_ATTRS,
+    QCOM_SCALES,
+)
 
 from .node_visitor import NodeVisitor
 from .node_visitor_manager import register_node_visitor
-from .qnn_constants import OpStridedSlice, QNN_OP_PACKAGE_NAME_QTI_AISW
+from .qnn_constants import OpGather, OpStridedSlice, QNN_OP_PACKAGE_NAME_QTI_AISW
 
 
 @register_node_visitor
@@ -63,6 +68,44 @@ class StrideSlice(NodeVisitor):
                 end = end % input_tensor.shape[dim]
         else:
             end = input_tensor.shape[dim]
+
+        # QNN HTP rejects StridedSlice when its input carries a per-channel
+        # encoding, even when the slice is on a different axis. Gather with a
+        # contiguous static index vector is exactly equivalent to slice_copy
+        # and preserves the input/output per-channel qparams. This path is
+        # needed by MHA-to-SHA head splitting for token-axis A8 V-cache; the
+        # established per-tensor and A16 StridedSlice paths remain unchanged.
+        input_quant_attrs = input_node.meta.get(QCOM_QUANT_ATTRS) or {}
+        if QCOM_SCALES in input_quant_attrs:
+            step = cast(int, node.args[4]) if len(node.args) > 4 else 1
+            indices = np.arange(start, end, step, dtype=np.int32)
+            indices_name = f"{node.name}_slice_indices"
+            indices_wrapper = PyQnnManager.TensorWrapper(
+                indices_name,
+                PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_STATIC,
+                PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_32,
+                PyQnnManager.Qnn_QuantizationEncoding_t.QNN_QUANTIZATION_ENCODING_UNDEFINED,
+                {},
+                1,
+                [len(indices)],
+                [],
+                indices,
+                True,
+            )
+            gather_op = PyQnnManager.PyQnnOpWrapper(
+                node.name,
+                QNN_OP_PACKAGE_NAME_QTI_AISW,
+                OpGather.op_name,
+            )
+            gather_op.AddInputTensors([input_tensor_wrapper, indices_wrapper])
+            gather_op.AddOutputTensors([output_tensor_wrapper])
+            gather_op.AddScalarParam(
+                OpGather.param_axis,
+                PyQnnManager.Qnn_DataType_t.QNN_DATATYPE_INT_32,
+                {QCOM_DATA: np.int32(dim)},
+            )
+            return gather_op
+
         input_tensor_rank = len(input_tensor.shape)
         ranges = []
         for i in range(input_tensor_rank):

@@ -35,7 +35,9 @@ target_link_libraries(
 target_sources(
   mtk_llama_executor_lib
   INTERFACE MultiModelLoader.h ModelChunk.h LlamaModelChunk.h LlamaRuntime.h
+            MtkPteWeightRebuilder.h MtkStageMajorPrefill.h QnnKvAbi.h
   PRIVATE MultiModelLoader.cpp ModelChunk.cpp LlamaModelChunk.cpp
-          LlamaRuntime.cpp
+          LlamaRuntime.cpp MtkPteWeightRebuilder.cpp MtkStageMajorPrefill.cpp
+          QnnKvAbi.cpp
 )
 target_compile_options(mtk_llama_executor_lib PUBLIC ${_common_compile_options})

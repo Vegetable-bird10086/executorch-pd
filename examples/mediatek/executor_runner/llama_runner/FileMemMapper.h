@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <algorithm>
 
 namespace example {
 
@@ -40,6 +41,9 @@ class FileMemMapper { // Read-only mmap
     if (mBuffer == MAP_FAILED) {
       ET_LOG(Error, "mmap fail");
       return;
+    }
+    if (madvise(mBuffer, mSize, MADV_RANDOM) == -1) {
+      ET_LOG(Debug, "madvise(MADV_RANDOM) failed for %s", path.c_str());
     }
 
     ET_LOG(
@@ -89,6 +93,26 @@ class FileMemMapper { // Read-only mmap
 
   size_t getSize() const {
     return mSize;
+  }
+
+  void discardRange(const size_t offset, const size_t length) const {
+    if (!mBuffer || length == 0 || offset >= mSize) {
+      return;
+    }
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) {
+      return;
+    }
+    const size_t boundedLength = std::min(length, mSize - offset);
+    const size_t page = static_cast<size_t>(pageSize);
+    const size_t begin = offset - offset % page;
+    const size_t end = std::min(mSize, ((offset + boundedLength + page - 1) / page) * page);
+    madvise(static_cast<char*>(mBuffer) + begin, end - begin, MADV_DONTNEED);
+    posix_fadvise(
+        mFd,
+        static_cast<off_t>(begin),
+        static_cast<off_t>(end - begin),
+        POSIX_FADV_DONTNEED);
   }
 
  private:

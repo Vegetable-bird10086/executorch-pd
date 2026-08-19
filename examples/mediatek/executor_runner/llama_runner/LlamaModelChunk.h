@@ -47,7 +47,10 @@ class LlamaModelChunk : public ModelChunk {
     Logits,
 
     // Cache Eviction
-    Attention
+    Attention,
+
+    // Diagnostic-only hidden states, appended after KV cache outputs.
+    LayerDebug
   };
 
  private:
@@ -61,7 +64,9 @@ class LlamaModelChunk : public ModelChunk {
       const size_t initBatchSize,
       const size_t numCache,
       const size_t numRotEmbInputs,
+      const size_t logitShardCount,
       const bool enableSWA,
+      const size_t chunkIndex,
       const RotaryEmbeddingMasterLut* rotEmbMasterLut);
 
   ~LlamaModelChunk();
@@ -83,6 +88,27 @@ class LlamaModelChunk : public ModelChunk {
   void AdvanceTokenIndex();
 
   size_t GetTokenIndex() const;
+
+  size_t GetCacheLayerCount() const;
+
+  size_t GetNumKVHeads() const;
+
+  size_t GetCacheHeadDim() const;
+
+  size_t GetCacheLength() const;
+
+  void CopyCacheToCanonicalFp16(
+      size_t validTokenCount,
+      size_t globalLayerOffset,
+      size_t totalLayers,
+      std::vector<uint16_t>& destination);
+
+  // Copies only this chunk's layers in [kind][local layer][head][token][dim]
+  // order. This bounds the temporary buffer when the consumer immediately
+  // converts each chunk to another KV ABI.
+  void CopyCacheToLocalCanonicalFp16(
+      size_t validTokenCount,
+      std::vector<uint16_t>& destination);
 
  private:
   void SetPosEmbed(const size_t tokenIndex);
@@ -173,6 +199,8 @@ class LlamaModelChunk : public ModelChunk {
   const size_t kRotEmbInputCount;
   const size_t kCacheCount;
   const size_t kSWAMaskCount = 0;
+  const size_t kLayerDebugOutputCount;
+  const size_t kLogitShardCount;
 
   // IO Indexes
   size_t mExpectedNumInputs = 0;

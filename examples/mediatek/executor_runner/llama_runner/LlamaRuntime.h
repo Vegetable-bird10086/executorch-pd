@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,9 @@ namespace example {
 
 class LlamaRuntime {
  public:
+  using ChunkCompleteCallback =
+      std::function<void(size_t, LlamaModelChunk&)>;
+
   explicit LlamaRuntime() {}
   ~LlamaRuntime() {}
 
@@ -37,7 +41,8 @@ class LlamaRuntime {
 
   void* Run(
       const std::vector<uint64_t>& inputTokens,
-      const bool lastLogits = true);
+      const bool lastLogits = true,
+      const ChunkCompleteCallback& chunkCompleteCallback = {});
 
   void Reset();
 
@@ -47,6 +52,12 @@ class LlamaRuntime {
 
   const LlamaModelOptions& GetModelOptions() const;
 
+  size_t GetNumKVHeads() const;
+
+  size_t GetCacheHeadDim() const;
+
+  size_t GetCacheLength() const;
+
  private:
   LlamaModelOptions mModelOptions;
   std::vector<std::unique_ptr<ModelChunk>> mLlamaModelChunks;
@@ -54,6 +65,7 @@ class LlamaRuntime {
   std::unique_ptr<llm_helper::RotaryEmbeddingMasterLut> mRotEmbMasterLut;
   size_t mTokenBatchSize = 1;
   size_t mTokenIndex = 0;
+  std::vector<char> mShardedLogits;
 };
 
 } // namespace example

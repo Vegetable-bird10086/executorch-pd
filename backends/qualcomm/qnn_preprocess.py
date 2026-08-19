@@ -5,12 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import base64
+import copy
 import hashlib
 import json
 import logging
 import os
 import re
 import struct
+import traceback
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, final, List
@@ -49,6 +51,56 @@ DEFAULT_GRAPH_NAME = "forward"
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+if os.environ.get("ET_QNN_TRACE_TENSOR_DEEPCOPY", "") == "1" and not getattr(
+    torch.Tensor, "_et_qnn_deepcopy_traced", False
+):
+    _original_tensor_deepcopy = torch.Tensor.__deepcopy__
+    _tensor_deepcopy_failure_reported = False
+
+    def _trace_tensor_deepcopy(tensor, memo):
+        global _tensor_deepcopy_failure_reported
+        try:
+            return _original_tensor_deepcopy(tensor, memo)
+        except RuntimeError:
+            if not _tensor_deepcopy_failure_reported:
+                _tensor_deepcopy_failure_reported = True
+                logger.error(
+                    "First failing tensor deepcopy: type=%s shape=%s dtype=%s",
+                    type(tensor),
+                    tuple(tensor.shape),
+                    tensor.dtype,
+                )
+                traceback.print_stack(limit=120)
+            raise
+
+    torch.Tensor.__deepcopy__ = _trace_tensor_deepcopy
+    torch.Tensor._et_qnn_deepcopy_traced = True
+
+if os.environ.get("ET_QNN_TRACE_DEEPCOPY_ROOT", "") == "1" and not getattr(
+    copy, "_et_qnn_deepcopy_root_traced", False
+):
+    _original_deepcopy = copy.deepcopy
+    _deepcopy_depth = 0
+    _deepcopy_root_failure_reported = False
+
+    def _trace_deepcopy_root(value, memo=None, _nil=[]):
+        global _deepcopy_depth, _deepcopy_root_failure_reported
+        is_root = _deepcopy_depth == 0
+        root_stack = traceback.format_stack(limit=80) if is_root else None
+        _deepcopy_depth += 1
+        try:
+            return _original_deepcopy(value, memo, _nil)
+        except RuntimeError:
+            if is_root and not _deepcopy_root_failure_reported:
+                _deepcopy_root_failure_reported = True
+                logger.error("Failing root copy.deepcopy call site:\n%s", "".join(root_stack))
+            raise
+        finally:
+            _deepcopy_depth -= 1
+
+    copy.deepcopy = _trace_deepcopy_root
+    copy._et_qnn_deepcopy_root_traced = True
+
 _QNN_TENSOR_QPARAMS_PATH_ENV = "ET_QNN_TENSOR_QPARAMS_PATH"
 _QNN_TENSOR_QPARAMS_OVERRIDE_PATH_ENV = "ET_QNN_TENSOR_QPARAMS_OVERRIDE_PATH"
 _QNN_PRESERVE_STATIC_S16_ENV = "ET_QNN_PRESERVE_STATIC_S16"
@@ -57,6 +109,7 @@ _QNN_LLAMA_QUANT_PROFILE_PROBE_PATH_ENV = (
     "ET_QNN_LLAMA_QUANT_PROFILE_PROBE_PATH"
 )
 _QNN_DIAGNOSTIC_SHARD_LIMIT_ENV = "ET_QNN_DIAGNOSTIC_SHARD_LIMIT"
+_QNN_DIAGNOSTIC_SHARD_START_ENV = "ET_QNN_DIAGNOSTIC_SHARD_START"
 _llama_quant_profile_batches: List[Dict[str, Any]] = []
 _qnn_tensor_qparams_override_cache: Dict[str, Any] = {}
 
@@ -514,16 +567,38 @@ def _register_profile_tensor(
         )
 
 
-def _u16_tensor_index(
+def _activation_tensor_index(
     tensors: Dict[str, Dict[str, Any]], operations: List[Dict[str, Any]],
     logical_tensors: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
-    """Index all QNN U16 ABI tensors without approximating their qparams.
+    """Index the graph's primary unsigned activation ABI exactly.
 
     The top-level tensor map remains the single source of exact qparams.  This
     compact index gives llama.cpp the producer/consumer path and decoder source
-    records needed to select a qparam record at runtime.
+    records needed to select a qparam record at runtime.  Production A16 graphs
+    retain their historical U16-only index.  An experimental native-A8 graph
+    has no U16 activations, so its U8 tensors become the primary ABI instead.
     """
+    requested_bits = os.environ.get("ET_QNN_LLAMA_ACTIVATION_BITS", "")
+    if requested_bits not in {"", "8", "16"}:
+        raise RuntimeError(
+            "ET_QNN_LLAMA_ACTIVATION_BITS must be unset, 8, or 16"
+        )
+    if requested_bits:
+        activation_data_type = (
+            "QNN_DATATYPE_UFIXED_POINT_8"
+            if requested_bits == "8"
+            else "QNN_DATATYPE_UFIXED_POINT_16"
+        )
+    else:
+        activation_data_type = (
+            "QNN_DATATYPE_UFIXED_POINT_16"
+            if any(
+                tensor.get("data_type") == "QNN_DATATYPE_UFIXED_POINT_16"
+                for tensor in tensors.values()
+            )
+            else "QNN_DATATYPE_UFIXED_POINT_8"
+        )
     index: Dict[str, Dict[str, Any]] = {
         name: {
             "name": name,
@@ -533,7 +608,7 @@ def _u16_tensor_index(
             "sources": [],
         }
         for name, tensor in tensors.items()
-        if tensor.get("data_type") == "QNN_DATATYPE_UFIXED_POINT_16"
+        if tensor.get("data_type") == activation_data_type
     }
 
     def add_source(tensor_name: str, source: Any) -> None:
@@ -650,7 +725,7 @@ def _build_llama_quant_profile(py_op_wrappers, graph_module, scope: str) -> Dict
         for name in tensors
         if name in source_records
     }
-    u16_tensor_index = _u16_tensor_index(tensors, operations, logical_tensors)
+    u16_tensor_index = _activation_tensor_index(tensors, operations, logical_tensors)
     return {
         "schema_version": 2,
         "format": "llama-qnn-quant-profile-v2",
@@ -906,14 +981,27 @@ def _validate_u16_tensor_index(
     operations: List[Dict[str, Any]],
     u16_tensor_index: Dict[str, Dict[str, Any]],
 ) -> None:
+    indexed_data_types = {
+        entry.get("data_type") for entry in u16_tensor_index.values()
+        if isinstance(entry, dict)
+    }
+    if indexed_data_types not in (
+        {"QNN_DATATYPE_UFIXED_POINT_16"},
+        {"QNN_DATATYPE_UFIXED_POINT_8"},
+    ):
+        raise RuntimeError(
+            "QNN activation index must contain exactly one unsigned activation "
+            f"width, got {sorted(str(value) for value in indexed_data_types)}"
+        )
+    activation_data_type = next(iter(indexed_data_types))
     expected_names = {
         tensor_name
         for tensor_name, tensor in tensors.items()
-        if tensor.get("data_type") == "QNN_DATATYPE_UFIXED_POINT_16"
+        if tensor.get("data_type") == activation_data_type
     }
     if set(u16_tensor_index) != expected_names:
         raise RuntimeError(
-            "QNN U16 index does not cover exactly the U16 tensor ABI: "
+            "QNN activation index does not cover exactly its tensor ABI: "
             f"expected={sorted(expected_names)} actual={sorted(u16_tensor_index)}"
         )
 
@@ -1595,6 +1683,7 @@ class QnnBackend(BackendDetails):
             option.backend_options.backend_type, compile_spec
         )
         diagnostic_shard_limit = 0
+        diagnostic_shard_start = 0
         diagnostic_shard_limit_value = os.environ.get(
             _QNN_DIAGNOSTIC_SHARD_LIMIT_ENV, ""
         )
@@ -1609,17 +1698,42 @@ class QnnBackend(BackendDetails):
                 raise RuntimeError(
                     f"{_QNN_DIAGNOSTIC_SHARD_LIMIT_ENV} must be a positive integer"
                 )
+            diagnostic_shard_start_value = os.environ.get(
+                _QNN_DIAGNOSTIC_SHARD_START_ENV, "0"
+            )
+            try:
+                diagnostic_shard_start = int(diagnostic_shard_start_value)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"{_QNN_DIAGNOSTIC_SHARD_START_ENV} must be a non-negative integer"
+                ) from error
+            if not 0 <= diagnostic_shard_start < num_sub_graphs:
+                raise RuntimeError(
+                    f"{_QNN_DIAGNOSTIC_SHARD_START_ENV} is outside the shard range"
+                )
             diagnostic_shard_limit = min(
-                diagnostic_shard_limit, num_sub_graphs
+                diagnostic_shard_limit,
+                num_sub_graphs - diagnostic_shard_start,
             )
             logger.warning(
-                "QNN diagnostic export will compile only the first %d/%d shard(s)",
+                "QNN diagnostic export will compile %d/%d shard(s) from index %d",
                 diagnostic_shard_limit,
                 num_sub_graphs,
+                diagnostic_shard_start,
             )
 
-        compile_sub_graphs = diagnostic_shard_limit or num_sub_graphs
-        for i in range(compile_sub_graphs):
+        compile_indices = (
+            range(
+                diagnostic_shard_start,
+                diagnostic_shard_start + diagnostic_shard_limit,
+            )
+            if diagnostic_shard_limit
+            else range(num_sub_graphs)
+        )
+        if diagnostic_shard_limit:
+            for key in all_processed_results:
+                all_processed_results[key] = [None] * num_sub_graphs
+        for i in compile_indices:
             # e.g. 2 methods (x, y) with 3 subgraphs(partitions)
             #      > context_binary_0: [x.subgraph_0, y.subgraph_0]
             #      > context_binary_1: [x.subgraph_1, y.subgraph_1]
@@ -1677,20 +1791,24 @@ class QnnBackend(BackendDetails):
                 qnn_manager.DestroyContext()
                 # methods should share the same context binary for current partition
                 for key in edge_programs.keys():
-                    all_processed_results[key].append(
-                        PreprocessResult(
-                            processed_bytes=bytes(qnn_context_binary),
-                            debug_handle_map=debug_handle_builder.get_delegate_mapping(),
-                        )
+                    result = PreprocessResult(
+                        processed_bytes=bytes(qnn_context_binary),
+                        debug_handle_map=debug_handle_builder.get_delegate_mapping(),
                     )
+                    if diagnostic_shard_limit:
+                        all_processed_results[key][i] = result
+                    else:
+                        all_processed_results[key].append(result)
             elif len(ctx_binary_list) == len(edge_programs.values()):
-                for i, key in enumerate(edge_programs.keys()):
-                    all_processed_results[key].append(
-                        PreprocessResult(
-                            processed_bytes=ctx_binary_list[i],
-                            debug_handle_map=debug_handle_builder.get_delegate_mapping(),
-                        )
+                for graph_index, key in enumerate(edge_programs.keys()):
+                    result = PreprocessResult(
+                        processed_bytes=ctx_binary_list[graph_index],
+                        debug_handle_map=debug_handle_builder.get_delegate_mapping(),
                     )
+                    if diagnostic_shard_limit:
+                        all_processed_results[key][i] = result
+                    else:
+                        all_processed_results[key].append(result)
             else:
                 raise RuntimeError("Hybrid compilation is not supported")
 
@@ -1701,20 +1819,20 @@ class QnnBackend(BackendDetails):
             # program verifier and are never serialized by the diagnostic
             # shard exporter.
             for key, results in all_processed_results.items():
-                for shard_index in range(len(results), num_sub_graphs):
-                    results.append(
-                        PreprocessResult(
-                            processed_bytes=(
-                                "ET_QNN_DIAGNOSTIC_UNCOMPILED_SHARD_"
-                                f"{shard_index}"
-                            ).encode("ascii"),
-                            debug_handle_map={},
-                        )
+                for shard_index, result in enumerate(results):
+                    if result is not None:
+                        continue
+                    results[shard_index] = PreprocessResult(
+                        processed_bytes=(
+                            "ET_QNN_DIAGNOSTIC_UNCOMPILED_SHARD_"
+                            f"{shard_index}"
+                        ).encode("ascii"),
+                        debug_handle_map={},
                     )
             logger.warning(
                 "Inserted non-serializable diagnostic placeholders for %d "
                 "uncompiled QNN shard(s)",
-                num_sub_graphs - compile_sub_graphs,
+                num_sub_graphs - diagnostic_shard_limit,
             )
 
         return all_processed_results

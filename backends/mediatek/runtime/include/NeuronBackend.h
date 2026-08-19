@@ -21,6 +21,7 @@
 #include "executorch/runtime/core/exec_aten/util/dim_order_util.h"
 
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -150,9 +151,7 @@ class NeuronExecuTorchDelegate {
 
   NeuronExecuTorchDelegate() {}
 
-  ~NeuronExecuTorchDelegate() {
-    mPLock->Stop();
-  }
+  ~NeuronExecuTorchDelegate() = default;
 
   int LoadCompiledNetwork(
       NeuronPayload payload,
@@ -169,7 +168,18 @@ class NeuronExecuTorchDelegate {
     CHECK_NO_ERROR(res);
     CHECK_TRUE(mExecutor.IsValid());
     SummarizeIoSizes(payload.Header.InputCount, payload.Header.OutputCount);
-    mPLock = std::unique_ptr<ScopePerformancer>(new ScopePerformancer);
+    // Loading adjacent stage-major chunks intentionally overlaps. Keep one
+    // PowerHAL worker/lock shared by all live Neuron delegates instead of
+    // stopping, joining, and reacquiring it for every chunk transition. The
+    // last live delegate releases the lock automatically.
+    {
+      std::lock_guard<std::mutex> lock(sPerformanceLockMutex);
+      mPLock = sPerformanceLock.lock();
+      if (!mPLock) {
+        mPLock = std::make_shared<ScopePerformancer>();
+        sPerformanceLock = mPLock;
+      }
+    }
     return NEURON_NO_ERROR;
   }
 
@@ -279,7 +289,7 @@ class NeuronExecuTorchDelegate {
 
   mutable MemoryCache mCache;
 
-  std::unique_ptr<ScopePerformancer> mPLock;
+  std::shared_ptr<ScopePerformancer> mPLock;
 
   neuron::NeuronExecutor mExecutor;
 
@@ -289,6 +299,9 @@ class NeuronExecuTorchDelegate {
 
   mutable std::vector<std::shared_ptr<NeuronSharedWeights>>
       neuron_shared_weights_;
+
+  inline static std::mutex sPerformanceLockMutex;
+  inline static std::weak_ptr<ScopePerformancer> sPerformanceLock;
 
  private:
   NeuronExecuTorchDelegate(const NeuronExecuTorchDelegate&);

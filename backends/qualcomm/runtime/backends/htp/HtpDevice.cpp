@@ -371,6 +371,13 @@ void HtpDevice::ReleasePerformanceVote() {
   if (IsPerfModeEnabled()) {
     htp_perf_infra_->setPowerConfig(
         powerconfig_client_id_, down_vote_power_configs_ptr_.data());
+    // High-power modes also enable long RPC polling. Restore the default
+    // zero-polling configuration while retaining the device/context.
+    rpc_power_configs_ = SetRpcPollingPowerConfig(
+        QnnExecuTorchHtpPerformanceMode::kHtpDefault);
+    rpc_power_configs_ptr_ = ObtainNullTermPtrVector(rpc_power_configs_);
+    htp_perf_infra_->setPowerConfig(
+        powerconfig_client_id_, rpc_power_configs_ptr_.data());
   }
 };
 
