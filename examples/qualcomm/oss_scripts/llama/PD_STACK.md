@@ -125,6 +125,8 @@ throughput only, not first-token latency.
 |---|---|---:|---|---:|
 | Qwen3-4B | Q2_K | 7.772 tok/s | TG128, depth 0, 4 threads | 5 |
 | Qwen3-4B | Q4_0 | 16.252 tok/s | TG128, depth 0, 4 threads | 5 |
+| Qwen3-4B (matched) | Q2_K | **7.155 tok/s** | TG32, depth 1024, 6 threads, `taskset fc` | 2 |
+| Qwen3-4B (matched) | Q4_0 | **10.729 tok/s** | TG32, depth 1024, 6 threads, `taskset fc` | 2 |
 | Qwen3-8B | Q2_K | 4.216 tok/s | TG64, depth 1024, 6 threads | 3 |
 | Qwen3-8B | Q4_0 | 6.872 tok/s | TG64, depth 1024, 6 threads | 3 |
 | Qwen3-14B | Q2_K | 1.978 tok/s | TG32, depth 1024, 6 threads | 2 |
@@ -137,6 +139,5 @@ warmup, F16 KV, and no probes. Q4_0 reached 10.729 tok/s (10.7568, 10.7013);
 Q2_K reached 7.155 tok/s (7.26184, 7.04881). Both exited zero.
 
 The 14B Q4_0 result is an end-to-end residency failure case: the 8.51 GB
-model working set exceeded available physical memory and repeatedly faulted mmap
-pages. It
-must not be interpreted as Q4_0 kernel throughput.
+model working set exceeded available physical memory and repeatedly faulted
+mmap pages. It must not be interpreted as Q4_0 kernel throughput.
