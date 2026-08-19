@@ -130,7 +130,13 @@ throughput only, not first-token latency.
 | Qwen3-14B | Q2_K | 1.978 tok/s | TG32, depth 1024, 6 threads | 2 |
 | Qwen3-14B | Q4_0 | 0.0864 tok/s | TG32, depth 1024, 6 threads | 2 |
 
-The 4B rows are not directly comparable with the depth-1024 PD runs. The 14B
-Q4_0 result is an end-to-end residency failure case: the 8.51 GB model working
-set exceeded available physical memory and repeatedly faulted mmap pages. It
+The historical 4B rows are not directly comparable with the depth-1024 PD
+runs. A matched rerun used the current llama.cpp Android build with
+`taskset fc`, six threads, depth 1024, TG32, two measured repetitions, normal
+warmup, F16 KV, and no probes. Q4_0 reached 10.729 tok/s (10.7568, 10.7013);
+Q2_K reached 7.155 tok/s (7.26184, 7.04881). Both exited zero.
+
+The 14B Q4_0 result is an end-to-end residency failure case: the 8.51 GB
+model working set exceeded available physical memory and repeatedly faulted mmap
+pages. It
 must not be interpreted as Q4_0 kernel throughput.
