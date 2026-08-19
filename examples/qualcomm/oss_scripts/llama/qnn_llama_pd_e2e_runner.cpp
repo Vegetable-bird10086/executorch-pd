@@ -339,12 +339,12 @@ DEFINE_int32(
     "Number of tokens to generate after importing the PD handoff.");
 DEFINE_int32(
     decode_threads,
-    4,
-    "Decode-side thread count passed to llama-pd-cli.");
+    6,
+    "Decode-side thread count; six threads is the validated Meizu 21 default.");
 DEFINE_int32(
     decode_ctx,
-    2048,
-    "Decode-side llama.cpp context size.");
+    4096,
+    "Decode-side llama.cpp context size matching the production Prefill export.");
 DEFINE_double(
     decode_temp,
     0.0f,
