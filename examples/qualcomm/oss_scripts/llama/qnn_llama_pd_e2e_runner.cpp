@@ -342,6 +342,15 @@ DEFINE_int32(
     6,
     "Decode-side thread count; six threads is the validated Meizu 21 default.");
 DEFINE_int32(
+    decode_cpu_strict,
+    0,
+    "Use strict one-worker-per-CPU placement when decode_cpu_range is set.");
+DEFINE_string(
+    decode_cpu_range,
+    "",
+    "Optional Decode CPU range forwarded to llama.cpp (for example 2-7). "
+    "Empty preserves the existing scheduler-managed placement.");
+DEFINE_int32(
     decode_ctx,
     4096,
     "Decode-side llama.cpp context size matching the production Prefill export.");
@@ -1721,6 +1730,12 @@ ResidentDecodeProcess start_resident_decode_process(
     args.push_back("-t");
     args.push_back(std::to_string(FLAGS_decode_threads));
   }
+  if (!FLAGS_decode_cpu_range.empty()) {
+    args.push_back("-Cr");
+    args.push_back(FLAGS_decode_cpu_range);
+    args.push_back("--cpu-strict");
+    args.push_back(std::to_string(FLAGS_decode_cpu_strict != 0));
+  }
   if (!shared_embedding_matrix_path.empty()) {
     args.push_back("--pd-disk-embedding");
     args.push_back(shared_embedding_matrix_path);
@@ -2537,6 +2552,12 @@ std::vector<std::string> make_joint_decode_args(
     args.push_back("-t");
     args.push_back(std::to_string(FLAGS_decode_threads));
   }
+  if (!FLAGS_decode_cpu_range.empty()) {
+    args.push_back("-Cr");
+    args.push_back(FLAGS_decode_cpu_range);
+    args.push_back("--cpu-strict");
+    args.push_back(std::to_string(FLAGS_decode_cpu_strict != 0));
+  }
   if (!shared_embedding_matrix_path.empty()) {
     args.push_back("--pd-disk-embedding");
     args.push_back(shared_embedding_matrix_path);
@@ -2728,6 +2749,9 @@ void begin_resident_decode_handoff(
   if (FLAGS_model_residency_probe) {
     request.decode_event_callback = joint_pd_decode_event_probe;
     request.decode_event_call_limit = 2;
+  }
+  if (std::getenv("LLAMA_PD_GRAPH_OP_TIMING") != nullptr) {
+    setenv("GGML_GRAPH_OP_TIMING", "1", 1);
   }
   set_joint_model_residency_stage(JointResidencyStage::Decode);
   const auto decode_start = SteadyClock::now();
@@ -3384,6 +3408,7 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
 #ifdef QNN_LLAMA_PD_JOINT
     set_joint_model_residency_stage(JointResidencyStage::PrefillComplete);
     log_joint_pd_boundary_probe("prefill_complete", -1, -1, true);
+    stop_memory_monitor.store(true, std::memory_order_relaxed);
 #endif
 
     if (FLAGS_prefill_only) {
@@ -3471,14 +3496,17 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
     // Send the ready KV
 #endif
 
-    // Send the ready KV immediately. Joining the dense PSS monitor can take
-    // tens of milliseconds on Android and must not sit on the PD boundary.
+#ifdef QNN_LLAMA_PD_JOINT
+    // Avoid /proc PSS sampling while the synchronous joint Decode is running.
+    memory_monitor.join();
+#endif
+    // Send the ready KV after the Prefill memory monitor has exited.
     begin_resident_decode_handoff(
         resident_decode,
         prefill_runtime.memory_handoff);
+#ifndef QNN_LLAMA_PD_JOINT
     stop_memory_monitor.store(true, std::memory_order_relaxed);
     memory_monitor.join();
-#ifndef QNN_LLAMA_PD_JOINT
     // The forked Decode path completes asynchronously after the handoff. Wait
     // for the child before reading its result; the joint path is synchronous
     // and has already populated resident_decode.result at this point.
