@@ -142,23 +142,42 @@ The 14B Q4_0 result is an end-to-end residency failure case: the 8.51 GB
 model working set exceeded available physical memory and repeatedly faulted
 mmap pages. It must not be interpreted as Q4_0 kernel throughput.
 
-## Current Seamless-PD Results and HWM
+## Current Default Configuration and Complete Phone Results
 
-The accepted Meizu 21 production path is one in-process seamless QNN Prefill
-to llama.cpp Decode lifecycle, prompt/depth 1024, context 4096, AR128, six
-Decode threads under `taskset fc`, embedded native-I8MM GPTQ2/A8, and V5
-per-shard malloc sidecar streaming. The 4B/14B rows use TG32; 8B uses TG64.
+The accepted production path is one in-process seamless QNN Prefill to
+llama.cpp Decode lifecycle. Code defaults are context 4096, six Decode
+threads, temperature 0, no layer offload, V5 sidecar overlap enabled, and
+decode_n_predict=128. The measurements below deliberately override only TG
+to 32 for 4B/14B and 64 for 8B. All use a 1024-token prompt/depth, AR128,
+taskset fc, stage-major three-stage Prefill, detached QNN execution shells,
+external embeddings, no Prefill output graph, no Decode operator probes, and
+the memory monitor stopped and joined before synchronous Decode.
 
-| Model | QNN Prefill | Decode | First token | HWM |
-|---|---:|---:|---:|---:|
-| Qwen3-4B run 1 / run 2 | 489.711 / 619.392 tok/s | 16.630 / 16.340 tok/s | 61.274 / 78.059 ms | **2670.05 / 2668.95 MiB** |
-| Qwen3-8B TG64 | 239.036 tok/s | 8.600 tok/s | 140.717 ms | **4197.61 MiB** |
-| Qwen3-14B run 1 / run 2 / run 3 | 108.168 / 81.021 / 98.312 tok/s | 2.790 / 5.250 / 2.530 tok/s | 333.660 / 260.641 / 2406.123 ms | **7297.75 / 7294.45 / 7300.21 MiB** |
+The tri-state lazy-profile default is deliberately conditional. `-1` enables
+post-Prefill `.meta` parsing for a 40-layer 14B run only when the single-request
+V5 sidecar-overlap lifecycle is active; unsupported modes automatically cancel
+lazy loading and preload the profile eagerly. `0` always uses eager preload,
+while explicit `1` requires the supported lifecycle and fails instead of
+silently changing the requested policy.
 
-Use 16.485 tok/s as the stable two-run 4B Decode mean and 2.790 tok/s as the
-three-run 14B median. Do not report the 14B 5.250 tok/s best sample alone: the
-third run entered Decode at only 4620.40 MiB RSS and paid a 2406.123 ms first
-token, so 14B remains sensitive to model residency.
+Decode eval is the inner llama.cpp evaluation rate. Decode generation uses
+the joint generation timer. Full PD Decode additionally includes the PD
+handoff boundary; for 14B both Decode rates also include the deferred
+quant-profile/context load. The table is intentionally wide so configuration
+or performance weaknesses remain visible.
+
+| Model | Export and Decode configuration | TG / profile lifecycle | Sidecar overlap | Initialization once | QNN Prefill | Decode eval | Decode generation | Full PD Decode | First token / post-first | PD boundary | Memory | Correctness |
+|---|---|---|---|---:|---:|---:|---:|---:|---|---:|---|---|
+| Qwen3-4B, runs 1/2 | 36 layers; 18 shards; QNN U16 AR128; GPTQ2_32 GS32 native-I8MM; dynamic A8 scope=all; ctx4096; 6 threads | TG32; eager profile, auto lazy policy resolves off | V5 per-shard malloc; 141,010,816 B; wait 0.272 / 0.086 ms | 1949.214 / 1109.471 ms | 2088.988 / 1651.622 ms; **489.711 / 619.392 tok/s** | **16.630 / 16.340 tok/s** | 16.564 / 16.270 tok/s | **16.506 / 16.231 tok/s** | 61.274 / 78.059 ms; post-first 16.650 / 16.497 tok/s | 6.889 / 4.722 ms | HWM **2670.05 / 2668.95 MiB**; final RSS 2443.06 / 2443.47 MiB; sampled peak PSS 2440.46 / 2440.74 MiB; VmSwap 0 | exit 0; I8MM native; SHA256 4c384fda...d864 |
+| Qwen3-8B | 36 layers; 18 shards; QNN U16 AR128; GPTQ2_32 GS32 native-I8MM; dynamic A8 scope=all; ctx4096; 6 threads | TG64; eager profile, auto lazy policy resolves off | V5 per-shard malloc; 249,692,032 B; wait 1.340 ms | 3385.499 ms | 4279.737 ms; **239.036 tok/s** | **8.600 tok/s** | 8.572 tok/s | **8.558 tok/s** | 140.717 ms; post-first 8.626 tok/s | 11.946 ms | HWM **4197.61 MiB**; final RSS 3769.93 MiB; sampled peak PSS 3767.14 MiB; VmSwap 0 | exit 0; I8MM native; SHA256 3008182f...8a8 |
+| Qwen3-14B | 40 layers; 20 shards; QNN U16 AR128; GPTQ2_32 GS32 native-I8MM; dynamic A8 scope=all; ctx4096; 6 threads | TG32; auto enables post-Prefill lazy profile; original serial meta parser; no synthetic handoff warmup | V5 per-shard malloc; 459,454,080 B; wait 47.068 ms; .bin stays overlapped | 4617.327 ms; metadata 296.506 ms; metadata plus TG context 498.463 ms | 11133.783 ms; **91.97 tok/s** | **5.27 tok/s** | 4.855 tok/s | **4.819 tok/s** | 961.388 ms; post-first 5.516 tok/s | 49.293 ms | HWM **6816.84 MiB**; final RSS 6115.95 MiB; sampled peak PSS 6113.06 MiB; VmSwap 0; final profile release -533.75 MiB RSS | exit 0; I8MM native; SHA256 4c384fda...d864 |
+
+The 4B figures are two retained zero-transfer runs. The 8B row is the accepted
+TG64 monitor-lifecycle-repair run. The 14B row supersedes the old 7.30-GiB-HWM
+summary for the current default: only the expanded .meta runtime object is
+deferred, while the V5 .bin keeps its Prefill-overlapped read path. Its load
+is intentionally counted in first-token and Decode speed, and the profile is
+the first Decode resource released after the final token.
 
 ## Decode Instrumentation Safety Contract
 

@@ -206,9 +206,10 @@ DEFINE_bool(
 DEFINE_bool(
     decode_stream_sidecar_during_prefill,
     true,
-    "Joint-PD default: after Decode warmup discard the physical pages of each "
-    "stable per-shard sidecar malloc buffer and read that shard from the V5 "
-    "payload asynchronously after its Prefill QNN Execute.");
+    "Joint-PD default: use stable per-shard malloc buffers and read each V5 "
+    "payload range asynchronously after its Prefill QNN Execute. The ordinary "
+    "path discards pages after Decode warmup; lazy-profile paths allocate the "
+    "stable transport without preloading payload pages.");
 DEFINE_bool(
     prefill_release_shard0_after_execute,
     true,
@@ -327,12 +328,21 @@ DEFINE_bool(
     decode_defer_runtime_until_after_prefill,
     false,
     "Legacy diagnostic: create and warm Decode after Prefill. Production joint "
-    "PD initializes and warms Decode before Prefill for a seamless handoff.");
+    "PD initializes Decode state before Prefill. The 14B lazy-profile default "
+    "stages model/transport first and defers metadata/context without a "
+    "synthetic handoff warmup.");
 DEFINE_bool(
     decode_stage_model_only_before_prefill,
     false,
     "Experimental: load model-only Decode state before Prefill while deferring "
     "QNN metadata, context, KV, TG reserve, and warmup to the handoff boundary.");
+DEFINE_int32(
+    decode_lazy_quant_profile_after_prefill,
+    -1,
+    "Delay full Decode quant-profile metadata parsing until after Prefill. "
+    "-1 enables it for 40-layer Qwen3-14B when single-request V5 sidecar "
+    "overlap is active and otherwise falls back to eager preload; 0 disables "
+    "it, and 1 forces it (invalid combinations fail explicitly).");
 DEFINE_int32(
     decode_n_predict,
     128,
@@ -1690,7 +1700,8 @@ struct ResidentDecodeProcess {
 };
 
 ResidentDecodeProcess start_resident_decode_process(
-    const std::string& shared_embedding_matrix_path) {
+    const std::string& shared_embedding_matrix_path,
+    bool lazy_quant_profile_after_prefill) {
   ET_CHECK_MSG(
       !FLAGS_llama_pd_cli_path.empty(),
       "--llama_pd_cli_path is required unless --prefill_only=true");
@@ -2524,6 +2535,7 @@ struct ResidentDecodeProcess {
   std::string shared_embedding_matrix_path;
   std::vector<std::string> args;
   llama_pd_inprocess_runtime* runtime{nullptr};
+  bool lazy_quant_profile_after_prefill{false};
   DecodeProcessResult result{};
 };
 
@@ -2584,17 +2596,21 @@ std::vector<std::string> make_joint_decode_args(
 }
 
 ResidentDecodeProcess start_resident_decode_process(
-    const std::string& shared_embedding_matrix_path) {
+    const std::string& shared_embedding_matrix_path,
+    bool lazy_quant_profile_after_prefill) {
   ET_CHECK_MSG(
       g_joint_model_source && !g_joint_model_source->empty(),
       "joint PD runner requires the Prefill GGUF mapping to remain alive");
   ResidentDecodeProcess resident;
   resident.shared_embedding_matrix_path = shared_embedding_matrix_path;
+  resident.lazy_quant_profile_after_prefill =
+      lazy_quant_profile_after_prefill;
   resident.args = make_joint_decode_args(shared_embedding_matrix_path);
   resident.result.before = process_memory_snapshot();
   resident.result.exit_code = 0;
-  if (FLAGS_decode_defer_runtime_until_after_prefill &&
-      FLAGS_decode_stage_model_only_before_prefill) {
+  if (lazy_quant_profile_after_prefill ||
+      (FLAGS_decode_defer_runtime_until_after_prefill &&
+       FLAGS_decode_stage_model_only_before_prefill)) {
     std::vector<char*> argv;
     argv.reserve(resident.args.size() + 1);
     for (auto& arg : resident.args) {
@@ -2613,10 +2629,12 @@ ResidentDecodeProcess start_resident_decode_process(
     ET_LOG(
         Info,
         "Joint Decode model-only initialization complete before Prefill: "
-        "model_ptr=%p model_bytes=%zu initialization_ms=%.3f",
+        "model_ptr=%p model_bytes=%zu initialization_ms=%.3f "
+        "lazy_quant_profile=%d",
         g_joint_model_source->data(),
         g_joint_model_source->size(),
-        resident.result.startup_ms);
+        resident.result.startup_ms,
+        static_cast<int>(lazy_quant_profile_after_prefill));
     return resident;
   }
   if (FLAGS_decode_defer_runtime_until_after_prefill) {
@@ -2674,7 +2692,8 @@ void begin_resident_decode_handoff(
           !memory_handoff.bytes->empty(),
       "joint Decode requires a direct-pointer KV handoff");
 
-  if (FLAGS_decode_defer_runtime_until_after_prefill &&
+  if (!resident.lazy_quant_profile_after_prefill &&
+      FLAGS_decode_defer_runtime_until_after_prefill &&
       FLAGS_decode_stage_model_only_before_prefill &&
       resident.runtime != nullptr) {
     set_joint_model_residency_stage(JointResidencyStage::DecodeContext);
@@ -2746,6 +2765,8 @@ void begin_resident_decode_handoff(
   };
   llama_pd_inprocess_result inprocess_result{};
   request.result = &inprocess_result;
+  request.lazy_quant_profile_after_prefill =
+      resident.lazy_quant_profile_after_prefill;
   if (FLAGS_model_residency_probe) {
     request.decode_event_callback = joint_pd_decode_event_probe;
     request.decode_event_call_limit = 2;
@@ -3186,9 +3207,37 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
   auto prefill_shard_rebuild =
       make_prefill_shard_rebuild_config(prefill_shard_files);
   const size_t request_count = use_tokenized_prompt ? 1 : prompts.size();
+  ET_CHECK_MSG(
+      FLAGS_decode_lazy_quant_profile_after_prefill >= -1 &&
+          FLAGS_decode_lazy_quant_profile_after_prefill <= 1,
+      "--decode_lazy_quant_profile_after_prefill must be -1, 0, or 1");
   const bool use_decode_sidecar_streaming =
       FLAGS_decode_stream_sidecar_during_prefill && !FLAGS_prefill_only &&
       request_count == 1;
+  const bool auto_lazy_quant_profile = !FLAGS_prefill_only &&
+      FLAGS_decode_lazy_quant_profile_after_prefill < 0 &&
+      prefill_shard_files.num_layers == 40;
+  const bool force_lazy_quant_profile = !FLAGS_prefill_only &&
+      FLAGS_decode_lazy_quant_profile_after_prefill > 0;
+  const bool use_lazy_quant_profile = force_lazy_quant_profile ||
+      (auto_lazy_quant_profile && use_decode_sidecar_streaming);
+  ET_CHECK_MSG(
+      !force_lazy_quant_profile || use_decode_sidecar_streaming,
+      "lazy Decode quant profile requires single-request V5 sidecar streaming");
+  if (auto_lazy_quant_profile && !use_lazy_quant_profile) {
+    ET_LOG(
+        Info,
+        "Auto lazy Decode quant profile fell back to eager lifecycle: "
+        "single_request_sidecar_overlap=0");
+  }
+  ET_LOG(
+      Info,
+      "Decode quant profile lifecycle: lazy_after_prefill=%d layers=%lld "
+      "option=%d sidecar_overlap=%d",
+      static_cast<int>(use_lazy_quant_profile),
+      static_cast<long long>(prefill_shard_files.num_layers),
+      FLAGS_decode_lazy_quant_profile_after_prefill,
+      static_cast<int>(use_decode_sidecar_streaming));
   if (FLAGS_decode_stream_sidecar_during_prefill &&
       !use_decode_sidecar_streaming) {
     ET_LOG(
@@ -3306,9 +3355,10 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
     set_joint_model_residency_stage(JointResidencyStage::DecodeModelInit);
 #endif
     resident_decode =
-        start_resident_decode_process(resident_embedding_matrix_path);
-    attach_joint_sidecar_residency_source(resident_decode.runtime);
+        start_resident_decode_process(
+            resident_embedding_matrix_path, use_lazy_quant_profile);
 #ifdef QNN_LLAMA_PD_JOINT
+    attach_joint_sidecar_residency_source(resident_decode.runtime);
     if (use_decode_sidecar_streaming) {
       const size_t sidecar_shard_count = prefill_shard_files.pte_paths.size();
       ET_CHECK_MSG(
