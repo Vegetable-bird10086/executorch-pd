@@ -1,5 +1,7 @@
 # PD Stack Layout
 
+The current final 4B/8B/14B phone-result record is [RESULTS.md](RESULTS.md).
+
 This PD split inference stack is logically one project, even though it is
 currently implemented across two git repositories:
 
