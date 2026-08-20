@@ -75,30 +75,31 @@ Peak RSS/HWM remains a kernel process metric across the complete run. Peak PSS
 in the repaired rows is sampled through Prefill only because the perturbing
 5 ms sampler is deliberately joined before Decode.
 
-## Zero-transfer 4B/8B repetitions
+## Recorded llama.cpp Decode Baselines
 
-The two 4B rows in this subsection predate the GGUF correction and used the
-old GS32 layout, so Decode selected `GS32_GROUPWISE_FALLBACK`. They are kept
-as historical measurements and are not the current native-I8MM result.
+The following Meizu 21 CPU results were recovered from the retained raw
+`llama-bench` JSON on 2026-08-19. Historical output contains aggregate
+throughput only, not first-token latency.
 
-The retained phone workdirs were executed again without fetching or pushing
-any runner, sidecar, Prefill bundle, embedding, or model.
+| Model | Quantization | Decode | Conditions | Repetitions |
+|---|---|---:|---|---:|
+| Qwen3-4B (matched) | Q2_K | **7.155 tok/s** | TG32, depth 1024, 6 threads, `taskset fc` | 2 |
+| Qwen3-4B (matched) | Q4_0 | **10.729 tok/s** | TG32, depth 1024, 6 threads, `taskset fc` | 2 |
+| Qwen3-8B | Q2_K | 4.216 tok/s | TG64, depth 1024, 6 threads | 3 |
+| Qwen3-8B | Q4_0 | 6.872 tok/s | TG64, depth 1024, 6 threads | 3 |
+| Qwen3-14B | Q2_K | 1.978 tok/s | TG32, depth 1024, 6 threads | 2 |
+| Qwen3-14B | Q4_0 | 0.0864 tok/s | TG32, depth 1024, 6 threads | 2 |
 
-| Model | Run | Decode core | First token | Post-first mean | First-token excess | Post-first median | QNN Prefill | Peak RSS |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4B | 1 | 6.89 tok/s | 181.473 ms | 6.777 tok/s | +33.921 ms (+23.0%) | 131.622 ms | 3269.818 ms | 2663.70 MiB |
-| 4B | 2 | 8.08 tok/s | 184.955 ms | 8.210 tok/s | +63.159 ms (+51.9%) | 120.777 ms | 1756.900 ms | 2668.62 MiB |
-| 8B | 1 | 5.51 tok/s | 214.806 ms | 5.540 tok/s | +34.293 ms (+19.0%) | 179.864 ms | 6317.067 ms | 4388.07 MiB |
-| 8B | 2 | 5.14 tok/s | 207.433 ms | 5.150 tok/s | +13.257 ms (+6.8%) | 192.531 ms | 4469.095 ms | 4390.12 MiB |
+The historical 4B rows are not directly comparable with the depth-1024 PD
+runs. A matched rerun used the current llama.cpp Android build with
+`taskset fc`, six threads, depth 1024, TG32, two measured repetitions, normal
+warmup, F16 KV, and no probes. Q4_0 reached 10.729 tok/s (10.7568, 10.7013);
+Q2_K reached 7.155 tok/s (7.26184, 7.04881). Both exited zero.
 
-Both models used six generation and batch threads and reported dynamic-A8
-scope all. The stable first-token pairs and opposite throughput movement
-(4B improved while 8B declined) reject a fixed thread-count or A8-dispatch
-regression. The old approximately 13 tok/s 4B result used prompt/depth 32 and
-TG128; these runs use prompt/depth 1024 and TG32. Earlier same-depth 4B was
-5.30-6.25 tok/s. Earlier 8B prompt1024 samples ranged from 4.90 to 9.19 tok/s,
-so the new 5.14-5.51 samples are low but remain inside the documented device
-state range.
+The 14B Q4_0 result is an end-to-end residency failure case: the 8.51 GB
+model working set exceeded available physical memory and repeatedly faulted
+mmap pages. It must not be interpreted as Q4_0 kernel throughput.
+
 
 ## Unified PD and independent-Decode comparison
 

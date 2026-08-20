@@ -125,8 +125,6 @@ throughput only, not first-token latency.
 
 | Model | Quantization | Decode | Conditions | Repetitions |
 |---|---|---:|---|---:|
-| Qwen3-4B | Q2_K | 7.772 tok/s | TG128, depth 0, 4 threads | 5 |
-| Qwen3-4B | Q4_0 | 16.252 tok/s | TG128, depth 0, 4 threads | 5 |
 | Qwen3-4B (matched) | Q2_K | **7.155 tok/s** | TG32, depth 1024, 6 threads, `taskset fc` | 2 |
 | Qwen3-4B (matched) | Q4_0 | **10.729 tok/s** | TG32, depth 1024, 6 threads, `taskset fc` | 2 |
 | Qwen3-8B | Q2_K | 4.216 tok/s | TG64, depth 1024, 6 threads | 3 |
