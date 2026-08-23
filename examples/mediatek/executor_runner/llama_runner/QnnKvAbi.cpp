@@ -213,4 +213,71 @@ void QnnKvAbi::ConvertCanonicalFp16Layers(
   }
 }
 
+void QnnKvAbi::ConvertCacheLayer(
+    const void* source,
+    bool sourceIsFp16,
+    size_t sourceCacheLength,
+    size_t sourceFirstToken,
+    size_t validTokenCount,
+    size_t kind,
+    size_t layer,
+    uint8_t* output,
+    size_t outputBytes,
+    QnnKvAbiStats* accumulatedStats) const {
+  const size_t layerStride = numHeads_ * validTokenCount * headDim_;
+  const size_t outputPerKind = numLayers_ * layerStride;
+  if (source == nullptr || output == nullptr || validTokenCount == 0 ||
+      kind >= 2 || layer >= numLayers_ ||
+      sourceFirstToken + validTokenCount > sourceCacheLength ||
+      outputBytes != 2 * outputPerKind) {
+    throw std::runtime_error("MTK cache layer does not match QNN KV ABI");
+  }
+
+  const Layer& metadata = layers_[layer];
+  const auto& qparams = kind == 0 ? metadata.key : metadata.value;
+  QnnKvAbiStats local{};
+  std::vector<float> transformed(headDim_);
+  for (size_t head = 0; head < numHeads_; ++head) {
+    const size_t sourceHeadBase =
+        (head * sourceCacheLength + sourceFirstToken) * headDim_;
+    const size_t outputHeadBase = kind * outputPerKind +
+        (layer * numHeads_ + head) * validTokenCount * headDim_;
+    for (size_t token = 0; token < validTokenCount; ++token) {
+      const size_t sourceTokenBase = sourceHeadBase + token * headDim_;
+      const size_t outputTokenBase = outputHeadBase + token * headDim_;
+      for (size_t dim = 0; dim < headDim_; ++dim) {
+        if (sourceIsFp16) {
+          transformed[dim] = executorch::runtime::etensor::internal::
+              fp16_ieee_to_fp32_value(
+                  static_cast<const uint16_t*>(source)[sourceTokenBase + dim]);
+        } else {
+          const float fp32 =
+              static_cast<const float*>(source)[sourceTokenBase + dim];
+          const uint16_t fp16 = executorch::runtime::etensor::internal::
+              fp16_ieee_from_fp32_value(fp32);
+          transformed[dim] = executorch::runtime::etensor::internal::
+              fp16_ieee_to_fp32_value(fp16);
+        }
+      }
+      if (kind == 0) {
+        FastWalshHadamard(transformed.data(), headDim_);
+      }
+      for (size_t dim = 0; dim < headDim_; ++dim) {
+        const float real = kind == 0
+            ? transformed[dim] * metadata.rotationUnit
+            : transformed[dim];
+        output[outputTokenBase + dim] = Quantize(
+            real, qparams[head].scale, qparams[head].offset, local);
+      }
+    }
+  }
+  if (accumulatedStats != nullptr) {
+    accumulatedStats->values += local.values;
+    accumulatedStats->nonFinite += local.nonFinite;
+    accumulatedStats->codeZero += local.codeZero;
+    accumulatedStats->code255 += local.code255;
+  }
+}
+
+
 } // namespace example

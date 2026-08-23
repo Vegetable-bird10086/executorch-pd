@@ -36,13 +36,25 @@ class MtkGgufPteRecipe;
 std::shared_ptr<MtkGgufWeightSource> OpenMtkGgufWeightSource(
     const std::string& ggufPath);
 
+// QNN-aligned joint-PD model store: read the GGUF once into a sealed memfd and
+// expose one stable read-only pointer to both MTK rebuild and llama.cpp Decode.
+std::shared_ptr<MtkGgufWeightSource> LoadMtkGgufWeightSourceIntoRam(
+    const std::string& ggufPath);
+const void* MtkGgufWeightSourceData(
+    const std::shared_ptr<MtkGgufWeightSource>& source);
+size_t MtkGgufWeightSourceSize(
+    const std::shared_ptr<MtkGgufWeightSource>& source);
+bool MtkGgufWeightSourceIsRamStore(
+    const std::shared_ptr<MtkGgufWeightSource>& source);
+
 std::shared_ptr<MtkGgufPteRecipe> PrepareMtkGgufPteRecipe(
     const std::shared_ptr<MtkGgufWeightSource>& source,
     const std::string& indexPath);
 
 MtkPteRebuildResult RebuildMtkPteWeightsFromGguf(
     const std::string& strippedPtePath,
-    const MtkGgufPteRecipe& recipe);
+    const MtkGgufPteRecipe& recipe,
+    std::shared_ptr<std::vector<uint8_t>> outputBuffer = nullptr);
 
 // Drop only this mapping's resident source pages after Prefill. The Decode
 // mapping of the same GGUF remains valid and can fault pages independently.
@@ -55,6 +67,7 @@ void DiscardMtkGgufSourcePages(
 MtkPteRebuildResult RebuildMtkPteWeights(
     const std::string& strippedPtePath,
     const std::string& indexPath,
-    const std::string& weightsPath);
+    const std::string& weightsPath,
+    std::shared_ptr<std::vector<uint8_t>> outputBuffer = nullptr);
 
 } // namespace example

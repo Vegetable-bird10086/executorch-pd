@@ -131,6 +131,12 @@ Result<DelegateHandle*> NeuronBackend::init(
       processed->size());
 
   int res = delegate->LoadCompiledNetwork(Payload, setting);
+  if (res == NEURON_NO_ERROR) {
+    // NeuronExecutor has imported the compiled network into its own runtime
+    // handle. Honor BackendInterface's processed-buffer contract so an owning
+    // DataLoader can release this usually-large PTE segment immediately.
+    processed->Free();
+  }
   return res == NEURON_NO_ERROR ? delegate : nullptr;
 }
 

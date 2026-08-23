@@ -40,6 +40,10 @@ struct MtkStageMajorPrefillResult {
   std::vector<char> lastLogits;
   std::vector<uint16_t> canonicalKv;
   std::vector<uint8_t> qnnU8Kv;
+  // QNN-compatible [prompt uint64][QNN U8 KV] buffer built incrementally
+  // during Prefill. Joint Decode consumes this pointer without a final copy.
+  std::vector<uint8_t> qnnDirectHandoff;
+  size_t qnnDirectKvOffsetBytes{0};
   QnnKvAbiStats qnnKvStats;
   std::vector<MtkStageMajorChunkStats> chunks;
   size_t numKvHeads{0};
@@ -48,6 +52,8 @@ struct MtkStageMajorPrefillResult {
   double rotaryMs{0.0};
   double initialChunkWaitMs{0.0};
   double activePrefillMs{0.0};
+  double kvHandoffWorkerMs{0.0};
+  double kvHandoffBoundaryMs{0.0};
   double totalMs{0.0};
   double pureExecuteMs{0.0};
   size_t finalRssBytes{0};
@@ -65,10 +71,12 @@ class MtkStageMajorPrefillSession {
       std::string tokenEmbeddingPath,
       std::vector<MtkStrippedChunkPaths> chunks,
       std::string ggufWeightPath,
+      std::shared_ptr<MtkGgufWeightSource> sharedGgufSource,
       bool finalOutputLogits,
       bool enableThreeStagePipeline,
       bool enableAsyncRelease,
       bool persistentChunk0,
+      bool detachPteBackingAfterLoad,
       const QnnKvAbi* qnnKvAbi = nullptr);
   ~MtkStageMajorPrefillSession();
 

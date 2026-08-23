@@ -25,6 +25,18 @@ struct BufferInfo {
   size_t nbytesUsed = 0;
 };
 
+struct ModelIoBufferSet {
+  std::vector<BufferInfo> inputs;
+  std::vector<BufferInfo> outputs;
+
+  bool empty() const {
+    return inputs.empty() && outputs.empty();
+  }
+};
+
+// Release every unique Neuron/AHWB allocation in a detached IO set.
+void ReleaseModelIoBufferSet(ModelIoBufferSet buffers);
+
 using MultiTokenSizeModelLoader = MultiModelLoader<size_t>;
 using ModelPathMap = MultiTokenSizeModelLoader::ModelPathMap;
 
@@ -56,6 +68,21 @@ class ModelChunk : protected MultiTokenSizeModelLoader {
   // Must be set before Initialize(); the bytes remain owned by the model
   // instance until Release().
   void SetModelBytes(std::shared_ptr<std::vector<uint8_t>> modelBytes);
+
+  // Return the reconstructed PTE backing after Release() has destroyed the
+  // Program/Method that references it. Stage-major callers use this to recycle
+  // the allocation without extending the model lifetime.
+  std::shared_ptr<std::vector<uint8_t>> TakeReleasedModelBytes();
+
+  // Experimental: copy the retained Program metadata and detach the original
+  // reconstructed PTE immediately after a fully delegated Initialize().
+  void SetDetachPteBackingAfterLoad(bool enabled);
+  std::shared_ptr<std::vector<uint8_t>> DetachLoadedModelBytes();
+
+  // Install an IO slot before Initialize(), or detach it after destroying the
+  // Program/Method. These are used by the stage-major prefill double-slot pool.
+  void SetIoBufferSet(ModelIoBufferSet buffers);
+  ModelIoBufferSet ReleaseAndTakeIoBufferSet();
 
   void
   SetInputBuffer(const void* data, const size_t size, const size_t index = 0);
@@ -123,6 +150,7 @@ class ModelChunk : protected MultiTokenSizeModelLoader {
   size_t mTokenBatchSize = 1;
 
   std::shared_ptr<std::vector<uint8_t>> mModelBytes;
+  bool mDetachPteBackingAfterLoad{false};
 
   // Input/Output buffers info
   std::vector<BufferInfo> mInputBufferInfos;

@@ -21,6 +21,7 @@
 #include <executorch/runtime/platform/runtime.h>
 
 #include "LlamaConfig.h"
+#include "QnnKvAbi.h"
 #include "ModelChunk.h"
 #include "llm_helper/include/llm_types.h"
 
@@ -109,6 +110,16 @@ class LlamaModelChunk : public ModelChunk {
   void CopyCacheToLocalCanonicalFp16(
       size_t validTokenCount,
       std::vector<uint16_t>& destination);
+
+  // Directly compact this chunk's Neuron cache into the final QNN-U8 handoff.
+  // This is safe to run on the handoff worker while the next chunk executes.
+  void CopyCacheToQnnU8(
+      size_t validTokenCount,
+      size_t globalLayerOffset,
+      const QnnKvAbi& abi,
+      uint8_t* output,
+      size_t outputBytes,
+      QnnKvAbiStats* stats);
 
  private:
   void SetPosEmbed(const size_t tokenIndex);

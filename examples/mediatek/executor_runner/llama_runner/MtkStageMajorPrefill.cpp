@@ -6,9 +6,11 @@
 #include "MtkStageMajorPrefill.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -18,9 +20,14 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
+#include <executorch/runtime/core/portable_type/half.h>
 #include <executorch/runtime/platform/log.h>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "LlamaModelChunk.h"
 #include "llm_helper/include/llm_types.h"
@@ -33,6 +40,324 @@ namespace {
 using llm_helper::RotaryEmbeddingMasterLut;
 using llm_helper::TokenEmbeddingLut;
 using Clock = std::chrono::steady_clock;
+
+class StageEmbeddingLookup {
+ public:
+  StageEmbeddingLookup(
+      const std::string& path,
+      llm_helper::LLMType modelInputType,
+      size_t hiddenSize)
+      : hiddenSize_(hiddenSize), modelInputType_(modelInputType) {
+    fd_ = open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+      throw std::runtime_error("Failed to open token embedding: " + path);
+    }
+
+    char magic[4]{};
+    ReadAt(0, magic, sizeof(magic));
+    if (std::memcmp(magic, "SEMB", sizeof(magic)) != 0) {
+      close(fd_);
+      fd_ = -1;
+      raw_ = std::make_unique<TokenEmbeddingLut>(
+          path, modelInputType_, hiddenSize_);
+      raw_->setDiscardAfterLookup(true);
+      ET_LOG(Info, "MTK PD embedding: legacy raw %s", path.c_str());
+      return;
+    }
+
+    uint32_t version = 0;
+    uint32_t quantized = 0;
+    uint32_t dtype = 0;
+    uint32_t ndim = 0;
+    uint64_t nbytes = 0;
+    ReadAt(4, &version, sizeof(version));
+    ReadAt(8, &quantized, sizeof(quantized));
+    ReadAt(12, &dtype, sizeof(dtype));
+    ReadAt(16, &ndim, sizeof(ndim));
+    ReadAt(20, &nbytes, sizeof(nbytes));
+    if (version != 1 || quantized != 0 || dtype != 2 || ndim != 2) {
+      throw std::runtime_error(
+          "MTK PD requires an unquantized FP16 SEMB v1 embedding");
+    }
+    uint32_t shape[2]{};
+    ReadAt(28, shape, sizeof(shape));
+    vocabSize_ = shape[0];
+    if (shape[1] != hiddenSize_ ||
+        nbytes != static_cast<uint64_t>(vocabSize_) * hiddenSize_ *
+                sizeof(uint16_t)) {
+      throw std::runtime_error("FP16 SEMB embedding shape/size mismatch");
+    }
+    if (modelInputType_ != llm_helper::FP32) {
+      throw std::runtime_error(
+          "FP16 SEMB conversion currently requires an FP32 MTK graph input");
+    }
+    dataOffset_ = 36;
+    fp16Row_.resize(hiddenSize_);
+    ET_LOG(
+        Info,
+        "MTK PD embedding: QNN FP16 SEMB row-on-demand vocab=%zu hidden=%zu",
+        vocabSize_,
+        hiddenSize_);
+  }
+
+  ~StageEmbeddingLookup() {
+    if (fd_ >= 0) {
+      close(fd_);
+    }
+  }
+
+  void Lookup(
+      const std::vector<uint64_t>& tokens,
+      void* output,
+      size_t outputBytes) {
+    if (raw_) {
+      raw_->setOutput(output, outputBytes);
+      raw_->lookupEmbedding(tokens);
+      return;
+    }
+    const size_t expectedBytes =
+        tokens.size() * hiddenSize_ * sizeof(float);
+    if (output == nullptr || outputBytes != expectedBytes) {
+      throw std::runtime_error("Invalid MTK PD embedding output buffer");
+    }
+    auto* outputFp32 = static_cast<float*>(output);
+    for (size_t row = 0; row < tokens.size(); ++row) {
+      if (tokens[row] >= vocabSize_) {
+        throw std::runtime_error("MTK PD embedding token is out of range");
+      }
+      const uint64_t offset =
+          dataOffset_ + tokens[row] * hiddenSize_ * sizeof(uint16_t);
+      ReadAt(offset, fp16Row_.data(), fp16Row_.size() * sizeof(uint16_t));
+      for (size_t column = 0; column < hiddenSize_; ++column) {
+        executorch::runtime::etensor::Half value;
+        std::memcpy(&value, &fp16Row_[column], sizeof(value));
+        outputFp32[row * hiddenSize_ + column] = static_cast<float>(value);
+      }
+    }
+  }
+
+ private:
+  void ReadAt(uint64_t offset, void* output, size_t bytes) const {
+    auto* cursor = static_cast<uint8_t*>(output);
+    size_t remaining = bytes;
+    while (remaining > 0) {
+      const ssize_t readBytes = pread(fd_, cursor, remaining, offset);
+      if (readBytes < 0 && errno == EINTR) {
+        continue;
+      }
+      if (readBytes <= 0) {
+        throw std::runtime_error("Failed to read token embedding data");
+      }
+      cursor += readBytes;
+      offset += static_cast<uint64_t>(readBytes);
+      remaining -= static_cast<size_t>(readBytes);
+    }
+  }
+
+  size_t hiddenSize_{0};
+  llm_helper::LLMType modelInputType_{llm_helper::INVALID};
+  int fd_{-1};
+  size_t vocabSize_{0};
+  uint64_t dataOffset_{0};
+  std::vector<uint16_t> fp16Row_;
+  std::unique_ptr<TokenEmbeddingLut> raw_;
+};
+
+// In normal BufferDataLoader mode Program/Method keeps the reconstructed PTE
+// backing alive until ModelChunk::Release(), requiring three slots for
+// execute(i), load(i+1), and rebuild(i+2). The opt-in detachable loader copies
+// the retained Program metadata and returns backing at load tail, reducing the
+// hard limit to two slots.
+class MtkPteRebuildBufferPool {
+ public:
+  explicit MtkPteRebuildBufferPool(size_t maxBuffers)
+      : maxBuffers_(maxBuffers) {}
+
+  std::shared_ptr<std::vector<uint8_t>> Acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [&]() {
+      return cancelled_ || !idle_.empty() || allocationCount_ < maxBuffers_;
+    });
+    if (cancelled_) {
+      throw std::runtime_error("MTK PTE rebuild buffer pool cancelled");
+    }
+    if (idle_.empty()) {
+      ++allocationCount_;
+      return std::make_shared<std::vector<uint8_t>>();
+    }
+    auto largest = std::max_element(
+        idle_.begin(),
+        idle_.end(),
+        [](const auto& lhs, const auto& rhs) {
+          return lhs->capacity() < rhs->capacity();
+        });
+    auto buffer = std::move(*largest);
+    idle_.erase(largest);
+    ++reuseCount_;
+    return buffer;
+  }
+
+  void Release(std::shared_ptr<std::vector<uint8_t>> buffer) {
+    if (!buffer) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      idle_.push_back(std::move(buffer));
+    }
+    condition_.notify_one();
+  }
+
+  void Cancel() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      cancelled_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  size_t AllocationCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return allocationCount_;
+  }
+
+  size_t ReuseCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reuseCount_;
+  }
+
+  size_t IdleCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return idle_.size();
+  }
+
+  size_t IdleCapacityBytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t total = 0;
+    for (const auto& buffer : idle_) {
+      total += buffer->capacity();
+    }
+    return total;
+  }
+
+  void Clear() {
+    std::vector<std::shared_ptr<std::vector<uint8_t>>> released;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released.swap(idle_);
+    }
+  }
+
+ private:
+  const size_t maxBuffers_;
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::vector<std::shared_ptr<std::vector<uint8_t>>> idle_;
+  bool cancelled_{false};
+  size_t allocationCount_{0};
+  size_t reuseCount_{0};
+};
+
+// Load runs one chunk ahead of execute, so two complete Neuron IO/AHWB sets
+// are sufficient: execute(i) owns one and load(i+1) owns the other. Chunk 0 is
+// persistent and intentionally separate; the structurally different final
+// chunk is also not pooled.
+class MtkNeuronIoSlotPool {
+ public:
+  explicit MtkNeuronIoSlotPool(size_t maxSlots) : maxSlots_(maxSlots) {}
+
+  ModelIoBufferSet Acquire() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    condition_.wait(lock, [&]() {
+      return cancelled_ || !idle_.empty() || createdSlots_ < maxSlots_;
+    });
+    if (cancelled_) {
+      throw std::runtime_error("MTK Neuron IO pool cancelled");
+    }
+    if (!idle_.empty()) {
+      ModelIoBufferSet slot = std::move(idle_.back());
+      idle_.pop_back();
+      ++reuseCount_;
+      return slot;
+    }
+    ++createdSlots_;
+    ++allocationCount_;
+    return {};
+  }
+
+  void Release(ModelIoBufferSet slot) {
+    if (slot.empty()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      idle_.push_back(std::move(slot));
+    }
+    condition_.notify_one();
+  }
+
+  void Cancel() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      cancelled_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  size_t AllocationCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return allocationCount_;
+  }
+
+  size_t ReuseCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reuseCount_;
+  }
+
+  size_t IdleCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return idle_.size();
+  }
+
+  size_t IdleBytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t total = 0;
+    std::unordered_set<void*> seen;
+    for (const auto& slot : idle_) {
+      const auto count = [&](const std::vector<BufferInfo>& infos) {
+        for (const auto& info : infos) {
+          if (info.data != nullptr && seen.insert(info.data).second) {
+            total += info.nbytes;
+          }
+        }
+      };
+      count(slot.inputs);
+      count(slot.outputs);
+    }
+    return total;
+  }
+
+  void Clear() {
+    std::vector<ModelIoBufferSet> released;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released.swap(idle_);
+    }
+    for (auto& slot : released) {
+      ReleaseModelIoBufferSet(std::move(slot));
+    }
+  }
+
+ private:
+  const size_t maxSlots_;
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  std::vector<ModelIoBufferSet> idle_;
+  bool cancelled_{false};
+  size_t createdSlots_{0};
+  size_t allocationCount_{0};
+  size_t reuseCount_{0};
+};
 
 double ElapsedMs(Clock::time_point start) {
   return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -104,6 +429,9 @@ class ThreeStageChunkPipeline {
       size_t cachesPerChunk,
       bool finalOutputLogits,
       const RotaryEmbeddingMasterLut* rotary,
+      std::shared_ptr<MtkPteRebuildBufferPool> rebuildBufferPool,
+      std::shared_ptr<MtkNeuronIoSlotPool> ioSlotPool,
+      bool detachPteBackingAfterLoad,
       std::vector<MtkStageMajorChunkStats>* stats)
       : options_(options),
         paths_(paths),
@@ -113,6 +441,9 @@ class ThreeStageChunkPipeline {
         cachesPerChunk_(cachesPerChunk),
         finalOutputLogits_(finalOutputLogits),
         rotary_(rotary),
+        rebuildBufferPool_(std::move(rebuildBufferPool)),
+        ioSlotPool_(std::move(ioSlotPool)),
+        detachPteBackingAfterLoad_(detachPteBackingAfterLoad),
         stats_(stats),
         rebuilt_(paths.size()),
         loaded_(paths.size()),
@@ -178,6 +509,8 @@ class ThreeStageChunkPipeline {
       stop_ = true;
     }
     condition_.notify_all();
+    rebuildBufferPool_->Cancel();
+    ioSlotPool_->Cancel();
     if (rebuildWorker_.joinable()) {
       rebuildWorker_.join();
     }
@@ -220,9 +553,12 @@ class ThreeStageChunkPipeline {
             ? RebuildMtkPteWeights(
                   paths_[index].strippedPte,
                   paths_[index].index,
-                  paths_[index].weights)
+                  paths_[index].weights,
+                  rebuildBufferPool_->Acquire())
             : RebuildMtkPteWeightsFromGguf(
-                  paths_[index].strippedPte, *ggufRecipes_[index]);
+                  paths_[index].strippedPte,
+                  *ggufRecipes_[index],
+                  rebuildBufferPool_->Acquire());
         {
           std::lock_guard<std::mutex> lock(mutex_);
           (*stats_)[index].rebuild = result.stats;
@@ -270,10 +606,23 @@ class ThreeStageChunkPipeline {
             index,
             rotary_);
         chunk->SetModelBytes(rebuilt->pte);
+        chunk->SetDetachPteBackingAfterLoad(detachPteBackingAfterLoad_);
+        const bool pooledIo = !finalChunk;
+        if (pooledIo) {
+          auto ioSlot = ioSlotPool_->Acquire();
+          if (!ioSlot.empty()) {
+            chunk->SetIoBufferSet(std::move(ioSlot));
+          }
+        }
         const auto loadStart = Clock::now();
         chunk->Initialize();
         const double loadMs = ElapsedMs(loadStart);
         const ProcessMemory memoryAfterLoad = ReadProcessMemory();
+        if (detachPteBackingAfterLoad_) {
+          auto detached = chunk->DetachLoadedModelBytes();
+          rebuilt->pte.reset();
+          rebuildBufferPool_->Release(std::move(detached));
+        }
         rebuilt.reset();
         {
           std::lock_guard<std::mutex> lock(mutex_);
@@ -298,6 +647,9 @@ class ThreeStageChunkPipeline {
   size_t cachesPerChunk_;
   bool finalOutputLogits_;
   const RotaryEmbeddingMasterLut* rotary_;
+  std::shared_ptr<MtkPteRebuildBufferPool> rebuildBufferPool_;
+  std::shared_ptr<MtkNeuronIoSlotPool> ioSlotPool_;
+  bool detachPteBackingAfterLoad_;
   std::vector<MtkStageMajorChunkStats>* stats_;
   std::vector<std::optional<MtkPteRebuildResult>> rebuilt_;
   std::vector<std::unique_ptr<LlamaModelChunk>> loaded_;
@@ -326,6 +678,7 @@ struct MtkStageMajorPrefillSession::Impl {
   bool enableThreeStagePipeline{true};
   bool enableAsyncRelease{false};
   bool persistentChunk0{true};
+  bool detachPteBackingAfterLoad{false};
   const QnnKvAbi* qnnKvAbi{nullptr};
   std::once_flag prepareOnce;
   std::unique_ptr<RotaryEmbeddingMasterLut> rotary;
@@ -339,20 +692,24 @@ MtkStageMajorPrefillSession::MtkStageMajorPrefillSession(
     std::string tokenEmbeddingPath,
     std::vector<MtkStrippedChunkPaths> chunks,
     std::string ggufWeightPath,
+    std::shared_ptr<MtkGgufWeightSource> sharedGgufSource,
     const bool finalOutputLogits,
     const bool enableThreeStagePipeline,
     const bool enableAsyncRelease,
     const bool persistentChunk0,
+    const bool detachPteBackingAfterLoad,
     const QnnKvAbi* qnnKvAbi)
     : impl_(std::make_unique<Impl>()) {
   impl_->options = options;
   impl_->tokenEmbeddingPath = std::move(tokenEmbeddingPath);
   impl_->chunks = std::move(chunks);
   impl_->ggufWeightPath = std::move(ggufWeightPath);
+  impl_->ggufSource = std::move(sharedGgufSource);
   impl_->finalOutputLogits = finalOutputLogits;
   impl_->enableThreeStagePipeline = enableThreeStagePipeline;
   impl_->enableAsyncRelease = enableAsyncRelease;
   impl_->persistentChunk0 = persistentChunk0;
+  impl_->detachPteBackingAfterLoad = detachPteBackingAfterLoad;
   impl_->qnnKvAbi = qnnKvAbi;
 }
 
@@ -384,7 +741,9 @@ void MtkStageMajorPrefillSession::Prepare() {
     impl_->rotary->generate();
     impl_->rotaryMs = ElapsedMs(rotaryStart);
     if (!impl_->ggufWeightPath.empty()) {
-      impl_->ggufSource = OpenMtkGgufWeightSource(impl_->ggufWeightPath);
+      if (!impl_->ggufSource) {
+        impl_->ggufSource = OpenMtkGgufWeightSource(impl_->ggufWeightPath);
+      }
       impl_->ggufRecipes.reserve(chunks.size());
       for (const auto& chunk : chunks) {
         impl_->ggufRecipes.push_back(
@@ -392,9 +751,10 @@ void MtkStageMajorPrefillSession::Prepare() {
       }
       ET_LOG(
           Info,
-          "MTK GGUF rebuild source prepared: chunks=%zu source=%s",
+          "MTK GGUF rebuild source prepared: chunks=%zu source=%s ram_store=%d",
           impl_->ggufRecipes.size(),
-          impl_->ggufWeightPath.c_str());
+          impl_->ggufWeightPath.c_str(),
+          static_cast<int>(MtkGgufWeightSourceIsRamStore(impl_->ggufSource)));
     }
     if (!impl_->persistentChunk0) {
       return;
@@ -426,8 +786,15 @@ void MtkStageMajorPrefillSession::Prepare() {
         0,
         impl_->rotary.get());
     impl_->chunk0->SetModelBytes(rebuilt.pte);
+    impl_->chunk0->SetDetachPteBackingAfterLoad(
+        impl_->detachPteBackingAfterLoad);
     const auto loadStart = Clock::now();
     impl_->chunk0->Initialize();
+    if (impl_->detachPteBackingAfterLoad) {
+      auto detached = impl_->chunk0->DetachLoadedModelBytes();
+      rebuilt.pte.reset();
+      detached.reset();
+    }
     impl_->chunk0Stats.loadMs = ElapsedMs(loadStart);
     impl_->chunk0Stats.rssAfterLoadBytes = ReadProcessMemory().rssBytes;
     ET_LOG(
@@ -451,6 +818,7 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
   const bool enableThreeStagePipeline = impl_->enableThreeStagePipeline;
   const bool enableAsyncRelease = impl_->enableAsyncRelease;
   const bool persistentChunk0 = impl_->persistentChunk0;
+  const bool detachPteBackingAfterLoad = impl_->detachPteBackingAfterLoad;
   const auto totalStart = Clock::now();
   if (chunks.empty() || options.num_layer % chunks.size() != 0) {
     throw std::runtime_error("Stage-major chunks must evenly divide decoder layers");
@@ -477,7 +845,12 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
   }
 
   std::unique_ptr<ThreeStageChunkPipeline> pipeline;
+  std::shared_ptr<MtkPteRebuildBufferPool> rebuildBufferPool;
+  std::shared_ptr<MtkNeuronIoSlotPool> ioSlotPool;
   if (enableThreeStagePipeline) {
+    rebuildBufferPool = std::make_shared<MtkPteRebuildBufferPool>(
+        detachPteBackingAfterLoad ? 2 : 3);
+    ioSlotPool = std::make_shared<MtkNeuronIoSlotPool>(2);
     pipeline = std::make_unique<ThreeStageChunkPipeline>(
         options,
         chunks,
@@ -487,6 +860,9 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
         cachesPerChunk,
         finalOutputLogits,
         &rotary,
+        rebuildBufferPool,
+        ioSlotPool,
+        detachPteBackingAfterLoad,
         &result.chunks);
   }
 
@@ -494,22 +870,24 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
   // mirrors QNN's persistent-shard0 warmup and hides cold file/backend work
   // behind request-side input preparation where possible.
   const auto embeddingStart = Clock::now();
-  TokenEmbeddingLut embedding(
+  StageEmbeddingLookup embedding(
       tokenEmbeddingPath, options.model_input_type, options.hidden_size);
-  embedding.setDiscardAfterLookup(true);
   for (size_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
     auto padded = blocks[blockIndex].tokens;
     padded.insert(padded.begin(), blocks[blockIndex].leftPadding, uint64_t{0});
-    embedding.setOutput(hidden.data() + blockIndex * blockBytes, blockBytes);
-    embedding.lookupEmbedding(padded);
+    embedding.Lookup(
+        padded, hidden.data() + blockIndex * blockBytes, blockBytes);
   }
   result.embeddingMs = ElapsedMs(embeddingStart);
 
   std::optional<Clock::time_point> activePrefillStart;
+  const bool parallelKvHandoff = impl_->qnnKvAbi != nullptr && pipeline != nullptr;
   struct PendingReleaseResult {
     size_t chunkIndex{0};
+    double kvPackMs{0.0};
     double releaseMs{0.0};
     ProcessMemory memory;
+    QnnKvAbiStats qnnStats;
   };
   std::future<PendingReleaseResult> pendingRelease;
   auto logChunkStats = [&](const size_t chunkIndex) {
@@ -537,8 +915,14 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
     }
     const auto released = pendingRelease.get();
     auto& releasedStats = result.chunks[released.chunkIndex];
+    releasedStats.kvPackMs = released.kvPackMs;
     releasedStats.releaseMs = released.releaseMs;
     releasedStats.rssAfterReleaseBytes = released.memory.rssBytes;
+    result.kvHandoffWorkerMs += released.kvPackMs;
+    result.qnnKvStats.values += released.qnnStats.values;
+    result.qnnKvStats.nonFinite += released.qnnStats.nonFinite;
+    result.qnnKvStats.codeZero += released.qnnStats.codeZero;
+    result.qnnKvStats.code255 += released.qnnStats.code255;
     logChunkStats(released.chunkIndex);
   };
   for (size_t chunkIndex = 0; chunkIndex < chunks.size(); ++chunkIndex) {
@@ -656,32 +1040,39 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
             impl_->qnnKvAbi->HeadDim() != result.headDim) {
           throw std::runtime_error("QNN KV ABI dimensions do not match MTK cache");
         }
-        result.qnnU8Kv.resize(allKvValues);
+        result.qnnDirectKvOffsetBytes =
+            promptTokens.size() * sizeof(uint64_t);
+        result.qnnDirectHandoff.resize(
+            result.qnnDirectKvOffsetBytes + allKvValues);
+        std::memcpy(
+            result.qnnDirectHandoff.data(),
+            promptTokens.data(),
+            result.qnnDirectKvOffsetBytes);
       } else {
         result.canonicalKv.resize(allKvValues);
       }
     }
-    const auto packStart = Clock::now();
-    if (impl_->qnnKvAbi != nullptr) {
-      std::vector<uint16_t> localCanonicalKv(
-          2 * layersPerChunk * result.numKvHeads * promptTokens.size() *
-          result.headDim);
-      activeChunk->CopyCacheToLocalCanonicalFp16(
-          promptTokens.size(), localCanonicalKv);
-      impl_->qnnKvAbi->ConvertCanonicalFp16Layers(
-          localCanonicalKv,
-          chunkIndex * layersPerChunk,
-          promptTokens.size(),
-          result.qnnU8Kv,
-          &result.qnnKvStats);
-    } else {
-      activeChunk->CopyCacheToCanonicalFp16(
-          promptTokens.size(),
-          chunkIndex * layersPerChunk,
-          options.num_layer,
-          result.canonicalKv);
+    if (!parallelKvHandoff) {
+      const auto packStart = Clock::now();
+      if (impl_->qnnKvAbi != nullptr) {
+        activeChunk->CopyCacheToQnnU8(
+            promptTokens.size(),
+            chunkIndex * layersPerChunk,
+            *impl_->qnnKvAbi,
+            result.qnnDirectHandoff.data() +
+                result.qnnDirectKvOffsetBytes,
+            result.qnnDirectHandoff.size() -
+                result.qnnDirectKvOffsetBytes,
+            &result.qnnKvStats);
+      } else {
+        activeChunk->CopyCacheToCanonicalFp16(
+            promptTokens.size(),
+            chunkIndex * layersPerChunk,
+            options.num_layer,
+            result.canonicalKv);
+      }
+      stats.kvPackMs = ElapsedMs(packStart);
     }
-    stats.kvPackMs = ElapsedMs(packStart);
 
     // Match QNN's bounded three-stage lifetime: ensure the next context is
     // ready before destroying the current one, then keep at most current,
@@ -690,7 +1081,75 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
       pipeline->WaitUntilLoaded(chunkIndex + 1);
     }
 
-    if (persistentChunk0 && chunkIndex == 0) {
+    if (parallelKvHandoff) {
+      // Match QNN's incremental compactor: the previous chunk has the entire
+      // next NPU execute window to finish packing before we reuse its IO slot.
+      completePendingRelease();
+      LlamaModelChunk* persistentPackChunk =
+          persistentChunk0 && chunkIndex == 0 ? activeChunk : nullptr;
+      pendingRelease = std::async(
+          std::launch::async,
+          [chunkIndex,
+           persistentPackChunk,
+           releaseChunk = std::move(chunk),
+           releaseBacking = std::move(serialRebuiltPte),
+           rebuildBufferPool,
+           ioSlotPool,
+           recycleIo = chunkIndex + 1 < chunks.size(),
+           qnnKvAbi = impl_->qnnKvAbi,
+           promptLength = promptTokens.size(),
+           layerOffset = chunkIndex * layersPerChunk,
+           handoffKv = result.qnnDirectHandoff.data() +
+               result.qnnDirectKvOffsetBytes,
+           handoffKvBytes = result.qnnDirectHandoff.size() -
+               result.qnnDirectKvOffsetBytes]() mutable {
+            LlamaModelChunk* packChunk =
+                persistentPackChunk != nullptr
+                ? persistentPackChunk
+                : releaseChunk.get();
+            QnnKvAbiStats localStats{};
+            const auto packStart = Clock::now();
+            packChunk->CopyCacheToQnnU8(
+                promptLength,
+                layerOffset,
+                *qnnKvAbi,
+                handoffKv,
+                handoffKvBytes,
+                &localStats);
+            const double packMs = ElapsedMs(packStart);
+
+            double releaseMs = 0.0;
+            if (releaseChunk) {
+              const auto releaseStart = Clock::now();
+              ModelIoBufferSet ioSlot;
+              if (recycleIo) {
+                ioSlot = releaseChunk->ReleaseAndTakeIoBufferSet();
+              } else {
+                releaseChunk->Release();
+              }
+              if (rebuildBufferPool) {
+                releaseBacking = releaseChunk->TakeReleasedModelBytes();
+              }
+              releaseChunk.reset();
+              if (recycleIo) {
+                ioSlotPool->Release(std::move(ioSlot));
+              }
+              if (rebuildBufferPool) {
+                rebuildBufferPool->Release(std::move(releaseBacking));
+              } else {
+                releaseBacking.reset();
+              }
+              releaseMs = ElapsedMs(releaseStart);
+            }
+            return PendingReleaseResult{
+                chunkIndex,
+                packMs,
+                releaseMs,
+                ReadProcessMemory(),
+                localStats,
+            };
+          });
+    } else if (persistentChunk0 && chunkIndex == 0) {
       stats.releaseMs = 0.0;
       stats.rssAfterReleaseBytes = ReadProcessMemory().rssBytes;
       logChunkStats(chunkIndex);
@@ -703,35 +1162,94 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
           std::launch::async,
           [chunkIndex,
            releaseChunk = std::move(chunk),
-           releaseBacking = std::move(serialRebuiltPte)]() mutable {
+           releaseBacking = std::move(serialRebuiltPte),
+           rebuildBufferPool,
+           ioSlotPool,
+           recycleIo = chunkIndex + 1 < chunks.size()]() mutable {
             const auto releaseStart = Clock::now();
-            releaseChunk->Release();
+            ModelIoBufferSet ioSlot;
+            if (recycleIo) {
+              ioSlot = releaseChunk->ReleaseAndTakeIoBufferSet();
+            } else {
+              releaseChunk->Release();
+            }
+            if (rebuildBufferPool) {
+              releaseBacking = releaseChunk->TakeReleasedModelBytes();
+            }
             releaseChunk.reset();
-            releaseBacking.reset();
+            if (recycleIo) {
+              ioSlotPool->Release(std::move(ioSlot));
+            }
+            if (rebuildBufferPool) {
+              rebuildBufferPool->Release(std::move(releaseBacking));
+            } else {
+              releaseBacking.reset();
+            }
             return PendingReleaseResult{
                 chunkIndex,
+                0.0,
                 ElapsedMs(releaseStart),
                 ReadProcessMemory(),
+                {},
             };
           });
     } else {
       const auto releaseStart = Clock::now();
-      chunk->Release();
+      ModelIoBufferSet ioSlot;
+      const bool recycleIo = pipeline && chunkIndex + 1 < chunks.size();
+      if (recycleIo) {
+        ioSlot = chunk->ReleaseAndTakeIoBufferSet();
+      } else {
+        chunk->Release();
+      }
+      if (rebuildBufferPool) {
+        serialRebuiltPte = chunk->TakeReleasedModelBytes();
+      }
       chunk.reset();
-      serialRebuiltPte.reset();
+      if (recycleIo) {
+        ioSlotPool->Release(std::move(ioSlot));
+      }
+      if (rebuildBufferPool) {
+        rebuildBufferPool->Release(std::move(serialRebuiltPte));
+      } else {
+        serialRebuiltPte.reset();
+      }
       stats.releaseMs = ElapsedMs(releaseStart);
       stats.rssAfterReleaseBytes = ReadProcessMemory().rssBytes;
       logChunkStats(chunkIndex);
     }
     result.pureExecuteMs += stats.executeMs;
   }
-  completePendingRelease();
   result.activePrefillMs = ElapsedMs(*activePrefillStart);
+  const auto handoffBoundaryStart = Clock::now();
+  completePendingRelease();
+  result.kvHandoffBoundaryMs = ElapsedMs(handoffBoundaryStart);
   if (pipeline) {
     pipeline->Stop();
+    ET_LOG(
+        Info,
+        "MTK PTE rebuild buffer pool complete: allocations=%zu reuses=%zu "
+        "idle_slots=%zu idle_capacity_bytes=%zu",
+        rebuildBufferPool->AllocationCount(),
+        rebuildBufferPool->ReuseCount(),
+        rebuildBufferPool->IdleCount(),
+        rebuildBufferPool->IdleCapacityBytes());
+    ET_LOG(
+        Info,
+        "MTK Neuron IO slot pool complete: allocations=%zu reuses=%zu "
+        "idle_slots=%zu idle_bytes=%zu",
+        ioSlotPool->AllocationCount(),
+        ioSlotPool->ReuseCount(),
+        ioSlotPool->IdleCount(),
+        ioSlotPool->IdleBytes());
+    // The pool is a prefill-only workspace. Drop all idle PTE backing before
+    // GGUF page discard, final memory accounting, and llama.cpp decode.
+    pipeline.reset();
+    rebuildBufferPool->Clear();
+    ioSlotPool->Clear();
   }
-  // Prefill reconstruction is complete. Release this mapping's GGUF pages;
-  // llama.cpp Decode owns a separate mapping of the same file.
+  // File-mmap fallback may discard pages here. The joint-PD RAM store is shared
+  // by Prefill and Decode, so DiscardMtkGgufSourcePages intentionally no-ops.
   DiscardMtkGgufSourcePages(impl_->ggufSource);
   if (finalOutputLogits && result.lastLogits.size() !=
           options.vocab_size *
@@ -746,8 +1264,9 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
       Info,
       "MTK stage-major summary: chunks=%zu blocks=%zu cached_tokens=%zu "
       "three_stage=%d async_release=%d persistent_chunk0=%d "
+      "parallel_kv_handoff=%d "
       "embedding_ms=%.3f rotary_ms=%.3f initial_chunk_wait_ms=%.3f "
-      "active_prefill_ms=%.3f "
+      "active_prefill_ms=%.3f kv_worker_ms=%.3f kv_boundary_ms=%.3f "
       "pure_npu_execute_ms=%.3f total_ms=%.3f final_rss_mib=%.2f peak_hwm_mib=%.2f",
       chunks.size(),
       blocks.size(),
@@ -755,10 +1274,13 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
       static_cast<int>(enableThreeStagePipeline),
       static_cast<int>(enableThreeStagePipeline && enableAsyncRelease),
       static_cast<int>(persistentChunk0),
+      static_cast<int>(parallelKvHandoff),
       result.embeddingMs,
       result.rotaryMs,
       result.initialChunkWaitMs,
       result.activePrefillMs,
+      result.kvHandoffWorkerMs,
+      result.kvHandoffBoundaryMs,
       result.pureExecuteMs,
       result.totalMs,
       result.finalRssBytes / (1024.0 * 1024.0),
@@ -780,9 +1302,11 @@ MtkStageMajorPrefillResult RunMtkStageMajorPrefill(
       tokenEmbeddingPath,
       chunks,
       ggufWeightPath,
+      nullptr,
       finalOutputLogits,
       enableThreeStagePipeline,
       enableAsyncRelease,
+      false,
       false,
       nullptr);
   return session.Run(promptTokens);

@@ -9,6 +9,8 @@
 #include "ModelChunk.h"
 
 #include <sstream>
+#include <new>
+#include <unordered_set>
 
 #include "executorch/backends/mediatek/runtime/include/NeuronBufferAllocator.h"
 
@@ -41,6 +43,67 @@ using executorch::runtime::Span;
 using executorch::runtime::Tag;
 
 static constexpr size_t kMethodAllocatorPoolSize = 4 * 1024U * 1024U; // 4MB
+
+// Keep only the small Program flatbuffer in independent storage. Fully
+// delegated MTK chunks consume Backend/Constant segments synchronously during
+// load_method(), so those large segments can remain temporary views and the
+class DetachableBufferDataLoader final : public executorch::runtime::DataLoader {
+ public:
+  DetachableBufferDataLoader(const void* data, size_t size)
+      : data_(static_cast<const uint8_t*>(data)), size_(size) {}
+
+  Result<executorch::runtime::FreeableBuffer> load(
+      size_t offset,
+      size_t size,
+      const SegmentInfo& segmentInfo) const override {
+    if (offset > size_ || size > size_ - offset) {
+      return Error::InvalidArgument;
+    }
+    if (size == 0) {
+      return executorch::runtime::FreeableBuffer{};
+    }
+    if (segmentInfo.segment_type != SegmentInfo::Type::Program) {
+      // This mode is only enabled for a fully delegated stage-major model.
+      // Neuron imports backend data and copies named shared weights into AHWB
+      // synchronously during load_method(). Keep all initialization segments
+      // as views, then recycle the source PTE at load tail. Method::execute()
+      // only needs the independently owned ~8 KiB Program flatbuffer below.
+      return executorch::runtime::FreeableBuffer(
+          data_ + offset, size, /*free_fn=*/nullptr);
+    }
+    auto* copy = new (std::nothrow) uint8_t[size];
+    if (copy == nullptr) {
+      return Error::MemoryAllocationFailed;
+    }
+    std::memcpy(copy, data_ + offset, size);
+    return executorch::runtime::FreeableBuffer(
+        copy,
+        size,
+        [](void*, void* data, size_t) {
+          delete[] static_cast<uint8_t*>(data);
+        });
+  }
+
+  Result<size_t> size() const override {
+    return size_;
+  }
+
+  Error load_into(
+      size_t offset,
+      size_t size,
+      const SegmentInfo&,
+      void* destination) const override {
+    if (destination == nullptr || offset > size_ || size > size_ - offset) {
+      return Error::InvalidArgument;
+    }
+    std::memcpy(destination, data_ + offset, size);
+    return Error::Ok;
+  }
+
+ private:
+  const uint8_t* data_;
+  size_t size_;
+};
 
 // ExecuTorch model instance with cacheable program.
 class ModelInstance {
@@ -93,7 +156,8 @@ class ModelInstance {
 
   ModelInstance(
       const std::string& modelLabel,
-      std::shared_ptr<std::vector<uint8_t>> modelBytes) {
+      std::shared_ptr<std::vector<uint8_t>> modelBytes,
+      bool copyLoadedSegments) {
     ET_CHECK_MSG(
         modelBytes != nullptr && !modelBytes->empty(),
         "In-memory model %s is empty",
@@ -105,10 +169,16 @@ class ModelInstance {
         modelBytes->size());
     mProgramInstance = std::make_shared<ProgramInstance>();
     mProgramInstance->modelBytes = std::move(modelBytes);
-    mProgramInstance->dataLoader =
-        std::make_unique<executorch::extension::BufferDataLoader>(
-            mProgramInstance->modelBytes->data(),
-            mProgramInstance->modelBytes->size());
+    if (copyLoadedSegments) {
+      mProgramInstance->dataLoader = std::make_unique<DetachableBufferDataLoader>(
+          mProgramInstance->modelBytes->data(),
+          mProgramInstance->modelBytes->size());
+    } else {
+      mProgramInstance->dataLoader =
+          std::make_unique<executorch::extension::BufferDataLoader>(
+              mProgramInstance->modelBytes->data(),
+              mProgramInstance->modelBytes->size());
+    }
     Result<Program> programLoaded =
         Program::load(mProgramInstance->dataLoader.get());
     ET_CHECK_MSG(
@@ -117,6 +187,10 @@ class ModelInstance {
         modelLabel.c_str());
     mProgramInstance->program =
         std::make_unique<Program>(std::move(programLoaded.get()));
+  }
+
+  void ReleaseSourceModelBytes() {
+    mProgramInstance->modelBytes.reset();
   }
 
   Method& GetMethod() {
@@ -255,6 +329,7 @@ void ModelChunk::Release() {
   ENSURE_INIT
   ReleaseModels();
   ReleaseIoBuffers();
+  mIsInitialized = false;
 }
 
 void ModelChunk::Run() {
@@ -323,6 +398,39 @@ void ModelChunk::SetModelBytes(
       modelBytes != nullptr && !modelBytes->empty(),
       "Reconstructed model bytes must not be empty");
   mModelBytes = std::move(modelBytes);
+}
+
+void ModelChunk::SetDetachPteBackingAfterLoad(bool enabled) {
+  ET_CHECK_MSG(!Initialized(), "Cannot change PTE detach mode after Initialize()");
+  mDetachPteBackingAfterLoad = enabled;
+}
+
+std::shared_ptr<std::vector<uint8_t>> ModelChunk::DetachLoadedModelBytes() {
+  ENSURE_INIT
+  ET_CHECK_MSG(
+      mDetachPteBackingAfterLoad,
+      "DetachLoadedModelBytes requires copying loader mode");
+  auto* instance = reinterpret_cast<ModelInstance*>(GetModelInstance());
+  instance->ReleaseSourceModelBytes();
+  return std::move(mModelBytes);
+}
+
+std::shared_ptr<std::vector<uint8_t>> ModelChunk::TakeReleasedModelBytes() {
+  return std::move(mModelBytes);
+}
+
+void ModelChunk::SetIoBufferSet(ModelIoBufferSet buffers) {
+  ET_CHECK_MSG(!Initialized(), "Cannot replace IO buffers after Initialize()");
+  mInputBufferInfos = std::move(buffers.inputs);
+  mOutputBufferInfos = std::move(buffers.outputs);
+}
+
+ModelIoBufferSet ModelChunk::ReleaseAndTakeIoBufferSet() {
+  ENSURE_INIT
+  ReleaseModels();
+  mIsInitialized = false;
+  return ModelIoBufferSet{
+      std::move(mInputBufferInfos), std::move(mOutputBufferInfos)};
 }
 
 void ModelChunk::SetInputBuffer(
@@ -666,13 +774,22 @@ void ModelChunk::AllocateIoBuffers() {
 }
 
 void ModelChunk::ReleaseIoBuffers() {
+  ReleaseModelIoBufferSet(ModelIoBufferSet{
+      std::move(mInputBufferInfos), std::move(mOutputBufferInfos)});
+}
+
+void ReleaseModelIoBufferSet(ModelIoBufferSet buffers) {
   auto& buffer_allocator = GET_NEURON_ALLOCATOR;
-
-  for (size_t i = 0; i < mInputBufferInfos.size(); i++)
-    buffer_allocator.RemoveBuffer(mInputBufferInfos[i].data);
-
-  for (size_t i = 0; i < mOutputBufferInfos.size(); i++)
-    buffer_allocator.RemoveBuffer(mOutputBufferInfos[i].data);
+  std::unordered_set<void*> released;
+  const auto release = [&](const std::vector<BufferInfo>& infos) {
+    for (const auto& info : infos) {
+      if (info.data != nullptr && released.insert(info.data).second) {
+        buffer_allocator.RemoveBuffer(info.data);
+      }
+    }
+  };
+  release(buffers.inputs);
+  release(buffers.outputs);
 }
 
 Method& ModelChunk::GetModelMethod() {
@@ -683,7 +800,8 @@ Method& ModelChunk::GetModelMethod() {
 // Override the virtual functions
 void* ModelChunk::CreateModelInstance(const std::string& modelPath) {
   auto modelInstance = mModelBytes
-      ? new ModelInstance(modelPath, mModelBytes)
+      ? new ModelInstance(
+            modelPath, mModelBytes, mDetachPteBackingAfterLoad)
       : new ModelInstance(modelPath);
   const auto selectedMethod = SelectMethod(modelInstance->GetMethodNames());
   if (!selectedMethod.empty()) {

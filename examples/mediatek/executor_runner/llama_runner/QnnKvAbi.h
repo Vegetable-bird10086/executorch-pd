@@ -42,6 +42,21 @@ class QnnKvAbi {
       std::vector<uint8_t>& output,
       QnnKvAbiStats* accumulatedStats = nullptr) const;
 
+  // Convert one MTK cache tensor directly into its final QNN-U8 handoff slice.
+  // FP32 inputs are rounded through FP16 to preserve the validated legacy path
+  // exactly, without materializing a chunk-sized canonical FP16 vector.
+  void ConvertCacheLayer(
+      const void* source,
+      bool sourceIsFp16,
+      size_t sourceCacheLength,
+      size_t sourceFirstToken,
+      size_t validTokenCount,
+      size_t kind,
+      size_t layer,
+      uint8_t* output,
+      size_t outputBytes,
+      QnnKvAbiStats* accumulatedStats = nullptr) const;
+
  private:
   struct Affine {
     float scale{0.0f};

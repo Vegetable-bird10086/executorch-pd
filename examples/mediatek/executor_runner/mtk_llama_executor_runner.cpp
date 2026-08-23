@@ -220,6 +220,12 @@ DEFINE_bool(
     "Prebuild and keep chunk 0 alive for the Prefill session. Preparation "
     "runs in parallel with tokenizer/prompt initialization; later requests "
     "reset and reuse the same Neuron context.");
+DEFINE_bool(
+    pd_stage_major_detach_pte_after_load,
+    true,
+    "Recycle each reconstructed PTE backing immediately after Neuron load, "
+    "including persistent chunk 0. Disable explicitly only for backends that "
+    "require the original PTE bytes to remain resident.");
 DEFINE_uint64(
     pd_stage_major_session_repeats,
     1,
@@ -238,8 +244,20 @@ DEFINE_string(
     "Optional external embedding matrix passed to llama.cpp Decode.");
 DEFINE_int32(pd_joint_decode_n_predict, 32, "Decode tokens to generate.");
 DEFINE_int32(pd_joint_decode_ctx, 2048, "llama.cpp Decode context size.");
-DEFINE_int32(pd_joint_decode_threads, 4, "llama.cpp Decode CPU threads.");
+DEFINE_int32(pd_joint_decode_threads, 6, "llama.cpp Decode CPU threads.");
 DEFINE_double(pd_joint_decode_temp, 0.0, "llama.cpp Decode temperature.");
+DEFINE_string(
+    decode_ppl_tokens_path,
+    "",
+    "Raw uint64 continuation-token file for in-process teacher-forced PD WikiPPL.");
+DEFINE_string(
+    decode_ppl_output_path,
+    "",
+    "Output file written by the in-process Decode WikiPPL path.");
+DEFINE_int32(
+    decode_ppl_max_tokens,
+    0,
+    "Maximum in-process PD WikiPPL targets; zero scores the full continuation.");
 DEFINE_bool(
     pd_joint_import_only,
     false,
@@ -257,6 +275,10 @@ using example::LlamaModelChunk;
 using example::LlamaRuntime;
 using example::MtkStrippedChunkPaths;
 using example::MtkStageMajorPrefillSession;
+using example::MtkGgufWeightSource;
+using example::LoadMtkGgufWeightSourceIntoRam;
+using example::MtkGgufWeightSourceData;
+using example::MtkGgufWeightSourceSize;
 using example::QnnKvAbi;
 using example::QnnKvAbiStats;
 using example::utils::argmax;
@@ -273,43 +295,8 @@ using tokenizers::Tokenizer;
 #ifdef MTK_LLAMA_PD_JOINT
 namespace {
 
-class ReadOnlyMmap {
- public:
-  explicit ReadOnlyMmap(const std::string& path) {
-    fd_ = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    ET_CHECK_MSG(fd_ >= 0, "Unable to open GGUF %s: %s", path.c_str(), strerror(errno));
-    struct stat info {};
-    ET_CHECK_MSG(fstat(fd_, &info) == 0 && info.st_size > 0, "Unable to stat GGUF %s", path.c_str());
-    size_ = static_cast<size_t>(info.st_size);
-    data_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    ET_CHECK_MSG(data_ != MAP_FAILED, "Unable to mmap GGUF %s: %s", path.c_str(), strerror(errno));
-  }
-
-  ~ReadOnlyMmap() {
-    if (data_ != MAP_FAILED) {
-      munmap(data_, size_);
-    }
-    if (fd_ >= 0) {
-      close(fd_);
-    }
-  }
-
-  const void* data() const { return data_; }
-  size_t size() const { return size_; }
-  void discard_resident_pages() const {
-    if (data_ != MAP_FAILED && size_ != 0) {
-      (void)madvise(data_, size_, MADV_DONTNEED);
-    }
-  }
-
- private:
-  int fd_{-1};
-  void* data_{MAP_FAILED};
-  size_t size_{0};
-};
-
 struct JointDecodeRuntime {
-  std::shared_ptr<ReadOnlyMmap> model;
+  std::shared_ptr<MtkGgufWeightSource> model;
   llama_pd_inprocess_runtime* runtime{nullptr};
   double initializationMs{0.0};
 
@@ -320,10 +307,17 @@ struct JointDecodeRuntime {
   }
 };
 
-std::shared_ptr<JointDecodeRuntime> prepare_joint_decode() {
-  ET_CHECK_MSG(!FLAGS_pd_joint_gguf_path.empty(), "--pd_joint_gguf_path is required");
+std::shared_ptr<JointDecodeRuntime> prepare_joint_decode(
+    std::shared_ptr<MtkGgufWeightSource> modelSource) {
+  ET_CHECK_MSG(modelSource != nullptr, "joint Decode requires GGUF RAM store");
+  if (std::getenv("GGML_QNN_U16_ACTIVATIONS") == nullptr) {
+    setenv("GGML_QNN_U16_ACTIVATIONS", "1", 0);
+  }
+  if (std::getenv("GGML_QNN_U16_BLOCKWISE_REQUANT") == nullptr) {
+    setenv("GGML_QNN_U16_BLOCKWISE_REQUANT", "1", 0);
+  }
   auto out = std::make_shared<JointDecodeRuntime>();
-  out->model = std::make_shared<ReadOnlyMmap>(FLAGS_pd_joint_gguf_path);
+  out->model = std::move(modelSource);
   std::vector<std::string> args = {
       "mtk_llama_pd_joint_runner", "-m", "in-process.gguf", "-n",
       std::to_string(FLAGS_pd_joint_decode_n_predict), "-c",
@@ -334,6 +328,20 @@ std::shared_ptr<JointDecodeRuntime> prepare_joint_decode() {
     args.push_back("--pd-disk-embedding");
     args.push_back(FLAGS_pd_joint_disk_embedding_path);
   }
+  // Match the QNN joint runner: only the continuation tokens are file-backed.
+  // Prefill KV remains in the request's in-process handoff_data buffer.
+  if (!FLAGS_decode_ppl_tokens_path.empty()) {
+    args.push_back("--pd-ppl-tokens");
+    args.push_back(FLAGS_decode_ppl_tokens_path);
+    if (!FLAGS_decode_ppl_output_path.empty()) {
+      args.push_back("--pd-ppl-output");
+      args.push_back(FLAGS_decode_ppl_output_path);
+    }
+    if (FLAGS_decode_ppl_max_tokens > 0) {
+      args.push_back("--pd-ppl-max-tokens");
+      args.push_back(std::to_string(FLAGS_decode_ppl_max_tokens));
+    }
+  }
   if (FLAGS_pd_joint_import_only) {
     args.push_back("--pd-import-ro");
   }
@@ -343,8 +351,11 @@ std::shared_ptr<JointDecodeRuntime> prepare_joint_decode() {
     argv.push_back(arg.data());
   }
   out->runtime = llama_pd_inprocess_runtime_create(
-      static_cast<int>(argv.size()), argv.data(), out->model->data(),
-      out->model->size(), &out->initializationMs);
+      static_cast<int>(argv.size()),
+      argv.data(),
+      MtkGgufWeightSourceData(out->model),
+      MtkGgufWeightSourceSize(out->model),
+      &out->initializationMs);
   ET_CHECK_MSG(out->runtime != nullptr, "Unable to initialize joint llama.cpp Decode");
   return out;
 }
@@ -1182,6 +1193,23 @@ int main(int argc, char** argv) {
 #else
     const std::string stageGgufPath;
 #endif
+    std::shared_ptr<MtkGgufWeightSource> sharedGgufSource;
+#ifdef MTK_LLAMA_PD_JOINT
+    if (ggufBacked) {
+      const auto ramStoreStart = std::chrono::steady_clock::now();
+      sharedGgufSource = LoadMtkGgufWeightSourceIntoRam(stageGgufPath);
+      ET_LOG(
+          Info,
+          "MTK PD GGUF RAM store ready: bytes=%zu load_ms=%.3f "
+          "shared_prefill_decode_pointer=%p timing_scope=bootstrap",
+          MtkGgufWeightSourceSize(sharedGgufSource),
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - ramStoreStart)
+              .count(),
+          MtkGgufWeightSourceData(sharedGgufSource));
+    }
+#endif
+
 
     std::unique_ptr<QnnKvAbi> qnnKvAbi;
     if (!FLAGS_pd_qnn_kv_abi_path.empty()) {
@@ -1198,22 +1226,35 @@ int main(int argc, char** argv) {
           qnnKvAbi->NumHeads(),
           qnnKvAbi->HeadDim());
     }
+    std::string stageEmbeddingPath = FLAGS_token_embedding_path;
+#ifdef MTK_LLAMA_PD_JOINT
+    if (!FLAGS_pd_joint_disk_embedding_path.empty()) {
+      stageEmbeddingPath = FLAGS_pd_joint_disk_embedding_path;
+      ET_LOG(
+          Info,
+          "MTK PD prefill and QNN decode share FP16 embedding: %s",
+          stageEmbeddingPath.c_str());
+    }
+#endif
     MtkStageMajorPrefillSession stageSession(
         model_options,
-        FLAGS_token_embedding_path,
+        stageEmbeddingPath,
         chunks,
         stageGgufPath,
+        sharedGgufSource,
         false,
         FLAGS_pd_stage_major_three_stage,
         FLAGS_pd_stage_major_async_release,
         FLAGS_pd_stage_major_persistent_chunk0,
+        FLAGS_pd_stage_major_detach_pte_after_load,
         qnnKvAbi.get());
     const auto overlapStart = std::chrono::steady_clock::now();
     auto prewarmFuture = std::async(
         std::launch::async, [&stageSession]() { stageSession.Prepare(); });
 #ifdef MTK_LLAMA_PD_JOINT
     auto decodeInitFuture = std::async(
-        std::launch::async, []() { return prepare_joint_decode(); });
+        std::launch::async,
+        [sharedGgufSource]() { return prepare_joint_decode(sharedGgufSource); });
 #endif
     const auto requestInitStart = std::chrono::steady_clock::now();
 #ifndef MTK_LLAMA_PD_JOINT
@@ -1290,30 +1331,23 @@ int main(int argc, char** argv) {
           static_cast<unsigned long long>(
               FLAGS_pd_stage_major_session_repeats));
 #ifdef MTK_LLAMA_PD_JOINT
-      const auto discardStart = std::chrono::steady_clock::now();
-      jointDecode->model->discard_resident_pages();
       ET_LOG(
           Info,
-          "MTK joint Decode GGUF resident pages discarded before Prefill: "
-          "request=%zu advise_ms=%.3f model_bytes=%zu",
+          "MTK joint GGUF RAM store retained for Prefill: request=%zu "
+          "model_bytes=%zu shared_pointer=%p",
           requestIndex,
-          std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - discardStart)
-              .count(),
-          jointDecode->model->size());
+          MtkGgufWeightSourceSize(jointDecode->model),
+          MtkGgufWeightSourceData(jointDecode->model));
 #endif
       const auto result = stageSession.Run(cachedPromptTokens);
       if (qnnKvAbi) {
-        double qnnKvMs = 0.0;
-        for (const auto& chunkStats : result.chunks) {
-          qnnKvMs += chunkStats.kvPackMs;
-        }
         ET_LOG(
             Info,
-            "MTK PD QNN U8 KV ready: values=%zu ms=%.3f non_finite=%zu "
-            "code0=%zu code255=%zu",
+            "MTK PD QNN U8 KV ready: values=%zu worker_ms=%.3f "
+            "boundary_finalize_ms=%.3f non_finite=%zu code0=%zu code255=%zu",
             result.qnnKvStats.values,
-            qnnKvMs,
+            result.kvHandoffWorkerMs,
+            result.kvHandoffBoundaryMs,
             result.qnnKvStats.nonFinite,
             result.qnnKvStats.codeZero,
             result.qnnKvStats.code255);
@@ -1325,18 +1359,25 @@ int main(int argc, char** argv) {
             : FLAGS_pd_export_dir + "/request_" +
                 std::to_string(requestIndex);
         std::filesystem::create_directories(requestExportDir);
+        std::vector<uint8_t> exportQnnKv;
+        if (qnnKvAbi) {
+          exportQnnKv.assign(
+              result.qnnDirectHandoff.begin() +
+                  result.qnnDirectKvOffsetBytes,
+              result.qnnDirectHandoff.end());
+        }
         write_stage_major_pd_handoff(
             requestExportDir,
             cachedPromptTokens,
             promptTail,
             result,
-            qnnKvAbi ? &result.qnnU8Kv : nullptr);
+            qnnKvAbi ? &exportQnnKv : nullptr);
       }
 #ifdef MTK_LLAMA_PD_JOINT
       llama_pd_inprocess_result decodeResult{};
       llama_pd_inprocess_request request{};
-      request.model_data = jointDecode->model->data();
-      request.model_size = jointDecode->model->size();
+      request.model_data = MtkGgufWeightSourceData(jointDecode->model);
+      request.model_size = MtkGgufWeightSourceSize(jointDecode->model);
       request.prompt_length = static_cast<int32_t>(cachedPromptTokens.size());
       request.num_layers = static_cast<int32_t>(FLAGS_num_layer);
       request.num_kv_heads = static_cast<int32_t>(result.numKvHeads);
@@ -1344,19 +1385,9 @@ int main(int argc, char** argv) {
       request.first_token = static_cast<int32_t>(promptTail);
       request.first_token_is_prompt_tail = true;
       request.result = &decodeResult;
-      std::vector<uint8_t> packedQnnHandoff;
       if (qnnKvAbi) {
-        const size_t tokenBytes =
-            cachedPromptTokens.size() * sizeof(uint64_t);
-        packedQnnHandoff.resize(tokenBytes + result.qnnU8Kv.size());
-        std::memcpy(
-            packedQnnHandoff.data(), cachedPromptTokens.data(), tokenBytes);
-        std::memcpy(
-            packedQnnHandoff.data() + tokenBytes,
-            result.qnnU8Kv.data(),
-            result.qnnU8Kv.size());
-        request.handoff_data = packedQnnHandoff.data();
-        request.handoff_size = packedQnnHandoff.size();
+        request.handoff_data = result.qnnDirectHandoff.data();
+        request.handoff_size = result.qnnDirectHandoff.size();
       } else {
         request.prompt_tokens = cachedPromptTokens.data();
         request.kv_fp16 = result.canonicalKv.data();

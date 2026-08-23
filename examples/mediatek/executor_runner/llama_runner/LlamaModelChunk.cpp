@@ -522,6 +522,50 @@ void LlamaModelChunk::CopyCacheToLocalCanonicalFp16(
       validTokenCount, 0, localLayers, destination);
 }
 
+void LlamaModelChunk::CopyCacheToQnnU8(
+    const size_t validTokenCount,
+    const size_t globalLayerOffset,
+    const QnnKvAbi& abi,
+    uint8_t* output,
+    const size_t outputBytes,
+    QnnKvAbiStats* stats) {
+  ET_CHECK_MSG(mCacheShape.size() == 4, "Expected a 4D KV cache");
+  ET_CHECK_MSG(mCacheShape[0] == 1, "PD export only supports cache batch 1");
+  ET_CHECK_MSG(
+      kCacheType == LLMType::FP32 || kCacheType == LLMType::FP16,
+      "Direct QNN KV handoff supports only FP32/FP16 MTK caches");
+  const size_t localLayers = GetCacheLayerCount();
+  const size_t numKVHeads = GetNumKVHeads();
+  const size_t headDim = GetCacheHeadDim();
+  ET_CHECK_MSG(
+      abi.NumHeads() == numKVHeads && abi.HeadDim() == headDim &&
+          globalLayerOffset + localLayers <= abi.NumLayers(),
+      "MTK cache dimensions do not match QNN KV ABI");
+  ET_CHECK_MSG(
+      outputBytes ==
+          2 * abi.NumLayers() * numKVHeads * validTokenCount * headDim,
+      "Direct QNN KV handoff output size mismatch");
+  const size_t sourceFirstToken = kCacheLength - validTokenCount;
+  for (size_t kind = 0; kind < 2; ++kind) {
+    for (size_t localLayer = 0; localLayer < localLayers; ++localLayer) {
+      const auto cacheInput = getInputIndex(
+          IOKind::KVCache, kind * localLayers + localLayer);
+      const auto source = GetInputBuffer(cacheInput);
+      abi.ConvertCacheLayer(
+          source.data,
+          kCacheType == LLMType::FP16,
+          kCacheLength,
+          sourceFirstToken,
+          validTokenCount,
+          kind,
+          globalLayerOffset + localLayer,
+          output,
+          outputBytes,
+          stats);
+    }
+  }
+}
+
 void LlamaModelChunk::Run() {
   UpdatePosEmbAndMask(mTokenBatchSize);
   ModelChunk::Run();
