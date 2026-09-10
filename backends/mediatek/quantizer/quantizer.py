@@ -29,6 +29,11 @@ class NeuropilotQuantizer(Quantizer):
         self._activation_observer_cls = MinMaxObserver
         self._skip_mlp_output_quantization = False
         self._module_name_precisions = {}
+        self._shared_kv_quantization = False
+        self.shared_kv_annotations = []
+
+    def set_shared_kv_quantization(self, enabled: bool = True) -> None:
+        self._shared_kv_quantization = enabled
 
     def setup_precision(self, precision: Precision) -> None:
         self._precision = precision
@@ -72,6 +77,9 @@ class NeuropilotQuantizer(Quantizer):
         )
         self._annotate_module_name_overrides(gm)
         annotate(gm.graph, quant_config)
+        if self._shared_kv_quantization:
+            from .shared_kv import annotate_shared_kv
+            self.shared_kv_annotations = annotate_shared_kv(gm.graph, quant_config.activation)
         if self._skip_mlp_output_quantization:
             self._remove_mlp_output_quantization(gm)
 

@@ -7,6 +7,7 @@
 import collections
 import contextlib
 import hashlib
+import json
 import os
 import struct
 
@@ -26,7 +27,7 @@ from executorch.exir.backend.backend_details import (
 )
 from executorch.exir.backend.compile_spec_schema import CompileSpec
 
-SKIP_COMPILE_SPEC_KEYS = {"ImportForever", "ConverterDumpDir"}
+SKIP_COMPILE_SPEC_KEYS = {"ImportForever", "ConverterDumpDir", "SharedKvIO"}
 EXTRACT_SHARED_BLOB_KEY = "ExtractSharedBlobKey"
 HEADER_SIZE = 13
 HEADER_VERSION = 1
@@ -164,6 +165,12 @@ class NeuropilotBackend(BackendDetails):
                     else None
                 )
             )
+            kv_specs = [spec for spec in module_compile_spec if spec.key == "SharedKvIO"]
+            if kv_specs:
+                from executorch.backends.mediatek.quantized_kv_io import prepare_kv_io
+                mlir_str = prepare_kv_io(
+                    mlir_str, json.loads(kv_specs[0].value), input_names, output_names
+                )
             model_bytes = mtk_neuron.compile(mlir_str, " ".join(compile_options))
 
         num_inputs = len(input_names)

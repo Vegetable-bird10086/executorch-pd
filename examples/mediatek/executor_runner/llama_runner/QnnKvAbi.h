@@ -55,7 +55,8 @@ class QnnKvAbi {
       size_t layer,
       uint8_t* output,
       size_t outputBytes,
-      QnnKvAbiStats* accumulatedStats = nullptr) const;
+      QnnKvAbiStats* accumulatedStats = nullptr,
+      float sourceInt16Scale = 0.0f) const;
 
  private:
   struct Affine {

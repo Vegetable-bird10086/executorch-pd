@@ -223,7 +223,8 @@ void QnnKvAbi::ConvertCacheLayer(
     size_t layer,
     uint8_t* output,
     size_t outputBytes,
-    QnnKvAbiStats* accumulatedStats) const {
+    QnnKvAbiStats* accumulatedStats,
+    float sourceInt16Scale) const {
   const size_t layerStride = numHeads_ * validTokenCount * headDim_;
   const size_t outputPerKind = numLayers_ * layerStride;
   if (source == nullptr || output == nullptr || validTokenCount == 0 ||
@@ -246,7 +247,11 @@ void QnnKvAbi::ConvertCacheLayer(
       const size_t sourceTokenBase = sourceHeadBase + token * headDim_;
       const size_t outputTokenBase = outputHeadBase + token * headDim_;
       for (size_t dim = 0; dim < headDim_; ++dim) {
-        if (sourceIsFp16) {
+        if (sourceInt16Scale > 0.0f) {
+          const float real = static_cast<const int16_t*>(source)[sourceTokenBase + dim] * sourceInt16Scale;
+          const auto half = executorch::runtime::etensor::internal::fp16_ieee_from_fp32_value(real);
+          transformed[dim] = executorch::runtime::etensor::internal::fp16_ieee_to_fp32_value(half);
+        } else if (sourceIsFp16) {
           transformed[dim] = executorch::runtime::etensor::internal::
               fp16_ieee_to_fp32_value(
                   static_cast<const uint16_t*>(source)[sourceTokenBase + dim]);

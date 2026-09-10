@@ -188,7 +188,16 @@ class LlamaModelChunk : public ModelChunk {
   const LLMType kCacheType;
   const size_t kMaxTokenLength;
   const size_t kCacheLength;
-  const size_t kCacheTypeSize;
+  size_t kCacheTypeSize;
+  size_t mChunkIndex;
+  bool mQuantizedKvIo{false};
+  bool mSharedKvIo{false};
+  std::unordered_map<size_t, std::vector<std::pair<float, float>>> mKvIoScales;
+  std::vector<std::vector<float>> mHandoffCache;
+  std::vector<float> mNewKvFloat;
+  std::vector<int16_t> mNewKvInput;
+  BufferInfo GetHandoffCache(size_t localIndex);
+  void PadHandoffCache(size_t rollbackTokens, size_t seenTokens, bool left);
 
   // Mask
   const LLMType kMaskType;

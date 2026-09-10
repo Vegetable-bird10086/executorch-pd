@@ -10,6 +10,7 @@ import sys
 if os.getcwd() not in sys.path:
     sys.path.append(os.getcwd())
 import argparse
+import gc
 import hashlib
 import json
 import re
@@ -255,6 +256,10 @@ def get_argument_parser():
         "Use --no-output-new-cache-only for legacy full-cache PTEs.",
     )
     parser.add_argument(
+        "--shared-kv-quantization", action=argparse.BooleanOptionalAction, default=True,
+        help="Use shared KV observers and Int16 KV IO (default); disable for legacy FP32 KV.",
+    )
+    parser.add_argument(
         "--compiler-accuracy-mode",
         action="store_true",
         help="Pass Neuropilot --opt-accuracy so compilation prioritizes accuracy over performance.",
@@ -286,6 +291,12 @@ def get_argument_parser():
 
 # flake8: noqa: F405
 def args_sanity_checks(args):
+    if args.shared_kv_quantization and (
+        not args.output_new_cache_only or args.layer_debug or args.tail_debug
+        or args.operator_debug_layer is not None
+    ):
+        raise ValueError("Shared Int16 KV requires new-token outputs without debug outputs; "
+                         "use --no-shared-kv-quantization for a legacy/debug export")
     check_old_arg(args.config)
     check_exist(args.config, "Config file")
     check_ext(args.config, ".json", "Config file")
@@ -1173,6 +1184,7 @@ def export_to_et_ir(
     dump_qweights=False,
     mtk_gguf_qparams_dir=None,
     layers_per_chunk=0,
+    shared_kv_quantization=True,
 ):
     print(f"Exporting Chunk {chunk_idx} to PTE")
     example_inputs, dynamic_shapes = model.get_example_inputs(
@@ -1184,12 +1196,34 @@ def export_to_et_ir(
     ).module()  # NOTE: Will be replaced with export
     quantizer = NeuropilotQuantizer()
     quantizer.setup_precision(getattr(Precision, precision))
+    quantizer.set_shared_kv_quantization(shared_kv_quantization)
     quantizer.set_skip_mlp_output_quantization(skip_mlp_output_quantization)
     if lm_head_precision != "same":
         quantizer.set_module_name_precision(
             "lm_head", getattr(Precision, lm_head_precision)
         )
     prepared_graph = prepare_pt2e(pre_autograd_aten_dialect, quantizer)
+    if shared_kv_quantization:
+        print("Shared KV observers:", quantizer.shared_kv_annotations)
+        # The final chunk drops its last attention result. Export may retain
+        # unused cache -> to chains, so count only inputs reaching an output.
+        reachable = set()
+        pending = [node for node in prepared_graph.graph.nodes if node.op == "output"]
+        while pending:
+            node = pending.pop()
+            if node not in reachable:
+                reachable.add(node)
+                pending.extend(node.all_input_nodes)
+        expected = {
+            node.name for node in reachable
+            if node.op == "placeholder" and str(node.target).startswith("cache_")
+        }
+        matched = {item["history"] for item in quantizer.shared_kv_annotations}
+        if not expected or matched != expected:
+            raise RuntimeError(
+                f"Incomplete shared KV annotation: expected {sorted(expected)}, "
+                f"matched {sorted(matched)}"
+            )
     # at this point quant min max are inf
     if cal_dataset is not None:
         calibrate_model(
@@ -1247,6 +1281,7 @@ def export_to_et_ir(
     if tail_debug:
         converted_graph = append_tail_debug_output(converted_graph)
 
+    kv_method_files = []
     method_to_edge_program = {}
     method_to_partitioner = {}
     edge_compile_config = exir.EdgeCompileConfig(_check_ir_validity=False)
@@ -1275,6 +1310,17 @@ def export_to_et_ir(
             CompileSpec("platform-config", platform_b),
             CompileSpec("ExtractSharedBlobKey", model_shared_key_name.encode()),
         ]
+        if shared_kv_quantization:
+            from executorch.backends.mediatek.quantized_kv_io import SPEC_KEY
+            ep = method_to_edge_program[model_fname]
+            cache_names = [name for name in ep.graph_signature.user_inputs if name.startswith("cache_")]
+            output_names = ep.graph_signature.user_outputs[-len(cache_names):]
+            qparams_path = os.path.abspath(os.path.join(output_folder, "kv_io", f"{shape}.json"))
+            kv_method_files.append(qparams_path)
+            compile_spec.append(CompileSpec(SPEC_KEY, json.dumps({
+                "ar": ntok_and_cache[0], "qparams_path": qparams_path,
+                "pairs": [{"input": a, "output": b} for a, b in zip(cache_names, output_names)],
+            }).encode()))
         if compiler_accuracy_mode:
             compile_spec.append(CompileSpec("opt-accuracy", b""))
         if compiler_opt_level != 3:
@@ -1315,7 +1361,14 @@ def export_to_et_ir(
     print(f"{exp_name} ET Model chunk {chunk_idx} Dest: {dest_path}\n")
     os.makedirs(dest_path.rsplit("/", 1)[0], exist_ok=True)
     with open(dest_path, "wb") as file:
-        file.write(executorch_program.buffer)
+        if shared_kv_quantization:
+            from executorch.backends.mediatek.quantized_kv_io import finalize_kv_io
+            finalize_kv_io(
+                executorch_program.buffer, kv_method_files, model.num_blocks * 2,
+                os.path.join(output_folder, "kv_io_qparams.txt"),
+            ).write_to_file(file)
+        else:
+            file.write(executorch_program.buffer)
 
 
 def main():
@@ -1397,52 +1450,139 @@ def main():
     if args.dataset is not None:
         embedding_layer = get_embedding_layer(config, weight_dir, state_dict)
 
-    # Instantiate model chunks
-    print("Instantiating submodels")
-    models = []
-    for chunk_idx, num_blocks in enumerate(num_blocks_per_chunk):
-        chunk = chunk_class(
-            config,
-            num_blocks,
-            chunk_idx=chunk_idx,
-            dtype=torch.float32,
-            include_tail=(chunk_idx == args.num_chunks - 1),
-            jit_trace=True,
-        )
-        chunk = chunk.load_weights(state_dict, sum(num_blocks_per_chunk[:chunk_idx]))
-        models.append(chunk)
-
+    low_memory_export = (
+        args.export_chunk is not None
+        and args.dataset is not None
+        and args.calibration_mode == "prompt-only"
+        and args.calibration_response_steps == 0
+    )
     cal_dataset = None
-    if args.dataset is not None:
-        cal_dataset = load_dataset("text", data_files=args.dataset, split="train")
-        master_rot_emb = get_master_rot_emb(config, dtype=torch.float32)
+    if low_memory_export:
+        # A single-chunk prompt-only export only calibrates that chunk's prompt
+        # input.  Run preceding chunks serially and release each immediately;
+        # retaining all FP32 submodels is unnecessary and OOMs 8B checkpoints.
+        source_dataset = load_dataset("text", data_files=args.dataset, split="train")
+        if len(source_dataset) != 1:
+            raise RuntimeError(
+                "low-memory prompt-only export requires exactly one calibration sample"
+            )
         if args.preformatter is not None:
-            cal_dataset = cal_dataset.map(
+            source_dataset = source_dataset.map(
                 apply_preformatter, fn_kwargs={"preformatter": preformatter}
             )
-        cal_dataset = cal_dataset.map(
+        source_dataset = source_dataset.map(
             tokenize_dataset, fn_kwargs={"tokenizer": tokenizer}
         )
-        print("Preparing Model Calibration Inputs...")
-        cal_dataset = cal_dataset.map(
-            prepare_model_inputs,
-            fn_kwargs={
-                "models": models,
-                "embedding_layer": embedding_layer,
-                "master_rot_emb": master_rot_emb,
-                "num_blocks_per_chunk": num_blocks_per_chunk,
-                "num_key_value_heads": config.num_key_value_heads,
-                "head_dim": head_dim,
-                "max_cache_size": max_cache_size,
-                "eos_token_id_tensor": torch.tensor(tokenizer.eos_token_id),
-                "response_cap": args.response_cap,
-            },
+        master_rot_emb = get_master_rot_emb(config, dtype=torch.float32)
+        input_ids = source_dataset[0]["input_ids"]
+        hidden_state = embedding_layer(torch.tensor(input_ids))
+        input_length = hidden_state.shape[1]
+        mask = generate_mask(max_cache_size, 0, input_length, input_length)
+        pos_emb = master_rot_emb[:, :, :input_length, :]
+        target_chunk = args.export_chunk
+        models = [None] * args.num_chunks
+        print(
+            "Preparing prompt calibration input with serial low-memory chunk execution"
         )
+        for chunk_idx in range(target_chunk + 1):
+            num_blocks = num_blocks_per_chunk[chunk_idx]
+            include_tail = (
+                chunk_idx == args.num_chunks - 1 and not args.prefill_no_lm_head
+            )
+            chunk = chunk_class(
+                config,
+                num_blocks,
+                chunk_idx=chunk_idx,
+                dtype=torch.float32,
+                include_tail=include_tail,
+                jit_trace=True,
+            )
+            chunk = chunk.load_weights(
+                state_dict, sum(num_blocks_per_chunk[:chunk_idx])
+            )
+            if chunk_idx == args.num_chunks - 1 and args.prefill_no_lm_head:
+                chunk.prefill_no_output = True
+            cache_in = torch.zeros(
+                (
+                    2 * num_blocks,
+                    config.num_key_value_heads,
+                    max_cache_size,
+                    head_dim,
+                ),
+                dtype=torch.float32,
+            )
+            if chunk_idx == target_chunk:
+                models[chunk_idx] = chunk
+                cal_dataset = [
+                    {
+                        str(chunk_idx): {
+                            "prompt": {
+                                "hidden_state": hidden_state,
+                                "mask": mask,
+                                "pos_emb": pos_emb,
+                                "cache": cache_in,
+                            }
+                        }
+                    }
+                ]
+                break
+            with torch.no_grad():
+                hidden_state = chunk(
+                    hidden_state,
+                    mask,
+                    pos_emb,
+                    *torch.split(cache_in, 1, dim=0),
+                )[0]
+            del chunk, cache_in
+            gc.collect()
+    else:
+        # Instantiate model chunks
+        print("Instantiating submodels")
+        models = []
+        for chunk_idx, num_blocks in enumerate(num_blocks_per_chunk):
+            chunk = chunk_class(
+                config,
+                num_blocks,
+                chunk_idx=chunk_idx,
+                dtype=torch.float32,
+                include_tail=(chunk_idx == args.num_chunks - 1),
+                jit_trace=True,
+            )
+            chunk = chunk.load_weights(
+                state_dict, sum(num_blocks_per_chunk[:chunk_idx])
+            )
+            models.append(chunk)
+
+        if args.dataset is not None:
+            cal_dataset = load_dataset("text", data_files=args.dataset, split="train")
+            master_rot_emb = get_master_rot_emb(config, dtype=torch.float32)
+            if args.preformatter is not None:
+                cal_dataset = cal_dataset.map(
+                    apply_preformatter, fn_kwargs={"preformatter": preformatter}
+                )
+            cal_dataset = cal_dataset.map(
+                tokenize_dataset, fn_kwargs={"tokenizer": tokenizer}
+            )
+            print("Preparing Model Calibration Inputs...")
+            cal_dataset = cal_dataset.map(
+                prepare_model_inputs,
+                fn_kwargs={
+                    "models": models,
+                    "embedding_layer": embedding_layer,
+                    "master_rot_emb": master_rot_emb,
+                    "num_blocks_per_chunk": num_blocks_per_chunk,
+                    "num_key_value_heads": config.num_key_value_heads,
+                    "head_dim": head_dim,
+                    "max_cache_size": max_cache_size,
+                    "eos_token_id_tensor": torch.tensor(tokenizer.eos_token_id),
+                    "response_cap": args.response_cap,
+                },
+            )
 
     # Keep calibration-data collection on the original logits model so prompt
     # plus decode-token calibration can select real response tokens. Replace
     # the exported final chunk with a KV-only graph only after inputs are ready.
-    if args.prefill_no_lm_head and exports_final_chunk:
+    if args.prefill_no_lm_head and exports_final_chunk and not low_memory_export:
         # Calibration input preparation needs the original final logits to
         # collect optional response tokens. Recreate only the exported final
         # chunk afterwards, with no final norm or lm_head parameters at all.
@@ -1503,6 +1643,7 @@ def main():
             args.dump_qweights,
             args.mtk_gguf_qparams_dir,
             num_blocks_per_chunk[chunk_idx],
+            args.shared_kv_quantization,
         )
 
 

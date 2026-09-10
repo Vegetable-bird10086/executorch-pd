@@ -10,6 +10,11 @@
 #include <cstdlib>
 #include <cstdio>
 #include <numeric>
+#include <fstream>
+#include <cmath>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -75,7 +80,8 @@ LlamaModelChunk::LlamaModelChunk(
               ? modelOptions.layer_debug_output_count
               : 0),
       enableSWA(enableSWA),
-      kCacheTypeSize(llm_helper::getLLMTypeSize(kCacheType)) {}
+      kCacheTypeSize(llm_helper::getLLMTypeSize(kCacheType)),
+      mChunkIndex(chunkIndex) {}
 
 LlamaModelChunk::~LlamaModelChunk() {}
 
@@ -289,6 +295,7 @@ void LlamaModelChunk::PaddingPostprocess() {
 }
 
 void LlamaModelChunk::LeftPaddingCachePostprocess() {
+  PadHandoffCache(mCurrentPadSize, mCurrentTokenIndex + mTokenBatchSize, true);
   // NOTE: This part might not actually be needed
 
   // Stride size is same across caches
@@ -325,6 +332,7 @@ void LlamaModelChunk::RollbackCache(
     return; // do nothing
   }
 
+  PadHandoffCache(rollbackTokCount, numSeenToken, false);
   const size_t numSeenTokenAlive = std::min(numSeenToken, kCacheLength);
   const size_t firstNonEmptyIdx = kCacheLength - numSeenTokenAlive;
   const size_t preserveTokCount = (numSeenTokenAlive > rollbackTokCount)
@@ -470,9 +478,9 @@ void LlamaModelChunk::CopyCacheToCanonicalFp16(
     for (size_t localLayer = 0; localLayer < localLayers; ++localLayer) {
       const auto cacheInput = getInputIndex(
           IOKind::KVCache, kind * localLayers + localLayer);
-      const auto source = GetInputBuffer(cacheInput);
+      const auto source = GetHandoffCache(kind * localLayers + localLayer);
       const size_t expectedSourceBytes =
-          numKVHeads * kCacheLength * headDim * kCacheTypeSize;
+          numKVHeads * kCacheLength * headDim * (mSharedKvIo ? sizeof(int16_t) : (mQuantizedKvIo ? sizeof(float) : kCacheTypeSize));
       ET_CHECK_MSG(
           source.nbytes >= expectedSourceBytes,
           "KV cache input %zu has %zu bytes, expected at least %zu",
@@ -489,7 +497,12 @@ void LlamaModelChunk::CopyCacheToCanonicalFp16(
             ((globalLayer * numKVHeads + head) * validTokenCount * headDim);
         const size_t valueCount = validTokenCount * headDim;
         auto* output = destination.data() + destinationOffset;
-        if (kCacheType == LLMType::FP16) {
+        if (mSharedKvIo) {
+          const auto* input = static_cast<const int16_t*>(source.data) + sourceOffset;
+          const float scale = mKvIoScales.at(mTokenBatchSize).at(kind * localLayers + localLayer).first;
+          for (size_t i=0;i<valueCount;++i)
+            output[i] = executorch::runtime::etensor::internal::fp16_ieee_from_fp32_value(input[i]*scale);
+        } else if (kCacheType == LLMType::FP16) {
           const auto* input =
               static_cast<const uint16_t*>(source.data) + sourceOffset;
           std::copy(input, input + valueCount, output);
@@ -554,7 +567,7 @@ void LlamaModelChunk::CopyCacheToQnnU8(
     for (size_t localLayer = 0; localLayer < localLayers; ++localLayer) {
       const auto cacheInput = getInputIndex(
           IOKind::KVCache, kind * localLayers + localLayer);
-      const auto source = GetInputBuffer(cacheInput);
+      const auto source = GetHandoffCache(kind * localLayers + localLayer);
       abi.ConvertCacheLayer(
           source.data,
           kCacheType == LLMType::FP16,
@@ -565,8 +578,34 @@ void LlamaModelChunk::CopyCacheToQnnU8(
           globalLayerOffset + localLayer,
           output,
           outputBytes,
-          stats);
+          stats,
+          mSharedKvIo ? mKvIoScales.at(mTokenBatchSize).at(kind * localLayers + localLayer).first : 0.0f);
     }
+  }
+  // Explicit diagnostic only; exclude this reference conversion from speed runs.
+  const char* verify = std::getenv("MTK_PD_VERIFY_KV_HANDOFF");
+  if (verify && std::string(verify) == "1") {
+    const size_t layerValues = numKVHeads * validTokenCount * headDim;
+    std::vector<uint16_t> canonical(2 * localLayers * layerValues);
+    CopyCacheToLocalCanonicalFp16(validTokenCount, canonical);
+    std::vector<uint8_t> reference(outputBytes);
+    QnnKvAbiStats referenceStats{};
+    for (size_t kind = 0; kind < 2; ++kind) {
+      for (size_t localLayer = 0; localLayer < localLayers; ++localLayer) {
+        const size_t globalLayer = globalLayerOffset + localLayer;
+        abi.ConvertCacheLayer(
+            canonical.data() + (kind * localLayers + localLayer) * layerValues,
+            true, validTokenCount, 0, validTokenCount, kind, globalLayer,
+            reference.data(), reference.size(), &referenceStats);
+        const size_t offset = (kind * abi.NumLayers() + globalLayer) * layerValues;
+        ET_CHECK_MSG(std::memcmp(output + offset, reference.data() + offset, layerValues) == 0,
+                     "QNN handoff reference mismatch: layer=%zu kind=%zu", globalLayer, kind);
+      }
+    }
+    ET_CHECK_MSG(referenceStats.nonFinite == 0, "Non-finite canonical KV handoff");
+    std::fprintf(stderr,
+        "MTK_KV_HANDOFF_VERIFIED chunk=%zu tokens=%zu values=%zu shared_int16=%d\n",
+        mChunkIndex, validTokenCount, canonical.size(), int(mSharedKvIo));
   }
 }
 
@@ -588,6 +627,17 @@ void LlamaModelChunk::Run() {
                      (mOutputNewCacheOnly ? mTokenBatchSize : kCacheLength) &&
                      output.nbytes >= out->nbytes(),
                  "Incompatible KV ABI or insufficient output storage after method switch");
+  }
+  if (mQuantizedKvIo) {
+    ET_CHECK_MSG(mKvIoScales.count(mTokenBatchSize), "Missing KV method scales");
+    const auto& selected = mKvIoScales.at(mTokenBatchSize);
+    for (const auto& entry : mKvIoScales) {
+      ET_CHECK_MSG(entry.second.size() == kCacheCount, "Incomplete KV scales");
+      for (size_t i=0;i<kCacheCount;++i)
+        ET_CHECK_MSG(selected[i].first > 0 && selected[i].second > 0 &&
+                         selected[i].first == entry.second[i].first,
+                     "KV history input scales must agree across methods");
+    }
   }
   UpdatePosEmbAndMask(mTokenBatchSize);
   const auto prepared = profile ? Clock::now() : Clock::time_point{};
@@ -642,6 +692,47 @@ void LlamaModelChunk::PrepareCacheIOs() {
   const auto firstInCacheIdx = getInputIndex(IOKind::KVCache);
   mCacheShape = method_meta.input_tensor_meta(firstInCacheIdx)->sizes();
 
+  mQuantizedKvIo = method_meta.input_tensor_meta(firstInCacheIdx)->scalar_type() ==
+      executorch::aten::ScalarType::Short;
+  if (mQuantizedKvIo) {
+    ET_CHECK_MSG(kCacheType == LLMType::FP32, "Int16 KV IO requires FP32 logical cache configuration");
+    kCacheTypeSize = sizeof(int16_t);
+    const char* root = std::getenv("MTK_PD_KV_IO_QPARAMS");
+    ET_CHECK_MSG(root && *root, "Int16 KV IO requires MTK_PD_KV_IO_QPARAMS");
+    char filename[64]; std::snprintf(filename, sizeof(filename), "/chunk_%02zu.txt", mChunkIndex);
+    std::ifstream file(std::string(root) + filename);
+    ET_CHECK_MSG(file.good(), "Missing KV IO qparams for chunk %zu", mChunkIndex);
+    size_t ar, index; float inputScale, outputScale;
+    while (file >> ar >> index >> inputScale >> outputScale) {
+      ET_CHECK_MSG(index < kCacheCount && inputScale > 0 && outputScale > 0 &&
+                       std::isfinite(inputScale) && std::isfinite(outputScale), "Invalid KV IO scale");
+      auto& row = mKvIoScales[ar]; row.resize(kCacheCount);
+      ET_CHECK_MSG(row[index].first == 0, "Duplicate KV IO scale");
+      row[index] = {inputScale, outputScale};
+    }
+    ET_CHECK_MSG(file.eof(), "Malformed KV IO sidecar");
+    ET_CHECK_MSG(mKvIoScales.count(mTokenBatchSize), "Missing selected KV method scales");
+    mSharedKvIo = true;
+    const auto& reference = mKvIoScales.at(mTokenBatchSize);
+    for (const auto& entry : mKvIoScales) {
+      for (size_t i=0;i<kCacheCount;++i) {
+        ET_CHECK_MSG(entry.second[i].first > 0 && entry.second[i].second > 0,
+                     "Missing KV scale entry");
+        mSharedKvIo = mSharedKvIo && entry.second[i].first == reference[i].first &&
+            entry.second[i].second == reference[i].first;
+      }
+    }
+    ET_LOG(Info, "MTK Int16 KV storage: %s",
+           mSharedKvIo ? "shared_scale_direct_append" : "requantize_with_fp32_handoff");
+    // Unshared legacy scales need a full-range shadow for decode. Shared
+    // scales keep only the Int16 history and append output codes directly.
+    const size_t values = GetCacheNumRows() * kCacheLength * GetCacheHeadDim();
+    if (!mSharedKvIo) {
+      mHandoffCache.resize(kCacheCount);
+      for (auto& cache : mHandoffCache) cache.resize(values);
+    }
+  }
+
   // Incremental outputs must have separate storage: aliasing them with the
   // history would overwrite KV still read by the NPU. Detect the ABI from PTE
   // metadata so legacy full-cache models remain usable.
@@ -650,6 +741,7 @@ void LlamaModelChunk::PrepareCacheIOs() {
   ET_CHECK_MSG(outputShape.size() == 4, "Expected a 4D KV output");
   mOutputNewCacheOnly = static_cast<size_t>(outputShape[2]) != kCacheLength ||
       std::string(method_meta.name()).find("_new_kv_only") != std::string::npos;
+  ET_CHECK_MSG(!mQuantizedKvIo || mOutputNewCacheOnly, "Int16 KV requires new-token outputs");
   if (mOutputNewCacheOnly) {
     ET_CHECK_MSG(static_cast<size_t>(outputShape[2]) == mTokenBatchSize,
                  "KV output must contain either full history or new tokens");
@@ -690,6 +782,34 @@ void LlamaModelChunk::UpdateCacheFromNewOutputs() {
     ET_CHECK_MSG(input.nbytes >= GetCacheNumRows() * kCacheLength * GetCacheStrideSize() &&
                      output.nbytesUsed >= GetCacheNumRows() * mTokenBatchSize * GetCacheStrideSize(),
                  "KV buffer is smaller than its contiguous tensor shape");
+    if (mQuantizedKvIo && !mSharedKvIo) {
+      const auto scales = mKvIoScales.at(mTokenBatchSize).at(i);
+      const size_t values = GetCacheNumRows() * mTokenBatchSize * GetCacheHeadDim();
+      mNewKvFloat.resize(values); mNewKvInput.resize(values);
+      const auto* q = static_cast<const int16_t*>(output.data);
+      size_t j = 0;
+      #if defined(__aarch64__)
+      const auto outScale = vdupq_n_f32(scales.second);
+      const auto invScale = vdupq_n_f32(1.0f / scales.first);
+      for (; j + 4 <= values; j += 4) {
+        const auto v = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vld1_s16(q+j))), outScale);
+        vst1q_f32(mNewKvFloat.data()+j, v);
+        const auto clipped = vmaxq_f32(vdupq_n_f32(-32768.0f),
+            vminq_f32(vdupq_n_f32(32767.0f), vmulq_f32(v, invScale)));
+        vst1_s16(mNewKvInput.data()+j, vqmovn_s32(vcvtnq_s32_f32(clipped)));
+      }
+      #endif
+      for (; j < values; ++j) {
+        const float v = q[j] * scales.second; mNewKvFloat[j] = v;
+        mNewKvInput[j] = static_cast<int16_t>(std::nearbyint(
+            std::max(-32768.0f, std::min(32767.0f, v / scales.first))));
+      }
+      UpdateSlidingKvCache(input.data, mNewKvInput.data(), GetCacheNumRows(),
+          kCacheLength, mTokenBatchSize, GetCacheStrideSize(), mCurrentTokenIndex);
+      UpdateSlidingKvCache(mHandoffCache[i].data(), mNewKvFloat.data(), GetCacheNumRows(),
+          kCacheLength, mTokenBatchSize, GetCacheHeadDim()*sizeof(float), mCurrentTokenIndex);
+      continue;
+    }
     UpdateSlidingKvCache(input.data, output.data, GetCacheNumRows(),
                          kCacheLength, mTokenBatchSize, GetCacheStrideSize(),
                          mCurrentTokenIndex);
@@ -736,12 +856,41 @@ void LlamaModelChunk::InitMaskBuilder() {
 }
 
 void LlamaModelChunk::InitCache() {
+  for (auto& cache : mHandoffCache) std::fill(cache.begin(), cache.end(), 0.0f);
   // Zero initialization
   for (const auto cacheIdx : getInputIndexes(IOKind::KVCache)) {
     const auto& inputCacheInfo = mInputBufferInfos[cacheIdx];
     char* cacheBuffer = reinterpret_cast<char*>(inputCacheInfo.data);
     const size_t cacheSizeBytes = inputCacheInfo.nbytes;
     std::memset(cacheBuffer, 0, cacheSizeBytes);
+  }
+}
+
+
+BufferInfo LlamaModelChunk::GetHandoffCache(size_t localIndex) {
+  if (!mQuantizedKvIo || mSharedKvIo) return GetInputBuffer(getInputIndex(IOKind::KVCache, localIndex));
+  auto& v = mHandoffCache.at(localIndex);
+  return {v.data(), v.size()*sizeof(float), v.size()*sizeof(float)};
+}
+
+void LlamaModelChunk::PadHandoffCache(size_t pad, size_t seen, bool left) {
+  if (!mQuantizedKvIo || mSharedKvIo || !pad) return;
+  const size_t dim = GetCacheHeadDim(), rows = GetCacheNumRows();
+  const size_t alive = std::min(seen, kCacheLength);
+  const size_t keep = alive > pad ? alive-pad : 0;
+  for (auto& cache : mHandoffCache) {
+    if (!left && !keep) { std::fill(cache.begin(), cache.end(), 0.0f); continue; }
+    for (size_t row=0;row<rows;++row) {
+      auto* data = cache.data()+row*kCacheLength*dim;
+      if (left) {
+        std::fill(data+(kCacheLength-mTokenBatchSize)*dim,
+                  data+(kCacheLength-mTokenBatchSize+pad)*dim, 0.0f);
+      } else {
+        const size_t start=kCacheLength-alive;
+        std::memmove(data+(start+pad)*dim, data+start*dim, keep*dim*sizeof(float));
+        std::fill(data+start*dim, data+(start+pad)*dim, 0.0f);
+      }
+    }
   }
 }
 
