@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <chrono>
 #include <mutex>
 
 namespace executorch {
@@ -70,9 +71,23 @@ bool BufferAllocator::RemoveBuffer(void* address) {
   return remove_func(allocatorHandle, address);
 }
 
-const MemoryUnit* BufferAllocator::Find(void* address) {
-  std::scoped_lock Guard(mMutex);
-  return static_cast<const MemoryUnit*>(find_func(allocatorHandle, address));
+const MemoryUnit* BufferAllocator::Find(
+    void* address, double* lockUs, double* lookupUs) {
+  if (lockUs == nullptr || lookupUs == nullptr) {
+    std::scoped_lock Guard(mMutex);
+    return static_cast<const MemoryUnit*>(find_func(allocatorHandle, address));
+  }
+  using Clock = std::chrono::steady_clock;
+  const auto begin = Clock::now();
+  std::unique_lock<std::mutex> guard(mMutex);
+  const auto locked = Clock::now();
+  const auto* unit =
+      static_cast<const MemoryUnit*>(find_func(allocatorHandle, address));
+  const auto found = Clock::now();
+  guard.unlock();
+  *lockUs = std::chrono::duration<double, std::micro>(locked - begin).count();
+  *lookupUs = std::chrono::duration<double, std::micro>(found - locked).count();
+  return unit;
 }
 
 void BufferAllocator::Clear() {

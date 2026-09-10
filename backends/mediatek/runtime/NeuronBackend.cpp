@@ -16,6 +16,10 @@
 #include "executorch/runtime/core/error.h"
 
 #include <algorithm>
+#include <chrono>
+#include <type_traits>
+#include <cstdlib>
+#include <cstdio>
 #include <memory>
 #include <new>
 #include <unordered_set>
@@ -164,6 +168,30 @@ bool NeuronBackend::is_available() const {
 Error NeuronExecuTorchDelegate::execute(
     BackendExecutionContext& context,
     Span<EValue*> args) const {
+  static const bool profile = [] {
+    const char* value = std::getenv("MTK_PD_DETAIL_TIMING");
+    return value && std::string(value) == "1";
+  }();
+  static const bool bindProfile = [] {
+    const char* value = std::getenv("MTK_PD_BIND_TIMING");
+    return value && std::string(value) == "1";
+  }();
+  using Clock = std::chrono::steady_clock;
+  struct BindTiming {
+    const char* kind;
+    size_t index, bytes;
+    bool hit = false, memory = false;
+    double cache = 0, find = 0, lock = 0, lookup = 0, sdk = 0;
+    int status = NEURON_NO_ERROR;
+  };
+  std::vector<BindTiming> bindTimings;
+  if (bindProfile) {
+    bindTimings.reserve(mInputSizes.size() + neuron_shared_weights_.size() + mOutputSizes.size());
+  }
+  const auto elapsedUs = [](auto a, auto b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+  };
+  const auto begin = profile ? Clock::now() : Clock::time_point{};
   if (HintNeuronBackend(args) != NEURON_NO_ERROR) {
     return Error::InvalidState;
   };
@@ -174,6 +202,7 @@ Error NeuronExecuTorchDelegate::execute(
       "Expecting default dim_order but got a non default dim_order tensor input");
 
   PrepareInputsOuputs(args);
+  const auto prepared = profile ? Clock::now() : Clock::time_point{};
 
   auto allocator =
       dynamic_cast<neuron::BufferAllocator*>(context.get_temp_allocator());
@@ -181,42 +210,66 @@ Error NeuronExecuTorchDelegate::execute(
   size_t inputCount = mInputSizes.size() + neuron_shared_weights_.size();
   size_t outputCount = mOutputSizes.size();
 
+  const auto bind = [&](auto inputTag, size_t index, const InputOutputInfo& info) {
+    constexpr bool isInput = decltype(inputTag)::value;
+    auto data_ptr = info.data_ptr;
+    auto data_size = info.size;
+    BindTiming timing{isInput ? (index < mInputSizes.size() ? "input" : "weight") : "output",
+                      index, data_size};
+    const auto cacheBegin = bindProfile ? Clock::now() : Clock::time_point{};
+    timing.hit = IsCached<isInput>(index, data_ptr);
+    if (bindProfile) timing.cache = elapsedUs(cacheBegin, Clock::now());
+    if (!timing.hit) {
+      const auto findBegin = bindProfile ? Clock::now() : Clock::time_point{};
+      auto unit = allocator != nullptr
+          ? allocator->Find(data_ptr, bindProfile ? &timing.lock : nullptr,
+                            bindProfile ? &timing.lookup : nullptr)
+          : nullptr;
+      if (bindProfile) timing.find = elapsedUs(findBegin, Clock::now());
+      timing.memory = unit != nullptr;
+      if (unit) {
+        UpdateCache<isInput>(index, data_ptr);
+        size_t offset = (char*)data_ptr - (char*)unit->GetAddress();
+        auto memory = unit->GetNeuronMemory();
+        const auto sdkBegin = bindProfile ? Clock::now() : Clock::time_point{};
+        timing.status = mExecutor.SetInputOutputFromMemory<isInput>(
+            index, memory, offset, data_size);
+        if (bindProfile) timing.sdk = elapsedUs(sdkBegin, Clock::now());
+      } else {
+        const auto sdkBegin = bindProfile ? Clock::now() : Clock::time_point{};
+        timing.status = mExecutor.SetInputOutput<isInput>(index, data_ptr, data_size);
+        if (bindProfile) timing.sdk = elapsedUs(sdkBegin, Clock::now());
+      }
+    }
+    if (bindProfile) bindTimings.push_back(timing);
+  };
   for (size_t i = 0; i < inputCount; i++) {
-    auto data_ptr = mPreparedInputs[i].data_ptr;
-    auto data_size = mPreparedInputs[i].size;
-    if (IsCached</*isInput=*/true>(i, data_ptr)) {
-      continue;
-    };
-    auto unit = allocator != nullptr ? allocator->Find(data_ptr) : nullptr;
-    if (unit) {
-      UpdateCache<true>(i, data_ptr);
-      size_t offset = (char*)data_ptr - (char*)unit->GetAddress();
-      mExecutor.SetInputOutputFromMemory</*isInput*/ true>(
-          i, unit->GetNeuronMemory(), offset, data_size);
-    } else {
-      mExecutor.SetInputOutput</*isInput=*/true>(i, data_ptr, data_size);
-    }
+    bind(std::true_type{}, i, mPreparedInputs[i]);
   }
-
   for (size_t o = 0; o < outputCount; o++) {
-    auto data_ptr = mPreparedOutputs[o].data_ptr;
-    auto data_size = mPreparedOutputs[o].size;
-    if (IsCached</*isInput=*/false>(o, data_ptr)) {
-      continue;
-    };
-    auto unit = allocator != nullptr ? allocator->Find(data_ptr) : nullptr;
-    if (unit) {
-      UpdateCache</*isInput=*/false>(o, data_ptr);
-      size_t offset = (char*)data_ptr - (char*)unit->GetAddress();
-      mExecutor.SetInputOutputFromMemory</*isInput*/ false>(
-          o, unit->GetNeuronMemory(), offset, data_size);
-    } else {
-      mExecutor.SetInputOutput</*isInput=*/false>(o, data_ptr, data_size);
-    }
+    bind(std::false_type{}, o, mPreparedOutputs[o]);
   }
 
-  return mExecutor.Compute() == NEURON_NO_ERROR ? Error::Ok
-                                                : Error::InvalidState;
+  const auto bound = profile ? Clock::now() : Clock::time_point{};
+  const int status = mExecutor.Compute();
+  if (profile) {
+    const auto done = Clock::now();
+    const auto us = [](auto a, auto b) {
+      return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+    std::fprintf(stderr,
+        "MTK_DETAIL_BACKEND prepare_us=%.3f bind_us=%.3f compute_us=%.3f status=%d\n",
+        us(begin, prepared), us(prepared, bound), us(bound, done), status);
+  }
+  if (bindProfile) {
+    for (const auto& t : bindTimings) {
+      std::fprintf(stderr,
+          "MTK_DETAIL_BIND delegate=%p kind=%s index=%zu bytes=%zu hit=%d memory=%d cache_us=%.3f find_us=%.3f lock_us=%.3f lookup_us=%.3f sdk_us=%.3f status=%d\n",
+          static_cast<const void*>(this), t.kind, t.index, t.bytes, t.hit, t.memory,
+          t.cache, t.find, t.lock, t.lookup, t.sdk, t.status);
+    }
+  }
+  return status == NEURON_NO_ERROR ? Error::Ok : Error::InvalidState;
 };
 
 int NeuronExecuTorchDelegate::HintNeuronBackend(Span<EValue*> args) const {

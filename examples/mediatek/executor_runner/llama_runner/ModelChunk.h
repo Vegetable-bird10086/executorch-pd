@@ -62,6 +62,9 @@ class ModelChunk : protected MultiTokenSizeModelLoader {
 
   virtual void Run();
 
+  // Existing Method::execute wall timer, excluding mask/position/KV updates.
+  double GetLastMethodExecuteMs() const { return mLastMethodExecuteMs; }
+
   virtual bool HotSwapModel(const size_t tokenBatchSize);
 
   // Use an in-memory reconstructed PTE instead of opening the configured path.
@@ -145,6 +148,7 @@ class ModelChunk : protected MultiTokenSizeModelLoader {
  protected:
   // State of initialization
   bool mIsInitialized = false;
+  double mLastMethodExecuteMs{0.0};
 
   // The number of input tokens the the fixed-shape model takes
   size_t mTokenBatchSize = 1;

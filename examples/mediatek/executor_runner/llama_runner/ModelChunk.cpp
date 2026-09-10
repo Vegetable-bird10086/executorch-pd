@@ -342,7 +342,8 @@ void ModelChunk::Run() {
       std::chrono::duration_cast<std::chrono::microseconds>(
           afterExec - beforeExec)
           .count();
-  ET_LOG(Debug, "Inference took %f ms", elapsedTime / 1000.0);
+  mLastMethodExecuteMs = elapsedTime / 1000.0;
+  ET_LOG(Debug, "Inference took %f ms", mLastMethodExecuteMs);
   ET_CHECK_MSG(
       status == Error::Ok,
       "Execution of method failed with status 0x%" PRIx32,

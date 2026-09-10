@@ -895,13 +895,16 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
     ET_LOG(
         Info,
         "MTK stage-major chunk=%zu rebuild_ms=%.3f load_ms=%.3f "
-        "pipeline_wait_ms=%.3f execute_ms=%.3f kv_pack_ms=%.3f release_ms=%.3f "
+        "pipeline_wait_ms=%.3f execute_ms=%.3f method_execute_ms=%.3f "
+        "host_update_ms=%.3f kv_pack_ms=%.3f release_ms=%.3f "
         "rss_load_mib=%.2f rss_execute_mib=%.2f rss_release_mib=%.2f hwm_mib=%.2f",
         chunkIndex,
         stats.rebuild.total_ms,
         stats.loadMs,
         stats.pipelineWaitMs,
         stats.executeMs,
+        stats.methodExecuteMs,
+        stats.executeMs - stats.methodExecuteMs,
         stats.kvPackMs,
         stats.releaseMs,
         stats.rssAfterLoadBytes / (1024.0 * 1024.0),
@@ -996,6 +999,7 @@ MtkStageMajorPrefillResult MtkStageMajorPrefillSession::Run(
       const auto executeStart = Clock::now();
       activeChunk->Run();
       stats.executeMs += ElapsedMs(executeStart);
+      stats.methodExecuteMs += activeChunk->GetLastMethodExecuteMs();
 
       if (!finalChunk) {
         const auto output = activeChunk->GetOutputBuffer();

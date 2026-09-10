@@ -6,6 +6,9 @@
  * directory of this source tree for more details.
  */
 
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
 #include <numeric>
 #include <string>
 #include <unordered_map>
@@ -21,6 +24,7 @@
 #include <executorch/runtime/core/portable_type/half.h>
 
 #include "LlamaConfig.h"
+#include "IncrementalKvCache.h"
 #include "LlamaModelChunk.h"
 #include "Utils.h"
 #include "llm_helper/include/llm_types.h"
@@ -567,9 +571,43 @@ void LlamaModelChunk::CopyCacheToQnnU8(
 }
 
 void LlamaModelChunk::Run() {
+  static const bool profile = [] {
+    const char* value = std::getenv("MTK_PD_DETAIL_TIMING");
+    return value && std::string(value) == "1";
+  }();
+  using Clock = std::chrono::steady_clock;
+  const auto begin = profile ? Clock::now() : Clock::time_point{};
+  // Validate every selected method before execution, including AR128 -> AR1
+  // switches. Mixed legacy/incremental methods must not silently alias KV.
+  const auto meta = GetModelMethod().method_meta();
+  for (size_t i = 0; i < getNumOutputsFor(IOKind::KVCache); ++i) {
+    const auto out = meta.output_tensor_meta(getOutputIndex(IOKind::KVCache, i));
+    const auto shape = out->sizes();
+    const auto output = GetOutputBuffer(getOutputIndex(IOKind::KVCache, i));
+    ET_CHECK_MSG(shape.size() == 4 && static_cast<size_t>(shape[2]) ==
+                     (mOutputNewCacheOnly ? mTokenBatchSize : kCacheLength) &&
+                     output.nbytes >= out->nbytes(),
+                 "Incompatible KV ABI or insufficient output storage after method switch");
+  }
   UpdatePosEmbAndMask(mTokenBatchSize);
+  const auto prepared = profile ? Clock::now() : Clock::time_point{};
   ModelChunk::Run();
+  const auto executed = profile ? Clock::now() : Clock::time_point{};
+  if (mOutputNewCacheOnly) {
+    UpdateCacheFromNewOutputs();
+  }
+  const auto updated = profile ? Clock::now() : Clock::time_point{};
   PaddingPostprocess();
+  const auto padded = profile ? Clock::now() : Clock::time_point{};
+  if (profile) {
+    const auto us = [](auto a, auto b) {
+      return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+    std::fprintf(stderr,
+        "MTK_DETAIL_HOST token=%zu new_kv=%d prepare_us=%.3f method_us=%.3f kv_us=%.3f padding_us=%.3f\n",
+        mCurrentTokenIndex, int(mOutputNewCacheOnly), us(begin, prepared),
+        us(prepared, executed), us(executed, updated), us(updated, padded));
+  }
   AdvanceTokenIndex();
 }
 
@@ -604,11 +642,57 @@ void LlamaModelChunk::PrepareCacheIOs() {
   const auto firstInCacheIdx = getInputIndex(IOKind::KVCache);
   mCacheShape = method_meta.input_tensor_meta(firstInCacheIdx)->sizes();
 
-  // Link cache IOs
+  // Incremental outputs must have separate storage: aliasing them with the
+  // history would overwrite KV still read by the NPU. Detect the ABI from PTE
+  // metadata so legacy full-cache models remain usable.
+  const auto firstOut = method_meta.output_tensor_meta(getOutputIndex(IOKind::KVCache));
+  const auto outputShape = firstOut->sizes();
+  ET_CHECK_MSG(outputShape.size() == 4, "Expected a 4D KV output");
+  mOutputNewCacheOnly = static_cast<size_t>(outputShape[2]) != kCacheLength ||
+      std::string(method_meta.name()).find("_new_kv_only") != std::string::npos;
+  if (mOutputNewCacheOnly) {
+    ET_CHECK_MSG(static_cast<size_t>(outputShape[2]) == mTokenBatchSize,
+                 "KV output must contain either full history or new tokens");
+  }
+  ET_LOG(Info, "MTK KV output ABI: %s",
+         mOutputNewCacheOnly ? "new_tokens_only" : "full_cache");
   const size_t numCaches = getNumInputsFor(IOKind::KVCache);
   for (size_t i = 0; i < numCaches; i++) {
-    this->LinkModelIO(
-        getInputIndex(IOKind::KVCache, i), getOutputIndex(IOKind::KVCache, i));
+    const auto inMeta = method_meta.input_tensor_meta(getInputIndex(IOKind::KVCache, i));
+    const auto outMeta = method_meta.output_tensor_meta(getOutputIndex(IOKind::KVCache, i));
+    const auto inShape = inMeta->sizes();
+    const auto outShape = outMeta->sizes();
+    ET_CHECK_MSG(inShape.size() == 4 && outShape.size() == 4 &&
+                     inShape[0] == outShape[0] && inShape[1] == outShape[1] &&
+                     inShape[3] == outShape[3] &&
+                     static_cast<size_t>(inShape[2]) == kCacheLength &&
+                     static_cast<size_t>(outShape[2]) ==
+                         (mOutputNewCacheOnly ? mTokenBatchSize : kCacheLength) &&
+                     inMeta->scalar_type() == outMeta->scalar_type(),
+                 "Inconsistent KV input/output ABI");
+    if (!mOutputNewCacheOnly) {
+      this->LinkModelIO(
+          getInputIndex(IOKind::KVCache, i), getOutputIndex(IOKind::KVCache, i));
+    }
+  }
+}
+
+void LlamaModelChunk::UpdateCacheFromNewOutputs() {
+  const auto meta = GetModelMethod().method_meta();
+  for (size_t i = 0; i < getNumInputsFor(IOKind::KVCache); ++i) {
+    const auto input = GetInputBuffer(getInputIndex(IOKind::KVCache, i));
+    const auto output = GetOutputBuffer(getOutputIndex(IOKind::KVCache, i));
+    const auto shape = meta.output_tensor_meta(getOutputIndex(IOKind::KVCache, i))->sizes();
+    ET_CHECK_MSG(shape.size() == 4 &&
+                     static_cast<size_t>(shape[2]) == mTokenBatchSize &&
+                     input.data != output.data,
+                 "Invalid incremental KV output after method switch");
+    ET_CHECK_MSG(input.nbytes >= GetCacheNumRows() * kCacheLength * GetCacheStrideSize() &&
+                     output.nbytesUsed >= GetCacheNumRows() * mTokenBatchSize * GetCacheStrideSize(),
+                 "KV buffer is smaller than its contiguous tensor shape");
+    UpdateSlidingKvCache(input.data, output.data, GetCacheNumRows(),
+                         kCacheLength, mTokenBatchSize, GetCacheStrideSize(),
+                         mCurrentTokenIndex);
   }
 }
 

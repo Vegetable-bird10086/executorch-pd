@@ -134,7 +134,8 @@ class BufferAllocator : public executorch::runtime::MemoryAllocator {
 
   bool RemoveBuffer(void* address);
 
-  const MemoryUnit* Find(void* address);
+  const MemoryUnit* Find(
+      void* address, double* lockUs = nullptr, double* lookupUs = nullptr);
 
   void Clear();
 

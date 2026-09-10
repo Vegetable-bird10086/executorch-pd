@@ -28,6 +28,7 @@ struct MtkStageMajorChunkStats {
   double loadMs{0.0};
   double pipelineWaitMs{0.0};
   double executeMs{0.0};
+  double methodExecuteMs{0.0};
   double kvPackMs{0.0};
   double releaseMs{0.0};
   size_t rssAfterLoadBytes{0};

@@ -130,6 +130,8 @@ class LlamaModelChunk : public ModelChunk {
 
   void PrepareCacheIOs();
 
+  void UpdateCacheFromNewOutputs();
+
   size_t GetCacheStrideSize() const;
 
   size_t GetCacheNumRows() const;
@@ -182,6 +184,7 @@ class LlamaModelChunk : public ModelChunk {
 
   // Cache
   TensorShape mCacheShape;
+  bool mOutputNewCacheOnly{false};
   const LLMType kCacheType;
   const size_t kMaxTokenLength;
   const size_t kCacheLength;

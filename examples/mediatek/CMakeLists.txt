@@ -132,6 +132,15 @@ if(${ANDROID})
   # Build Llama Executor static library
   add_subdirectory(executor_runner/llama_runner)
 
+  # Optional isolated single-chunk experiment harness; absent in normal builds.
+  set(MTK_CHUNK_PROBE_SOURCE "" CACHE FILEPATH "Single-chunk probe source")
+  if(MTK_CHUNK_PROBE_SOURCE)
+    add_executable(mtk_chunk_probe "${MTK_CHUNK_PROBE_SOURCE}" "${EXECUTORCH_SOURCE_DIR}/extension/data_loader/file_data_loader.cpp")
+    target_include_directories(mtk_chunk_probe PRIVATE ${_common_include_directories})
+    target_link_libraries(mtk_chunk_probe ${_executor_runner_libs} neuron_backend mtk_llama_executor_lib)
+    target_compile_options(mtk_chunk_probe PRIVATE ${_common_compile_options})
+  endif()
+
   # Build Llama Executor Runner
   add_executable(mtk_llama_executor_runner ${_mtk_llama_executor_runner__srcs})
 

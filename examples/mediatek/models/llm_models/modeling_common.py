@@ -91,6 +91,7 @@ class Attention(nn.Module):
         )
         self.attn_scale = math.sqrt(self.head_dim)
         self.jit_trace = jit_trace
+        self.output_new_cache_only = getattr(config, "output_new_cache_only", False)
 
         if config.combine_qkv:
             self.qkv_proj = nn.Linear(
@@ -214,6 +215,9 @@ class Attention(nn.Module):
                 query_states, key_states, cos, sin
             )
 
+        # Keep only the new, unexpanded KV as graph outputs. History remains
+        # an input to attention; the host owns persistent cache updates.
+        new_key_states, new_value_states = key_states, value_states
         key_states = torch.cat([past_key, key_states], dim=2)
         value_states = torch.cat([past_value, value_states], dim=2)
         key_states_out = key_states
@@ -235,6 +239,9 @@ class Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
+
+        if self.output_new_cache_only:
+            return attn_output, new_key_states, new_value_states
 
         key_states_out = key_states_out[:, :, q_len:, :]
         value_states_out = value_states_out[:, :, q_len:, :]

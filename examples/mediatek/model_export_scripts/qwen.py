@@ -248,6 +248,13 @@ def get_argument_parser():
         ),
     )
     parser.add_argument(
+        "--output-new-cache-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Output only new KV tokens; the incremental-KV runner updates history. "
+        "Use --no-output-new-cache-only for legacy full-cache PTEs.",
+    )
+    parser.add_argument(
         "--compiler-accuracy-mode",
         action="store_true",
         help="Pass Neuropilot --opt-accuracy so compilation prioritizes accuracy over performance.",
@@ -369,6 +376,7 @@ def print_args(args, exp_name):
     print(f"LM head precision:            {args.lm_head_precision}")
     print(f"LM head shard size:           {args.lm_head_shard_size}")
     print(f"Exclude Prefill lm_head:      {args.prefill_no_lm_head}")
+    print(f"Output new KV only:           {args.output_new_cache_only}")
     print(f"Compiler accuracy mode:       {args.compiler_accuracy_mode}")
     print(f"Compiler optimization level:  {args.compiler_opt_level}")
     print(f"Converter diagnostic dump:    {args.converter_dump}")
@@ -449,9 +457,14 @@ def forward_and_save(
                 hidden_state, mask, pos_emb, *torch.split(cache_in, 1, dim=0)
             )
         hidden_state = model_out[0]
-        cache[chunk_idx] = torch.cat(
+        cache_out = torch.cat(
             model_out[1 : 1 + 2 * num_blocks_per_chunk[chunk_idx]], dim=0
-        ).clone()
+        )
+        if getattr(models[chunk_idx].config, "output_new_cache_only", False):
+            cache_out = torch.cat((cache_in, cache_out), dim=2)[
+                :, :, -cache_in.shape[2] :, :
+            ]
+        cache[chunk_idx] = cache_out.clone()
     return hidden_state, cache
 
 
@@ -1315,6 +1328,8 @@ def main():
         exp_name = (
             f"{get_exp_name(args.config)}_{args.precision}_{args.num_chunks}_chunks"
         )
+    if args.output_new_cache_only:
+        exp_name += "_new_kv_only"
     if args.layer_debug:
         exp_name += "_layer_debug_last_token"
     if args.operator_debug_layer is not None:
@@ -1352,6 +1367,7 @@ def main():
     config, weight_dir, tokenizer_class, chunk_class = resolve_model_classes(
         args.config
     )
+    config.output_new_cache_only = args.output_new_cache_only
     tokenizer = tokenizer_class.from_pretrained(weight_dir)
     if args.preformatter is not None:
         preformatter = Preformatter(args.preformatter)
