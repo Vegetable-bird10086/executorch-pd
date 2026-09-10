@@ -8,6 +8,7 @@ fbcode_target(_kind = runtime.python_library,
     ],
     visibility = ["PUBLIC"],
     deps = [
+        "//executorch/backends/mediatek/_passes:passes",
         "//executorch/exir/_serialize:lib",
         "//executorch/exir/backend:backend_api",
         "//executorch/exir/passes:lib",
@@ -23,5 +24,6 @@ fbcode_target(_kind = runtime.python_library,
     visibility = ["PUBLIC"],
     deps = [
         ":preprocess",
+        "//executorch/backends/mediatek/_passes:passes",
     ],
 )

@@ -1204,6 +1204,18 @@ def export_to_et_ir(
             handle.write("\n")
     if dump_qweights:
         dump_converted_qweights(converted_graph, output_folder, chunk_idx)
+    # Rewrite only after calibration and direct-qparam replacement, retaining
+    # the validated quantization boundaries while avoiding expanded KV tensors.
+    from aot_utils.llm_utils.grouped_gqa import group_gqa_matmuls
+    grouped_gqa_nodes = group_gqa_matmuls(
+        converted_graph, model.config.num_attention_heads,
+        model.config.num_key_value_heads,
+    )
+    os.makedirs(output_folder, exist_ok=True)
+    with open(os.path.join(output_folder, f"grouped_gqa_chunk_{chunk_idx}.json"), "w") as handle:
+        json.dump(grouped_gqa_nodes, handle, indent=2)
+    print(f"Grouped GQA: rewrote {len(grouped_gqa_nodes)} attention matmuls")
+
     if layer_debug:
         converted_graph = append_layer_debug_outputs(converted_graph, model.num_blocks)
     if operator_debug_local_layer is not None:
@@ -1238,7 +1250,7 @@ def export_to_et_ir(
         )
 
         method_to_edge_program[f"{model_fname}"] = exir.to_edge(
-            aten_dialect
+            aten_dialect, compile_config=edge_compile_config
         ).exported_program()
         del aten_dialect
 

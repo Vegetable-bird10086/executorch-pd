@@ -8,6 +8,9 @@ from typing import Callable, final, List, Optional, Tuple
 
 import torch
 from executorch.backends.mediatek.preprocess import NeuropilotBackend
+from executorch.backends.mediatek._passes.normalize_clone_dim_order import (
+    normalized_clone,
+)
 from executorch.exir.backend.backend_details import CompileSpec
 from executorch.exir.backend.partitioner import (
     DelegationSpec,
@@ -55,6 +58,13 @@ class NeuropilotOperatorsSupport(OperatorSupportBase):
             )
             return False
 
+        clone = normalized_clone(node)
+        if clone is not None:
+            # Query the exact representation used by preprocess; keep the
+            # partition graph intact for ExecuTorch's graph validation.
+            if clone.target.__name__ in self._op_types_to_skip:
+                return False
+            return importer_v2.is_fx_node_supported(clone)
         return importer_v2.is_fx_node_supported(node)
 
 

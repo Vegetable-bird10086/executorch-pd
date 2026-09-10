@@ -15,6 +15,9 @@ from typing import Dict, final, List
 import mtk_converter
 import mtk_neuron
 import torch
+from executorch.backends.mediatek._passes.normalize_clone_dim_order import (
+    normalize_clone_dim_order,
+)
 from executorch.exir._serialize._named_data_store import NamedDataStore
 from executorch.exir.backend.backend_details import (
     BackendDetails,
@@ -128,6 +131,7 @@ class NeuropilotBackend(BackendDetails):
                 value = spec.value.decode("utf-8")
                 compile_options.append(f"--{spec.key}={value}")
 
+        normalize_clone_dim_order(edge_program.graph_module)
         converter = mtk_converter.PyTorchV2Converter.from_exported_program(edge_program)
         converter.quantize = True
         converter.input_quantization_bitwidths = None
