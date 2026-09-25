@@ -24,7 +24,7 @@ struct QnnKvAbiStats {
 // only for PD handoff; normal MTK generation never constructs this object.
 class QnnKvAbi {
  public:
-  explicit QnnKvAbi(const std::string& path);
+  explicit QnnKvAbi(const std::string& path, bool llama3Layout = false);
 
   size_t NumLayers() const;
   size_t NumHeads() const;
@@ -72,6 +72,7 @@ class QnnKvAbi {
   size_t numLayers_{0};
   size_t numHeads_{0};
   size_t headDim_{0};
+  bool llama3Layout_{false};
   std::vector<Layer> layers_;
 };
 

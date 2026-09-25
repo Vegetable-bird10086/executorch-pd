@@ -550,6 +550,11 @@ def prepare_model_inputs(
 def calibrate_model(
     model, cal_dataset, chunk_idx: str, prompt_only=False, response_steps=0
 ):
+    # HF Dataset iteration materializes nested Arrow columns into Python lists.
+    # Only this chunk is consumed here; avoid expanding other chunks' KV caches.
+    # The low-memory export path also accepts a plain list, so keep it supported.
+    if hasattr(cal_dataset, "select_columns"):
+        cal_dataset = cal_dataset.select_columns([chunk_idx])
     with torch.no_grad():
         for inp in tqdm(cal_dataset, desc="Calibrating Model: "):
             # pass prompt and response
@@ -1283,6 +1288,7 @@ def export_to_et_ir(
 
     kv_method_files = []
     method_to_edge_program = {}
+    non_kv_output_shapes = {}
     method_to_partitioner = {}
     edge_compile_config = exir.EdgeCompileConfig(_check_ir_validity=False)
 
@@ -1315,7 +1321,12 @@ def export_to_et_ir(
             ep = method_to_edge_program[model_fname]
             cache_names = [name for name in ep.graph_signature.user_inputs if name.startswith("cache_")]
             output_names = ep.graph_signature.user_outputs[-len(cache_names):]
-            qparams_path = os.path.abspath(os.path.join(output_folder, "kv_io", f"{shape}.json"))
+            non_kv_names = ep.graph_signature.user_outputs[:-len(cache_names)]
+            nodes = {node.name: node for node in ep.graph.nodes}
+            non_kv_output_shapes[model_fname] = [
+                list(nodes[name].meta["val"].shape) for name in non_kv_names
+            ]
+            qparams_path = os.path.abspath(os.path.join(output_folder, "kv_io", f"chunk_{chunk_idx}", f"{shape}.json"))
             kv_method_files.append(qparams_path)
             compile_spec.append(CompileSpec(SPEC_KEY, json.dumps({
                 "ar": ntok_and_cache[0], "qparams_path": qparams_path,
@@ -1360,15 +1371,27 @@ def export_to_et_ir(
     dest_path = get_dest_path(output_folder, exp_name, None, chunk_idx)
     print(f"{exp_name} ET Model chunk {chunk_idx} Dest: {dest_path}\n")
     os.makedirs(dest_path.rsplit("/", 1)[0], exist_ok=True)
-    with open(dest_path, "wb") as file:
-        if shared_kv_quantization:
-            from executorch.backends.mediatek.quantized_kv_io import finalize_kv_io
-            finalize_kv_io(
-                executorch_program.buffer, kv_method_files, model.num_blocks * 2,
-                os.path.join(output_folder, "kv_io_qparams.txt"),
-            ).write_to_file(file)
+    finalized = None
+    if shared_kv_quantization:
+        from executorch.backends.mediatek.quantized_kv_io import finalize_kv_io
+        # Validate before opening the destination: failure must not truncate PTE.
+        sidecar_path = dest_path + ".kv_io_qparams.txt"
+        finalized = finalize_kv_io(
+            executorch_program.buffer, kv_method_files, model.num_blocks * 2,
+            sidecar_path, expected_output_shapes=non_kv_output_shapes,
+        )
+        with open(dest_path + ".non_kv_outputs.json", "w") as handle:
+            json.dump(non_kv_output_shapes, handle, indent=2)
+        # Preserve legacy single-chunk consumers, but retain every chunk's copy.
+        with open(sidecar_path) as source, open(os.path.join(output_folder, "kv_io_qparams.txt"), "w") as target:
+            target.write(source.read())
+    partial_path = dest_path + ".partial"
+    with open(partial_path, "wb") as file:
+        if finalized is not None:
+            finalized.write_to_file(file)
         else:
             file.write(executorch_program.buffer)
+    os.replace(partial_path, dest_path)
 
 
 def main():

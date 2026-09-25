@@ -42,6 +42,8 @@ class ReadOnlyMappedFile {
   std::string inherited_fd_spec() const;
   void discard_resident_pages() const;
   Residency residency() const;
+  void discard_shared_range(size_t offset, size_t length);
+  void restore_shared_range(const std::string& path, size_t offset, size_t length);
 
  private:
   enum class Backing {

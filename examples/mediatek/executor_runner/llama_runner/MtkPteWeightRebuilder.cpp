@@ -240,6 +240,7 @@ constexpr uint32_t kGgufTensorTypeGptq2_32 = 42;
 constexpr uint32_t kGgufTensorTypeI8 = 24;
 constexpr uint32_t kGgufTensorTypeF16 = 1;
 constexpr uint32_t kGgufTensorTypeGptq2PcI8mm = 47;
+constexpr uint32_t kGgufFlagLlamaRopeRows = 1U << 31;
 
 enum class GgufValueType : uint32_t {
   Uint8 = 0, Int8 = 1, Uint16 = 2, Int16 = 3, Uint32 = 4,
@@ -255,6 +256,7 @@ struct MtkGgufRecord {
   uint32_t rows{0};
   uint32_t cols{0};
   uint32_t kind{0};
+  uint32_t flags{0};
   const uint8_t* tensor{nullptr};
   size_t tensorBytes{0};
   const uint8_t* scale{nullptr};
@@ -576,31 +578,30 @@ inline uint8x8_t ExtractW2Lane(uint8x8_t packed) {
 }
 
 template <int LowShift, int HighShift>
-inline uint8x8_t PackExpandedW2Pair(uint8x8_t qbyte) {
+inline uint8x8_t PackCenteredW2Pair(uint8x8_t qbyte, uint8x8_t zeroPoint) {
   const uint8x8_t mask = vdup_n_u8(0xF);
-  // The MTK A16W4 exporter requantizes a per-channel W2 row across the full
-  // signed-int4 range.  For the four populated W2 codes this is exactly
-  // q4 = 5 * code - 8, i.e. {0,1,2,3} -> {-8,-3,2,7}.  Express -8 as +8
-  // modulo 16 so the whole transform stays in packed integer SIMD.
-  const uint8x8_t five = vdup_n_u8(5);
-  const uint8x8_t eight = vdup_n_u8(8);
+  // Direct per-channel export injects centered W2 integers into the signed
+  // INT4 MTK container. Subtraction wraps modulo 16, exactly matching the
+  // two's-complement nibble representation stored in the PTE.
   const uint8x8_t low = vand_u8(
-      vadd_u8(vmul_u8(ExtractW2Lane<LowShift>(qbyte), five), eight), mask);
+      vsub_u8(ExtractW2Lane<LowShift>(qbyte), zeroPoint), mask);
   const uint8x8_t high = vand_u8(
-      vadd_u8(vmul_u8(ExtractW2Lane<HighShift>(qbyte), five), eight), mask);
+      vsub_u8(ExtractW2Lane<HighShift>(qbyte), zeroPoint), mask);
   return vorr_u8(low, vshl_n_u8(high, 4));
 }
 
-inline uint8x8x4_t PackExpandedW2Tile8(uint8x16_t qbytePairs) {
+inline uint8x8x4_t PackCenteredW2Tile8(
+    uint8x16_t qbytePairs,
+    uint8x8_t zeroPoint) {
   const uint8x8_t lowHalf = vget_low_u8(qbytePairs);
   const uint8x8_t highHalf = vget_high_u8(qbytePairs);
   const uint8x8_t lowQbyte = vuzp1_u8(lowHalf, highHalf);
   const uint8x8_t highQbyte = vuzp2_u8(lowHalf, highHalf);
   uint8x8x4_t output;
-  output.val[0] = PackExpandedW2Pair<0, 2>(lowQbyte);
-  output.val[1] = PackExpandedW2Pair<4, 6>(lowQbyte);
-  output.val[2] = PackExpandedW2Pair<0, 2>(highQbyte);
-  output.val[3] = PackExpandedW2Pair<4, 6>(highQbyte);
+  output.val[0] = PackCenteredW2Pair<0, 2>(lowQbyte, zeroPoint);
+  output.val[1] = PackCenteredW2Pair<4, 6>(lowQbyte, zeroPoint);
+  output.val[2] = PackCenteredW2Pair<0, 2>(highQbyte, zeroPoint);
+  output.val[3] = PackCenteredW2Pair<4, 6>(highQbyte, zeroPoint);
   return output;
 }
 
@@ -634,135 +635,82 @@ void MaterializeGptq2PerChannelI8mmToMtkInt4(
         "Unsupported MTK per-channel W2 record dimensions or precision");
   }
   const size_t groups = record.cols / 32;
+  const auto sourceRowFor = [&](size_t rawRow) {
+    if ((record.flags & kGgufFlagLlamaRopeRows) == 0) {
+      return rawRow;
+    }
+    const size_t heads = record.flags & 0xFFFFU;
+    if (heads == 0 || record.rows % heads != 0 ||
+        (record.rows / heads) % 2 != 0) {
+      throw std::runtime_error("Invalid Llama Q/K row-layout flags");
+    }
+    const size_t headDim = record.rows / heads;
+    const size_t half = headDim / 2;
+    const size_t within = rawRow % headDim;
+    return (rawRow / headDim) * headDim +
+        (within % half) * 2 + within / half;
+  };
 #if defined(__ARM_NEON) && defined(__aarch64__)
   const size_t rowStride = 16;
   const size_t planeStride = record.rows * record.cols / 8;
   for (size_t rowBase = 0; rowBase < record.rows; rowBase += 8) {
-    const size_t nativeTile = rowBase / 16;
-    const size_t rowInTile = rowBase % 16;
+    uint8_t gatheredZeroPoint[8];
+    for (size_t lane = 0; lane < 8; ++lane) {
+      gatheredZeroPoint[lane] = record.zeroPoint[sourceRowFor(rowBase + lane)];
+    }
+    const uint8x8_t zeroPoint = vld1_u8(gatheredZeroPoint);
     for (size_t group = 0; group < groups; ++group) {
-      const uint8_t* nativeRows = record.tensor +
-          ((nativeTile * groups + group) * 16 + rowInTile) * 8;
+      uint8_t gatheredRows[64];
+      for (size_t lane = 0; lane < 8; ++lane) {
+        const size_t sourceRow = sourceRowFor(rowBase + lane);
+        const uint8_t* source = record.tensor +
+            (((sourceRow / 16) * groups + group) * 16 +
+             sourceRow % 16) * 8;
+        std::memcpy(gatheredRows + lane * 8, source, 8);
+      }
+      const uint8_t* nativeRows = gatheredRows;
       const size_t baseOffset = MtkInt4Offset(
           rowBase, group * 32, record.rows, record.cols);
       StoreMtkTile8Rows(
           destination + baseOffset + 0,
           rowStride,
           planeStride,
-          PackExpandedW2Tile8(PackI8mmNativeQbytes8<0>(nativeRows)));
+          PackCenteredW2Tile8(
+              PackI8mmNativeQbytes8<0>(nativeRows), zeroPoint));
       StoreMtkTile8Rows(
           destination + baseOffset + 4,
           rowStride,
           planeStride,
-          PackExpandedW2Tile8(PackI8mmNativeQbytes8<2>(nativeRows)));
+          PackCenteredW2Tile8(
+              PackI8mmNativeQbytes8<2>(nativeRows), zeroPoint));
       StoreMtkTile8Rows(
           destination + baseOffset + 8,
           rowStride,
           planeStride,
-          PackExpandedW2Tile8(PackI8mmNativeQbytes8<4>(nativeRows)));
+          PackCenteredW2Tile8(
+              PackI8mmNativeQbytes8<4>(nativeRows), zeroPoint));
       StoreMtkTile8Rows(
           destination + baseOffset + 12,
           rowStride,
           planeStride,
-          PackExpandedW2Tile8(PackI8mmNativeQbytes8<6>(nativeRows)));
-    }
-  }
-
-  // The common 0..3 row is fully handled above.  Rare narrower-code rows are
-  // overwritten with their exact integer-only affine expansion below.
-  for (size_t row = 0; row < record.rows; ++row) {
-    const int minimum = record.codeMin[row];
-    const int maximum = record.codeMax[row];
-    if (minimum == 0 && maximum == 3) {
-      continue;
-    }
-    const int sourceZero = record.zeroPoint[row];
-    const int range = maximum - minimum;
-    const bool truncateHalf = record.requantMode[row] != 0;
-    const auto roundRatioEven = [](int numerator, int denominator) {
-      const int sign = numerator < 0 ? -1 : 1;
-      const int absolute = std::abs(numerator);
-      int quotient = absolute / denominator;
-      const int remainder = absolute % denominator;
-      if (2 * remainder > denominator ||
-          (2 * remainder == denominator && (quotient & 1))) {
-        ++quotient;
-      }
-      return sign * quotient;
-    };
-    const auto roundForRow = [&](int numerator) {
-      return truncateHalf ? numerator / range
-                          : roundRatioEven(numerator, range);
-    };
-    const int targetZero = range == 0
-        ? 0
-        : std::max(-8, std::min(7,
-              -8 - roundForRow((minimum - sourceZero) * 15)));
-    const auto expand = [&](uint8_t code) {
-      if (range == 0) {
-        return static_cast<uint8_t>((code > sourceZero ? 7 : -8) & 0xF);
-      }
-      const int value = std::max(-8, std::min(7,
-          roundForRow((static_cast<int>(code) - sourceZero) * 15) +
-              targetZero));
-      return static_cast<uint8_t>(value & 0xF);
-    };
-    for (size_t col = 0; col < record.cols; col += 2) {
-      const auto codeFor = [&](size_t column) {
-        const size_t group = column / 32;
-        const size_t tileColumn = (column % 32) / 8;
-        const size_t within = column % 8;
-        const size_t sourceOffset =
-            (((row / 16) * groups + group) * 16 + row % 16) * 8 + within;
-        return static_cast<uint8_t>(
-            (record.tensor[sourceOffset] >> (tileColumn * 2)) & 0x3);
-      };
-      destination[MtkInt4Offset(row, col, record.rows, record.cols)] =
-          static_cast<uint8_t>(expand(codeFor(col)) |
-              (expand(codeFor(col + 1)) << 4));
+          PackCenteredW2Tile8(
+              PackI8mmNativeQbytes8<6>(nativeRows), zeroPoint));
     }
   }
 #else
   std::memset(destination, 0, static_cast<size_t>(record.length));
   for (size_t row = 0; row < record.rows; ++row) {
+    const size_t sourceRow = sourceRowFor(row);
     for (size_t col = 0; col < record.cols; ++col) {
       const size_t group = col / 32;
       const size_t tileColumn = (col % 32) / 8;
       const size_t within = col % 8;
       const size_t sourceOffset =
-          (((row / 16) * groups + group) * 16 + row % 16) * 8 + within;
+          (((sourceRow / 16) * groups + group) * 16 + sourceRow % 16) * 8 + within;
       const uint8_t code = static_cast<uint8_t>(
           (record.tensor[sourceOffset] >> (tileColumn * 2)) & 0x3);
-      const int minimum = record.codeMin[row];
-      const int maximum = record.codeMax[row];
-      const int sourceZero = record.zeroPoint[row];
-      const int range = maximum - minimum;
-      const bool truncateHalf = record.requantMode[row] != 0;
-      const auto roundRatioEven = [](int numerator, int denominator) {
-        const int sign = numerator < 0 ? -1 : 1;
-        const int absolute = std::abs(numerator);
-        int quotient = absolute / denominator;
-        const int remainder = absolute % denominator;
-        if (2 * remainder > denominator ||
-            (2 * remainder == denominator && (quotient & 1))) {
-          ++quotient;
-        }
-        return sign * quotient;
-      };
-      int quantized;
-      if (range == 0) {
-        quantized = code > sourceZero ? 7 : -8;
-      } else {
-        const auto roundForRow = [&](int numerator) {
-          return truncateHalf ? numerator / range
-                              : roundRatioEven(numerator, range);
-        };
-        const int targetZero = std::max(-8, std::min(7,
-            -8 - roundForRow((minimum - sourceZero) * 15)));
-        quantized = std::max(-8, std::min(7,
-            roundForRow((static_cast<int>(code) - sourceZero) * 15) +
-                targetZero));
-      }
+      const int quantized =
+          static_cast<int>(code) - static_cast<int>(record.zeroPoint[sourceRow]);
       const uint8_t nibble = static_cast<uint8_t>(quantized & 0xF);
       const size_t offset =
           MtkInt4Offset(row, col, record.rows, record.cols);
@@ -1060,7 +1008,7 @@ std::shared_ptr<MtkGgufPteRecipe> PrepareMtkGgufPteRecipe(
     MtkGgufRecord record{
         ReadU64(ptr), ReadU64(ptr + 8), ReadU32(ptr + 16),
         ReadU32(ptr + 20), ReadU32(ptr + 24), ReadU32(ptr + 28),
-        ReadU32(ptr + 32), nullptr, 0};
+        ReadU32(ptr + 32), ReadU32(ptr + 36), nullptr, 0};
     const std::string tensorName = "blk." + std::to_string(record.layer) + "." +
         GgufOpName(record.op) + ".weight";
     const auto& tensor = source->Tensor(tensorName);

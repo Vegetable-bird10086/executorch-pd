@@ -39,6 +39,11 @@ class QnnManager {
   // graph name will be obtained from the binary.
   executorch::runtime::Error InitContext(
       std::optional<std::vector<std::string>> graph_names = std::nullopt);
+  executorch::runtime::Error PrepareContextForBatch();
+  executorch::runtime::Error FinishContextAfterBatch();
+  static executorch::runtime::Error BatchRestoreContexts(
+      const std::vector<QnnManager*>& managers);
+
   // This function only initialize the context cache to get spill fill buffer
   // size
   executorch::runtime::Error InitContextCache();

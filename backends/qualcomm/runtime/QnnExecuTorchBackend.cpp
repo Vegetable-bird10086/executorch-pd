@@ -249,6 +249,71 @@ Result<DelegateHandle*> QnnExecuTorchBackend::init(
       Internal,
       "Fail to initialize Qnn Manager");
   const double init_backend_ms = elapsed_ms(init_backend_start);
+  size_t batch_context_count = 0;
+  if (const char* value = std::getenv("ET_QNN_BATCH_CONTEXT_COUNT")) {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end != value && *end == '\0' && parsed > 1) {
+      batch_context_count = static_cast<size_t>(parsed);
+    } else {
+      QNN_EXECUTORCH_LOG_WARN(
+          "Ignoring invalid ET_QNN_BATCH_CONTEXT_COUNT=%s", value);
+    }
+  }
+
+  if (batch_context_count > 1) {
+    ET_CHECK_OR_RETURN_ERROR(
+        status == Error::Ok,
+        InvalidArgument,
+        "Batch context restore requires QNN context custom protocol data");
+    ET_CHECK_OR_RETURN_ERROR(
+        qnn_manager->PrepareContextForBatch() == Error::Ok,
+        Internal,
+        "Fail to prepare QNN Manager for batch restore");
+    add_cached_delegate(signature, qnn_manager);
+    qnn_manager_owner.release();
+    pending_batch_contexts_.push_back(qnn_manager);
+
+    if (pending_batch_contexts_.size() < batch_context_count) {
+      QNN_EXECUTORCH_LOG_INFO(
+          "Deferred QNN context restore for batch: queued=%zu expected=%zu",
+          pending_batch_contexts_.size(),
+          batch_context_count);
+      g_last_initialized_backend = this;
+      g_last_initialized_handle = qnn_manager;
+      g_last_initialized_method = context.get_method_name();
+      return qnn_manager;
+    }
+    ET_CHECK_OR_RETURN_ERROR(
+        pending_batch_contexts_.size() == batch_context_count,
+        InvalidState,
+        "Collected more QNN contexts than ET_QNN_BATCH_CONTEXT_COUNT");
+    ET_CHECK_OR_RETURN_ERROR(
+        QnnManager::BatchRestoreContexts(pending_batch_contexts_) == Error::Ok,
+        Internal,
+        "Fail to batch restore QNN contexts");
+    for (QnnManager* pending : pending_batch_contexts_) {
+      ET_CHECK_OR_RETURN_ERROR(
+          pending->FinishContextAfterBatch() == Error::Ok,
+          Internal,
+          "Fail to finish batch-restored QNN Manager");
+      for (const std::string& graph_name : pending->GetGraphNames()) {
+        ET_CHECK_OR_RETURN_ERROR(
+            pending->AllocateTensor(graph_name) == Error::Ok,
+            Internal,
+            "Fail to allocate tensor for batch-restored QNN context");
+      }
+    }
+    pending_batch_contexts_.clear();
+    g_last_initialized_backend = this;
+    g_last_initialized_handle = qnn_manager;
+    g_last_initialized_method = context.get_method_name();
+    QNN_EXECUTORCH_LOG_INFO(
+        "Completed QNN batch context restore: contexts=%zu",
+        batch_context_count);
+    return qnn_manager;
+  }
+
 
   const auto init_context_start = Clock::now();
   ET_CHECK_OR_RETURN_ERROR(

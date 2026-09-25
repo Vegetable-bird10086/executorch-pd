@@ -146,6 +146,7 @@ DEFINE_uint64(eos_token, 128001, "EOS token id.");
 
 // Inference
 DEFINE_uint64(max_response, 50, "Maximum number of tokens to generate.");
+DEFINE_string(overall_tokens_path, "", "Frozen uint64 input for pure MTK Overall PP(N-1)/TG32; no PD decode.");
 DEFINE_string(prompt_file, "", "File containing the prompt text.");
 DEFINE_bool(
     prefill_only,
@@ -163,6 +164,10 @@ DEFINE_string(
     "PD-only QNN U8 KV ABI generated from the matching Decode profile. "
     "When set, MTK Prefill additionally emits byte-exact QNN-domain KV; "
     "normal MTK generation is unchanged.");
+DEFINE_string(
+    pd_decoder_model_version,
+    "qwen3",
+    "PD Decode model family. Supported values: qwen3, llama3.");
 DEFINE_string(
     pd_prompt_tokens_path,
     "",
@@ -526,7 +531,8 @@ void write_pd_handoff(
   ET_CHECK_MSG(manifest.good(), "Unable to open PD manifest in %s", exportDir.c_str());
   manifest << "{\n"
            << "  \"format_version\": \"pd-handoff-v1\",\n"
-           << "  \"decoder_model_version\": \"qwen3\",\n"
+           << "  \"decoder_model_version\": \"" << FLAGS_pd_decoder_model_version
+           << "\",\n"
            << "  \"context_length\": " << FLAGS_max_token_length << ",\n"
            << "  \"prompt_length\": " << promptTokens.size() << ",\n"
            << "  \"original_prompt_length\": " << promptTokens.size() << ",\n"
@@ -594,7 +600,8 @@ void write_stage_major_pd_handoff(
   ET_CHECK_MSG(manifest.good(), "Unable to open PD manifest in %s", exportDir.c_str());
   manifest << "{\n"
            << "  \"format_version\": \"pd-handoff-v1\",\n"
-           << "  \"decoder_model_version\": \"qwen3\",\n"
+           << "  \"decoder_model_version\": \"" << FLAGS_pd_decoder_model_version
+           << "\",\n"
            << "  \"context_length\": " << FLAGS_max_token_length << ",\n"
            << "  \"prompt_length\": " << cachedPromptTokens.size() << ",\n"
            << "  \"original_prompt_length\": " << cachedPromptTokens.size() + 1 << ",\n"
@@ -1213,7 +1220,14 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<QnnKvAbi> qnnKvAbi;
     if (!FLAGS_pd_qnn_kv_abi_path.empty()) {
-      qnnKvAbi = std::make_unique<QnnKvAbi>(FLAGS_pd_qnn_kv_abi_path);
+      ET_CHECK_MSG(
+          FLAGS_pd_decoder_model_version == "qwen3" ||
+              FLAGS_pd_decoder_model_version == "llama3",
+          "Unsupported --pd_decoder_model_version=%s",
+          FLAGS_pd_decoder_model_version.c_str());
+      qnnKvAbi = std::make_unique<QnnKvAbi>(
+          FLAGS_pd_qnn_kv_abi_path,
+          FLAGS_pd_decoder_model_version == "llama3");
       ET_CHECK_MSG(
           qnnKvAbi->NumLayers() == FLAGS_num_layer &&
               qnnKvAbi->HeadDim() == FLAGS_head_dim,
@@ -1435,6 +1449,52 @@ int main(int argc, char** argv) {
   timer_init.End();
 
   // Run model
+  if (!FLAGS_overall_tokens_path.empty()) {
+    ET_CHECK_MSG(FLAGS_prompt_file.empty() && FLAGS_pd_export_dir.empty() &&
+        FLAGS_pd_prompt_tokens_path.empty() && FLAGS_mtk_ppl_output.empty(),
+        "Overall mode cannot be combined with other input modes");
+    const auto tokens = load_pd_prompt_tokens(FLAGS_overall_tokens_path);
+    ET_CHECK_MSG(tokens.size() >= 2 && tokens.size() + 32 <= FLAGS_cache_size,
+                 "Overall input exceeds context capacity");
+    for (auto token : tokens) ET_CHECK_MSG(token < FLAGS_vocab_size, "Invalid token id");
+    // Initialization-only AR1 warmup. Clear its KV before the frozen request.
+    llama_runtime.SwapModel(1);
+    llama_runtime.Run({tokens.front()});
+    llama_runtime.Reset();
+    llama_runtime.SwapModel(model_options.prompt_token_batch_size);
+    using OverallClock = std::chrono::steady_clock;
+    const auto ppBegin = OverallClock::now();
+    const size_t ppCount = tokens.size() - 1;
+    for (size_t pos = 0; pos < ppCount;) {
+      const size_t remaining = ppCount - pos;
+      const size_t remainder = remaining % model_options.prompt_token_batch_size;
+      const size_t count = remainder ? remainder : model_options.prompt_token_batch_size;
+      llama_runtime.Run(std::vector<uint64_t>(tokens.begin()+pos, tokens.begin()+pos+count));
+      pos += count;
+    }
+    const auto tgBegin = OverallClock::now();
+    // Include prompt-tail inference, model switch and greedy sampling in TG.
+    llama_runtime.SwapModel(1);
+    uint64_t current = tokens.back();
+    std::vector<uint64_t> generated;
+    generated.reserve(32);
+    for (int i = 0; i < 32; ++i) {
+      void* logits = llama_runtime.Run({current});
+      current = argmax(model_options.model_output_type, logits, FLAGS_vocab_size);
+      generated.push_back(current); // Fixed TG32 deliberately does not stop on EOS.
+    }
+    const auto end = OverallClock::now();
+    const double ppMs = std::chrono::duration<double, std::milli>(tgBegin-ppBegin).count();
+    const double tgMs = std::chrono::duration<double, std::milli>(end-tgBegin).count();
+    std::cout << std::fixed << std::setprecision(6)
+      << "{\"prompt_tokens\":" << tokens.size()
+      << ",\"prefill_tokens\":" << ppCount << ",\"generated_tokens\":32"
+      << ",\"prefill_ms\":" << ppMs << ",\"decode_ms\":" << tgMs << ",\"tokens\":[";
+    for (size_t i=0;i<generated.size();++i) std::cout << (i ? "," : "") << generated[i];
+    std::cout << "],\"backend\":\"pure_mtk\"}" << std::endl;
+    llama_runtime.Release();
+    return 0;
+  }
   const bool mtkPplMode = !FLAGS_mtk_ppl_output.empty();
   ET_CHECK_MSG(
       !FLAGS_prompt_file.empty() || !FLAGS_pd_prompt_tokens_path.empty() ||

@@ -24,6 +24,7 @@
 #include <limits>
 #include <fcntl.h>
 #include <linux/memfd.h>
+#include <linux/falloc.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -35,6 +36,53 @@
 #include <vector>
 
 namespace example {
+
+void ReadOnlyMappedFile::discard_shared_range(size_t offset, size_t length) {
+  const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  if (backing_ != Backing::SharedMemory || offset > size_ ||
+      length > size_ - offset || !length || offset % page || length % page) {
+    throw std::runtime_error("Invalid deferred shared-model range");
+  }
+  if (::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                  static_cast<off_t>(offset), static_cast<off_t>(length)) != 0) {
+    throw std::runtime_error("Failed to release output pages: " + std::string(std::strerror(errno)));
+  }
+}
+
+void ReadOnlyMappedFile::restore_shared_range(
+    const std::string& path, size_t offset, size_t length) {
+  const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  if (backing_ != Backing::SharedMemory || offset > size_ ||
+      length > size_ - offset || !length || offset % page || length % page) {
+    throw std::runtime_error("Invalid output restore range");
+  }
+  FILE* source = std::fopen(path.c_str(), "rb");
+  if (!source) throw std::runtime_error("Cannot open deferred weight source");
+  struct stat metadata {};
+  if (::fstat(::fileno(source), &metadata) != 0 ||
+      static_cast<size_t>(metadata.st_size) != size_ ||
+      ::fseeko(source, static_cast<off_t>(offset), SEEK_SET) != 0) {
+    std::fclose(source);
+    throw std::runtime_error("Invalid deferred weight source");
+  }
+  auto* destination = const_cast<uint8_t*>(data_) + offset;
+  if (::mprotect(destination, length, PROT_READ | PROT_WRITE) != 0) {
+    std::fclose(source);
+    throw std::runtime_error("Cannot write deferred output pages");
+  }
+  size_t copied = 0;
+  while (copied < length) {
+    const size_t n = std::fread(destination + copied, 1,
+        std::min<size_t>(length - copied, 8U * 1024U * 1024U), source);
+    if (!n) break;
+    copied += n;
+  }
+  std::fclose(source);
+  const bool protected_ok = ::mprotect(destination, length, PROT_READ) == 0;
+  if (copied != length || !protected_ok) {
+    throw std::runtime_error("Deferred output restore incomplete");
+  }
+}
 
 ReadOnlyMappedFile::ReadOnlyMappedFile(
     int fd,
@@ -341,8 +389,10 @@ constexpr std::array<const char*, 7> kForwardTargetOps = {
 };
 
 constexpr uint32_t kBinaryIndexMagic = 0x49515445U;
-constexpr uint16_t kBinaryIndexVersion = 2;
+constexpr uint16_t kBinaryIndexVersion = 4;
 constexpr uint16_t kBinaryIndexHeaderSizeV1 = 32;
+constexpr uint16_t kBinaryIndexHeaderSizeV3 = 36;
+constexpr uint16_t kBinaryIndexHeaderSizeV4 = 40;
 constexpr uint16_t kBinaryIndexRecordSize = 20;
 constexpr uint8_t kWeightKindOutputConv = 0;
 constexpr uint8_t kWeightKindDecoderLinear = 1;
@@ -579,6 +629,10 @@ struct ParsedIndex {
   size_t final_size{0};
   size_t total_deleted{0};
   size_t num_splits{1};
+  size_t llama_rope_q_heads{0};
+  size_t llama_rope_kv_heads{0};
+  size_t llama_rope_q_permutations{0};
+  size_t llama_rope_kv_permutations{0};
   std::vector<RebuildRecord> records;
 };
 
@@ -775,7 +829,8 @@ GgufView parse_gguf(const uint8_t* gguf_data, size_t gguf_size) {
     if (key == "general.gptq2_32.layout" &&
         value_type == GgufValueType::STRING) {
       const std::string layout = read_gguf_string(gguf_data, &cursor);
-      if (layout != "gs32_source_v1" && layout != "i8mm_native_v1") {
+      if (layout != "gs32_source_v1" && layout != "i8mm_native_v1" &&
+          layout != "row_major_v1__") {
         throw std::runtime_error("Unsupported GPTQ2_32 GGUF source layout");
       }
       out.gptq2_32_gs32_source = layout == "gs32_source_v1";
@@ -870,6 +925,25 @@ ParsedIndex parse_binary_index(const std::vector<uint8_t>& index_bytes) {
   out.final_size = static_cast<size_t>(read_u64_le(index_bytes.data() + 24));
   out.total_deleted = out.old_size - out.final_size;
   out.num_splits = version >= 2 ? std::max<size_t>(1, read_u16_le(index_bytes.data() + 10)) : 1;
+  if (version >= 3) {
+    if (header_size < kBinaryIndexHeaderSizeV3) {
+      throw std::runtime_error("Binary index v3 header is too small");
+    }
+    out.llama_rope_q_heads = read_u16_le(index_bytes.data() + 32);
+    out.llama_rope_kv_heads = read_u16_le(index_bytes.data() + 34);
+  }
+  if (version >= 4) {
+    if (header_size < kBinaryIndexHeaderSizeV4) {
+      throw std::runtime_error("Binary index v4 header is too small");
+    }
+    out.llama_rope_q_permutations = index_bytes[36];
+    out.llama_rope_kv_permutations = index_bytes[37];
+  } else {
+    // V3 encoded only heads and historically applied the row mapping twice.
+    out.llama_rope_q_permutations = out.llama_rope_q_heads > 0 ? 2 : 0;
+    out.llama_rope_kv_permutations = out.llama_rope_kv_heads > 0 ? 2 : 0;
+  }
+
 
   const size_t expected_size =
       static_cast<size_t>(header_size) + static_cast<size_t>(record_count) * record_size;
@@ -1953,9 +2027,127 @@ void write_int4_block_from_gptq2_i8mm_native(
 void write_int4_block_from_gptq2_direct(
     const DirectGptq2TensorView& tensor,
     int block_id,
-    uint8_t* dst) {
+    uint8_t* dst,
+    size_t rope_heads = 0,
+    size_t rope_permutations = 0) {
   if (block_id < 0) {
     throw std::runtime_error("GPTQ INT2 source block index is negative");
+  }
+  if (rope_heads > 0) {
+    static constexpr size_t kRowsPerBlock = 64;
+    static constexpr size_t kColsPerGroup = 32;
+    static constexpr size_t kMetadataBytesPerRow = 4;
+    if (rope_permutations == 0 || rope_permutations > 2 ||
+        tensor.rows % rope_heads != 0 || tensor.cols % kColsPerGroup != 0) {
+      throw std::runtime_error("Invalid Llama RoPE direct-rebuild dimensions");
+    }
+    const size_t head_dim = tensor.rows / rope_heads;
+    if (head_dim == 0 || head_dim % 2 != 0) {
+      throw std::runtime_error("Invalid Llama RoPE direct-rebuild head dimension");
+    }
+    const size_t target_row0 = static_cast<size_t>(block_id) * kRowsPerBlock;
+    if (target_row0 >= tensor.rows ||
+        tensor.rows - target_row0 < kRowsPerBlock) {
+      throw std::runtime_error("Llama RoPE direct-rebuild block is out of range");
+    }
+    const size_t half = head_dim / 2;
+    const size_t num_qnn_groups = tensor.cols / kColsPerGroup;
+    for (size_t bc = 0; bc < num_qnn_groups; ++bc) {
+      for (size_t br = 0; br < 2; ++br) {
+        for (size_t tile_bc = 0; tile_bc < 4; ++tile_bc) {
+          const unsigned native_shift = static_cast<unsigned>(tile_bc * 2);
+          for (size_t tile_br = 0; tile_br < 4; ++tile_br) {
+            for (size_t lane = 0; lane < 8; ++lane) {
+              const size_t target_local_row = br * 32 + tile_br * 8 + lane;
+              const size_t target_row = target_row0 + target_local_row;
+              const size_t head = target_row / head_dim;
+              const size_t within = target_row % head_dim;
+              size_t source_within = within;
+              for (size_t permutation = 0;
+                   permutation < rope_permutations;
+                   ++permutation) {
+                source_within =
+                    (source_within % half) * 2 + source_within / half;
+              }
+              const size_t source_row = head * head_dim + source_within;
+              const size_t source_block_id = source_row / kRowsPerBlock;
+              const size_t source_local_row = source_row % kRowsPerBlock;
+              const uint8_t* source_block = tensor.data +
+                  gptq2_source_block_offset(tensor, source_block_id);
+              uint8_t qbyte0 = 0;
+              uint8_t qbyte1 = 0;
+              uint8_t zp = 0;
+              if (tensor.gs32_source_layout) {
+                static constexpr size_t kQbytesPerGroup = 512;
+                static constexpr size_t kMetadataPerGroup = 256;
+                static constexpr size_t kBytesPerGroup =
+                    kQbytesPerGroup + kMetadataPerGroup;
+                const uint8_t* group = source_block + bc * kBytesPerGroup;
+                const size_t source_br = source_local_row / 32;
+                const size_t source_tile_br = (source_local_row % 32) / 8;
+                const size_t source_lane = source_local_row % 8;
+                const size_t row_offset =
+                    source_br * 4 * 4 * 8 + tile_bc * 4 * 8 +
+                    source_tile_br * 8 + source_lane;
+                qbyte0 = group[row_offset * 2];
+                qbyte1 = group[row_offset * 2 + 1];
+                zp = decode_gptq2_qzero_metadata(
+                    group + kQbytesPerGroup +
+                    source_local_row * kMetadataBytesPerRow);
+              } else if (tensor.i8mm_native_layout) {
+                static constexpr size_t kRowsPerNativeTile = 16;
+                static constexpr size_t kNativeRowBytes = 8;
+                static constexpr size_t kNativeTileBytes = 128;
+                static constexpr size_t kQbytesPerGroup = 512;
+                static constexpr size_t kMetadataPerGroup = 256;
+                const size_t native_tile =
+                    source_local_row / kRowsPerNativeTile;
+                const size_t row_in_tile =
+                    source_local_row % kRowsPerNativeTile;
+                const uint8_t* native_row = source_block +
+                    (native_tile * num_qnn_groups + bc) * kNativeTileBytes +
+                    row_in_tile * kNativeRowBytes;
+                for (size_t column = 0; column < 4; ++column) {
+                  qbyte0 |= static_cast<uint8_t>(
+                      ((native_row[column] >> native_shift) & 0x3) <<
+                      (column * 2));
+                  qbyte1 |= static_cast<uint8_t>(
+                      ((native_row[column + 4] >> native_shift) & 0x3) <<
+                      (column * 2));
+                }
+                const uint8_t* metadata = source_block +
+                    num_qnn_groups * kQbytesPerGroup +
+                    bc * kMetadataPerGroup;
+                zp = decode_gptq2_qzero_metadata(
+                    metadata + source_local_row * kMetadataBytesPerRow);
+              } else {
+                const size_t source_group =
+                    (bc * kColsPerGroup) / tensor.source_group_size;
+                const size_t source_qbyte_offset =
+                    ((bc * kColsPerGroup) % tensor.source_group_size) / 4 +
+                    tile_bc * 2;
+                const uint8_t* group_ptr = source_block +
+                    (source_local_row * tensor.num_source_groups + source_group) *
+                    tensor.source_group_bytes;
+                qbyte0 = group_ptr[source_qbyte_offset];
+                qbyte1 = group_ptr[source_qbyte_offset + 1];
+                zp = decode_gptq2_qzero_metadata(
+                    group_ptr + tensor.source_group_code_bytes);
+              }
+              const uint32_t packed_row =
+                  pack_gs32_int4_from_qbytes(qbyte0, qbyte1, zp);
+              const size_t output_offset =
+                  (((bc * 2 + br) * 4 + tile_bc) * 4 + tile_br) * 8 + lane;
+              std::memcpy(
+                  dst + output_offset * sizeof(packed_row),
+                  &packed_row,
+                  sizeof(packed_row));
+            }
+          }
+        }
+      }
+    }
+    return;
   }
   const size_t source_offset =
       gptq2_source_block_offset(tensor, static_cast<size_t>(block_id));
@@ -2552,10 +2744,23 @@ PteRebuildResult rebuild_pte_from_gguf_index(
       have_current_tensor = true;
     }
 
+    size_t rope_heads = 0;
+    size_t rope_permutations = 0;
+    if (rec.weight_id.kind == kWeightKindDecoderLinear) {
+      if (rec.weight_id.op_id == 0) {
+        rope_heads = parsed_index.llama_rope_q_heads;
+        rope_permutations = parsed_index.llama_rope_q_permutations;
+      } else if (rec.weight_id.op_id == 1) {
+        rope_heads = parsed_index.llama_rope_kv_heads;
+        rope_permutations = parsed_index.llama_rope_kv_permutations;
+      }
+    }
     write_int4_block_from_gptq2_direct(
         current_tensor,
         rec.block_id,
-        rebuilt->data() + insert_at);
+        rebuilt->data() + insert_at,
+        rope_heads,
+        rope_permutations);
     dst_cursor = insert_at + rec_len;
   }
 
@@ -2832,6 +3037,7 @@ std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
       impl->relayout_blocks =
           std::unique_ptr<uint8_t[]>(new uint8_t[impl->relayout_bytes]);
     }
+    std::vector<uint8_t> rope_permute_scratch;
     for (size_t record_index = 0;
          record_index < impl->selected_records.size();
          ++record_index) {
@@ -2839,19 +3045,70 @@ std::shared_ptr<PteGgufShardRecipe> prepare_pte_gguf_shard_recipe(
       const auto& tensor = impl->record_tensors[record_index];
       const size_t source_offset =
           gptq2_source_block_offset(tensor, static_cast<size_t>(rec.block_id));
+      const uint8_t* source_block = tensor.data + source_offset;
+      size_t rope_heads = 0;
+      size_t rope_permutations = 0;
+      if (rec.weight_id.kind == kWeightKindDecoderLinear) {
+        if (rec.weight_id.op_id == 0) {
+          rope_heads = impl->parsed_index.llama_rope_q_heads;
+          rope_permutations = impl->parsed_index.llama_rope_q_permutations;
+        } else if (rec.weight_id.op_id == 1) {
+          rope_heads = impl->parsed_index.llama_rope_kv_heads;
+          rope_permutations = impl->parsed_index.llama_rope_kv_permutations;
+        }
+      }
+      if (rope_heads > 0) {
+        if (rope_permutations == 0 || rope_permutations > 2) {
+          throw std::runtime_error("Invalid Llama RoPE permutation count");
+        }
+        if (tensor.rows % rope_heads != 0) {
+          throw std::runtime_error("Llama RoPE tensor rows are not divisible by heads");
+        }
+        const size_t head_dim = tensor.rows / rope_heads;
+        if (head_dim == 0 || head_dim % 2 != 0) {
+          throw std::runtime_error("Invalid Llama RoPE head dimension");
+        }
+        const size_t row_bytes =
+            tensor.num_source_groups * tensor.source_group_bytes;
+        const size_t block_bytes = gptq2_source_block_bytes(tensor);
+        rope_permute_scratch.resize(block_bytes);
+        const size_t target_row0 = static_cast<size_t>(rec.block_id) * 64;
+        const size_t half = head_dim / 2;
+        for (size_t row = 0; row < 64; ++row) {
+          const size_t target_row = target_row0 + row;
+          const size_t head = target_row / head_dim;
+          const size_t within = target_row % head_dim;
+          size_t source_within = within;
+          for (size_t permutation = 0;
+               permutation < rope_permutations;
+               ++permutation) {
+            source_within =
+                (source_within % half) * 2 + source_within / half;
+          }
+          const size_t source_row = head * head_dim + source_within;
+          if (source_row >= tensor.rows) {
+            throw std::runtime_error("Llama RoPE source row is out of range");
+          }
+          std::memcpy(
+              rope_permute_scratch.data() + row * row_bytes,
+              tensor.data + source_row * row_bytes,
+              row_bytes);
+        }
+        source_block = rope_permute_scratch.data();
+      }
       uint8_t* relayout_block =
           impl->relayout_blocks.get() + impl->relayout_block_offsets[record_index];
       if (relayout_kind == PteGgufRecipeRelayoutKind::RawBlocks) {
         // Preserve raw GPTQ bytes; zero-point handling and QNN packing stay in rebuild.
         std::memcpy(
             relayout_block,
-            tensor.data + source_offset,
+            source_block,
             gptq2_source_block_bytes(tensor));
       } else if (relayout_kind == PteGgufRecipeRelayoutKind::Gs32Source) {
         // Copy raw qbytes plus raw scale/zero_bias fields only. Rebuild still
         // decodes qzero and invokes the same GS32 INT4 packing LUT.
         relayout_gptq2_block_for_gs32_source(
-            tensor.data + source_offset,
+            source_block,
             tensor.cols,
             tensor.source_group_size,
             tensor.num_source_groups,
@@ -2964,8 +3221,23 @@ PteRebuildResult rebuild_pte_from_stripped_gguf_recipe(
           impl.record_tensors[record_index].cols / 32,
           rebuilt->data() + destination_offset);
     } else {
+      size_t rope_heads = 0;
+      size_t rope_permutations = 0;
+      if (rec.weight_id.kind == kWeightKindDecoderLinear) {
+        if (rec.weight_id.op_id == 0) {
+          rope_heads = impl.parsed_index.llama_rope_q_heads;
+          rope_permutations = impl.parsed_index.llama_rope_q_permutations;
+        } else if (rec.weight_id.op_id == 1) {
+          rope_heads = impl.parsed_index.llama_rope_kv_heads;
+          rope_permutations = impl.parsed_index.llama_rope_kv_permutations;
+        }
+      }
       write_int4_block_from_gptq2_direct(
-          impl.record_tensors[record_index], rec.block_id, rebuilt->data() + destination_offset);
+          impl.record_tensors[record_index],
+          rec.block_id,
+          rebuilt->data() + destination_offset,
+          rope_heads,
+          rope_permutations);
     }
   }
   const auto materialization_end = std::chrono::steady_clock::now();

@@ -174,6 +174,10 @@ int run_compare(int argc, char** argv) {
   std::string stripped_manifest_path;
   std::string gguf_model_path;
   std::string reference_gguf_model_path;
+  std::string dump_rebuilt_path;
+  bool relayout_gs32_source = false;
+  bool ignore_llama_rope_permutation = false;
+  size_t max_shards = 0;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
@@ -185,6 +189,14 @@ int run_compare(int argc, char** argv) {
       gguf_model_path = argv[++i];
     } else if (arg == "--reference_gguf_model_path" && i + 1 < argc) {
       reference_gguf_model_path = argv[++i];
+    } else if (arg == "--dump_rebuilt_path" && i + 1 < argc) {
+      dump_rebuilt_path = argv[++i];
+    } else if (arg == "--relayout_gs32_source") {
+      relayout_gs32_source = true;
+    } else if (arg == "--ignore_llama_rope_permutation") {
+      ignore_llama_rope_permutation = true;
+    } else if (arg == "--max_shards" && i + 1 < argc) {
+      max_shards = static_cast<size_t>(std::stoull(argv[++i]));
     }
   }
 
@@ -262,6 +274,9 @@ int run_compare(int argc, char** argv) {
   constexpr size_t kMaxSamples = 8;
 
   for (size_t shard_idx = 0; shard_idx < stripped_paths.size(); ++shard_idx) {
+    if (max_shards > 0 && shard_idx >= max_shards) {
+      break;
+    }
     const std::string stripped_path = resolve(stripped_paths[shard_idx]);
     const std::string index_path = resolve(index_paths[shard_idx]);
 
@@ -280,6 +295,17 @@ int run_compare(int argc, char** argv) {
         read_binary_file(stripped_path);
     auto index_bytes = std::make_shared<std::vector<uint8_t>>(
         read_binary_file(index_path));
+    if (ignore_llama_rope_permutation && index_bytes->size() >= 36) {
+      (*index_bytes)[32] = 0;
+      (*index_bytes)[33] = 0;
+      (*index_bytes)[34] = 0;
+      (*index_bytes)[35] = 0;
+      if (index_bytes->size() >= 40 &&
+          ((*index_bytes)[4] | ((*index_bytes)[5] << 8)) >= 4) {
+        (*index_bytes)[36] = 0;
+        (*index_bytes)[37] = 0;
+      }
+    }
     std::vector<uint8_t> original_bytes;
     if (reference_gguf_context) {
       auto reference_recipe = example::prepare_pte_gguf_shard_recipe(
@@ -310,7 +336,10 @@ int run_compare(int argc, char** argv) {
         original_bytes.size(), stripped_bytes.size(), index_bytes->size());
 
     auto recipe = example::prepare_pte_gguf_shard_recipe(
-        gguf_context, index_bytes, 32);
+        gguf_context, index_bytes, 32,
+        relayout_gs32_source
+            ? example::PteGgufRecipeRelayoutKind::Gs32Source
+            : example::PteGgufRecipeRelayoutKind::None);
     example::PteRebuildResult rebuild_result =
         example::rebuild_pte_from_stripped_gguf_recipe(
             stripped_bytes, *recipe, nullptr);
@@ -324,6 +353,13 @@ int run_compare(int argc, char** argv) {
 
     const example::PteRebuildBuffer& rebuilt =
         *rebuild_result.rebuilt_pte_buffer;
+    if (!dump_rebuilt_path.empty() && shard_idx == 0) {
+      std::ofstream dump(dump_rebuilt_path, std::ios::binary);
+      dump.write(reinterpret_cast<const char*>(rebuilt.data()), rebuilt.size());
+      if (!dump) {
+        throw std::runtime_error("Unable to write rebuilt PTE dump");
+      }
+    }
 
     ET_LOG(Info,
         "  Rebuilt:   %zu bytes  records=%zu  weight_bytes=%zu  time=%.2f ms",

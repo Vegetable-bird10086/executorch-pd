@@ -104,6 +104,7 @@ class PDPrefillRunner {
   bool prefill_qnn_backend_prewarmed() const;
   double prefill_persistent_shard0_prepare_ms() const;
   bool prefill_persistent_shard0_prepared() const;
+  double prepare_persistent_prefill_shard0_for_next_request();
   void release_prefill_resources_before_decode();
   void set_prefill_etdump_config(DecoderRunner::PrefillEtDumpConfig config);
   void set_prefill_tokens(std::vector<uint64_t> tokens);

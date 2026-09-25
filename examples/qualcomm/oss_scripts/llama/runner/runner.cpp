@@ -283,7 +283,30 @@ Error Runner<T>::load() {
   decoder_runner_ =
       std::make_unique<DecoderRunner>(
           module_.get(), vocab_size, temperature_, prefill_shard_paths_);
-  decoder_runner_->set_logits_bit_width(sizeof(T) * 8);
+  int32_t logits_bit_width = static_cast<int32_t>(sizeof(T) * 8);
+  const auto model_method_names = module_->method_names();
+  ET_CHECK_OK_OR_RETURN_ERROR(model_method_names.error());
+  if (model_method_names->count("get_logits_output_bit_width") > 0) {
+    logits_bit_width = static_cast<int32_t>(
+        ET_UNWRAP(module_->get("get_logits_output_bit_width")).toInt());
+  } else if (model_method_names->count("get_logits_zero_point") > 0) {
+    const int64_t logits_zero_point =
+        ET_UNWRAP(module_->get("get_logits_zero_point")).toScalar().to<int64_t>();
+    logits_bit_width = logits_zero_point > 255 ? 16 : 8;
+  }
+  ET_CHECK_MSG(
+      logits_bit_width == 8 || logits_bit_width == 16,
+      "Unsupported logits bit width: %d",
+      logits_bit_width);
+  decoder_runner_->set_logits_bit_width(logits_bit_width);
+  decoder_runner_->set_logits_quantized(
+      model_method_names->count("get_logits_scale") > 0);
+  ET_LOG(
+      Info,
+      "QNN I/O widths: kv=%zu logits=%d quantized_logits=%d",
+      sizeof(T) * 8,
+      logits_bit_width,
+      static_cast<int>(model_method_names->count("get_logits_scale") > 0));
 
   ET_LOG(Info, "Reading metadata from model");
   // retrieve any method meta, can be either prefill or kv
@@ -388,7 +411,19 @@ Error Runner<T>::load() {
       vocab_size,
       cache_mode_ == CacheMode::HybridCache);
 
-  ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
+  std::vector<std::string> initial_method_names = method_names;
+  if (!prefill_shard_paths_.empty()) {
+    initial_method_names.erase(
+        std::remove(
+            initial_method_names.begin(),
+            initial_method_names.end(),
+            token_generator_method_name),
+        initial_method_names.end());
+    ET_LOG(
+        Info,
+        "Deferring kv_forward context load until streamed Prefill completes");
+  }
+  ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(initial_method_names));
 
   // Load the sliding window size if the model supports it.
   // This is used to configure the attention mask for models with window
@@ -430,7 +465,11 @@ Error Runner<T>::load() {
           embedding_dim,
           static_cast<size_t>(embedding_dim) * sizeof(float),
           executorch::aten::ScalarType::Float,
-          use_separate_embed ? &separate_embedding_ : nullptr});
+          use_separate_embed ? &separate_embedding_ : nullptr,
+          false,
+          0.0f,
+          0,
+          logits_bit_width});
   if (prefill_only_load_) {
     token_generator_.reset();
   } else if (eval_mode_ == EvalMode::kLookaheadDecoding) {
@@ -451,7 +490,8 @@ Error Runner<T>::load() {
             window_,
             gcap_,
             sliding_window,
-            cache_mode_},
+            cache_mode_,
+            logits_bit_width},
         &stats_);
   } else {
     token_generator_ = std::make_unique<TokenGenerator<T>>(
@@ -471,7 +511,8 @@ Error Runner<T>::load() {
             cache_mode_,
             use_separate_embed,
             embedding_dim,
-            use_separate_embed ? &separate_embedding_ : nullptr},
+            use_separate_embed ? &separate_embedding_ : nullptr,
+            logits_bit_width},
         &stats_);
   }
 

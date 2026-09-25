@@ -738,7 +738,21 @@ void transpose_qnn_u8_k_head(
     uint8_t* destination,
     int64_t head_dim,
     int32_t token_count,
-    int32_t source_token_stride) {
+    int32_t source_token_stride,
+    bool llama_l2_permute) {
+  if (llama_l2_permute) {
+    const size_t half = static_cast<size_t>(head_dim) / 2;
+    for (int32_t token = 0; token < token_count; ++token) {
+      for (int64_t dim = 0; dim < head_dim; ++dim) {
+        size_t source_dim = static_cast<size_t>(dim);
+        source_dim = (source_dim % 2) * half + source_dim / 2;
+        source_dim = (source_dim % 2) * half + source_dim / 2;
+        destination[static_cast<size_t>(token) * head_dim + dim] =
+            source[source_dim * source_token_stride + token];
+      }
+    }
+    return;
+  }
 #if defined(__aarch64__) || defined(__ARM_NEON)
   if (head_dim % 8 == 0) {
     int32_t token = 0;
@@ -801,6 +815,7 @@ void transpose_qnn_u8_k_head(
 
 void copy_qnn_u8_kv_handoff_layers(
     KVManager<uint8_t>* kv_manager,
+    DecoderModelVersion decoder_model_version,
     int64_t num_layers,
     int64_t num_heads,
     int64_t head_dim,
@@ -843,7 +858,8 @@ void copy_qnn_u8_kv_handoff_layers(
               static_cast<size_t>(head) * prompt_len * head_dim,
           head_dim,
           prompt_len,
-          max_cache_len);
+          max_cache_len,
+          decoder_model_version == DecoderModelVersion::kLlama3);
 
       // Decode consumes V as [head, token, dim], identical to Prefill.
       std::memcpy(
@@ -858,6 +874,7 @@ void copy_qnn_u8_kv_handoff_layers(
 
 void build_qnn_u8_kv_handoff(
     KVManager<uint8_t>* kv_manager,
+    DecoderModelVersion decoder_model_version,
     int64_t num_layers,
     int64_t num_heads,
     int64_t head_dim,
@@ -875,11 +892,11 @@ void build_qnn_u8_kv_handoff(
     const int64_t end = std::min(num_layers, begin + layers_per_worker);
     workers[static_cast<size_t>(worker - 1)] = std::thread(
         copy_qnn_u8_kv_handoff_layers,
-        kv_manager, num_layers, num_heads, head_dim, prompt_len,
+        kv_manager, decoder_model_version, num_layers, num_heads, head_dim, prompt_len,
         max_cache_len, direct, direct_size, begin, end);
   }
   copy_qnn_u8_kv_handoff_layers(
-      kv_manager, num_layers, num_heads, head_dim, prompt_len,
+      kv_manager, decoder_model_version, num_layers, num_heads, head_dim, prompt_len,
       max_cache_len, direct, direct_size,
       0, std::min(num_layers, layers_per_worker));
   for (auto& worker : workers) {
@@ -889,6 +906,7 @@ void build_qnn_u8_kv_handoff(
 
 std::vector<uint8_t> build_qnn_u8_kv_handoff(
     KVManager<uint8_t>* kv_manager,
+    DecoderModelVersion decoder_model_version,
     int64_t num_layers,
     int64_t num_heads,
     int64_t head_dim,
@@ -899,6 +917,7 @@ std::vector<uint8_t> build_qnn_u8_kv_handoff(
   std::vector<uint8_t> direct(size);
   build_qnn_u8_kv_handoff(
       kv_manager,
+      decoder_model_version,
       num_layers,
       num_heads,
       head_dim,
@@ -1149,7 +1168,8 @@ Error PDPrefillRunner<T>::load() {
   decoder_runner_->use_qwen3_prefill_static_plan(
       prefill_qwen3_static_plan_,
       prefill_static_aux_size_,
-      prefill_static_hidden_size_);
+      prefill_static_hidden_size_,
+      decoder_model_version_ == DecoderModelVersion::kLlama3);
   decoder_runner_->set_prefill_outputs_logits(prefill_outputs_logits_);
   decoder_runner_->set_prefill_separate_embed(separate_embed_);
   decoder_runner_->set_prefill_etdump_config(prefill_etdump_config_);
@@ -1441,6 +1461,12 @@ bool PDPrefillRunner<T>::prefill_persistent_shard0_prepared() const {
 }
 
 template <typename T>
+double PDPrefillRunner<T>::prepare_persistent_prefill_shard0_for_next_request() {
+  ET_CHECK_MSG(decoder_runner_ != nullptr, "Prefill runner is not initialized");
+  return decoder_runner_->prepare_persistent_prefill_shard0_for_next_request();
+}
+
+template <typename T>
 void PDPrefillRunner<T>::release_prefill_resources_before_decode() {
   if (decoder_runner_ != nullptr) {
     decoder_runner_->release_prefill_resources_before_decode();
@@ -1639,6 +1665,7 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
           const auto pack_start = SteadyClock::now();
           copy_qnn_u8_kv_handoff_layers(
               kv_manager_.get(),
+              decoder_model_version_,
               num_layers_,
               num_heads_,
               head_dim_,
@@ -1795,6 +1822,7 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
     if constexpr (std::is_same_v<T, uint8_t>) {
       qnn_u8_kv = build_qnn_u8_kv_handoff(
           kv_manager_.get(),
+          decoder_model_version_,
           num_layers_,
           num_heads_,
           head_dim_,
@@ -1817,6 +1845,7 @@ Error PDPrefillRunner<T>::export_prefill_handoff_impl(
       if (!all_layers_copied) {
         build_qnn_u8_kv_handoff(
             kv_manager_.get(),
+            decoder_model_version_,
             num_layers_,
             num_heads_,
             head_dim_,

@@ -93,7 +93,22 @@ def prepare_kv_io(mlir, config, input_names, output_names):
     return text
 
 
-def finalize_kv_io(buffer, method_files, cache_count, sidecar):
+def validate_non_kv_outputs(plan, cache_count, expected_output_shapes=None):
+    """Allow split heads only with explicit shapes from the exported graph."""
+    prefix = plan.outputs[:-cache_count]
+    if expected_output_shapes is None:
+        if len(prefix) not in (0, 1):
+            raise ValueError("Split head requires explicit non-KV output shapes")
+        return
+    if plan.name not in expected_output_shapes:
+        raise ValueError("Missing non-KV output schema for method")
+    expected = expected_output_shapes[plan.name]
+    actual = [list(plan.values[i].val.sizes) for i in prefix]
+    if actual != expected:
+        raise ValueError(f"Non-KV output shape mismatch: {actual} != {expected}")
+
+
+def finalize_kv_io(buffer, method_files, cache_count, sidecar, expected_output_shapes=None):
     """Validate all methods, write runner scales, and expose SHORT KV in PTE."""
     from executorch.exir._serialize._program import deserialize_pte_binary, serialize_pte_binary
     from executorch.exir.schema import ScalarType
@@ -120,8 +135,9 @@ def finalize_kv_io(buffer, method_files, cache_count, sidecar):
             raise ValueError("Quantized KV requires a single fully delegated method")
         for delegate in plan.delegates:
             delegate.compile_specs = [spec for spec in delegate.compile_specs if spec.key != SPEC_KEY]
-        if len(plan.inputs) != cache_count + 3 or len(plan.outputs) not in (cache_count, cache_count + 1):
+        if cache_count <= 0 or len(plan.inputs) != cache_count + 3 or len(plan.outputs) < cache_count:
             raise ValueError("Unexpected Qwen KV interface")
+        validate_non_kv_outputs(plan, cache_count, expected_output_shapes)
         for i in plan.inputs[-cache_count:] + plan.outputs[-cache_count:]:
             tensor = plan.values[i].val
             if len(tensor.sizes) != 4 or tensor.scalar_type != ScalarType.FLOAT:
@@ -135,6 +151,8 @@ def validate_export(pte_path, sidecar_path):
     """Reject a stale FP32/unshared model when reusing an export directory."""
     from executorch.exir._serialize._program import deserialize_pte_binary
     from executorch.exir.schema import ScalarType
+    schema_path = Path(str(pte_path) + ".non_kv_outputs.json")
+    expected_shapes = json.loads(schema_path.read_text()) if schema_path.is_file() else None
     records = {}
     for line in Path(sidecar_path).read_text().splitlines():
         ar, index, si, so = line.split()
@@ -148,8 +166,9 @@ def validate_export(pte_path, sidecar_path):
         count = len(plan.inputs) - 3
         if count <= 0 or len(plan.delegates) != 1 or plan.operators:
             raise ValueError("Not a fully delegated Qwen KV model")
-        if len(plan.outputs) not in (count, count + 1):
+        if len(plan.outputs) < count:
             raise ValueError("Unexpected KV output count")
+        validate_non_kv_outputs(plan, count, expected_shapes)
         outputs = [plan.values[i].val for i in plan.outputs[-count:]]
         ar = outputs[0].sizes[2]
         for index, (a, b) in enumerate(zip(plan.inputs[-count:], plan.outputs[-count:])):

@@ -334,6 +334,63 @@ Error QnnManager::InitContext(
   return Error::Ok;
 }
 
+Error QnnManager::PrepareContextForBatch() {
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_params_ptr_->backend_init_state_ ==
+          BackendInitializeState::UNINITIALIZED,
+      InvalidState,
+      "QNN manager is not uninitialized before batch prepare");
+  backend_params_ptr_ = QnnBackendFactory().Create(
+      backend_bundle_ptr_->implementation.get(),
+      backend_bundle_ptr_->qnn_backend_ptr.get(),
+      backend_bundle_ptr_->qnn_device_ptr.get(),
+      qnn_context_blob_,
+      options_,
+      qnn_dlc_manager_.get());
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_params_ptr_ != nullptr,
+      Internal,
+      "Failed to load QNN backend for batch restore");
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_params_ptr_->qnn_backend_cache_ptr_->Configure({}) == Error::Ok,
+      Internal,
+      "Failed to configure QNN backend cache for batch restore");
+  return Error::Ok;
+}
+
+Error QnnManager::BatchRestoreContexts(
+    const std::vector<QnnManager*>& managers) {
+  std::vector<QnnContext*> contexts;
+  contexts.reserve(managers.size());
+  for (QnnManager* manager : managers) {
+    ET_CHECK_OR_RETURN_ERROR(
+        manager != nullptr && manager->backend_params_ptr_ != nullptr &&
+            manager->backend_params_ptr_->qnn_context_ptr_ != nullptr,
+        InvalidArgument,
+        "Invalid QNN manager in batch restore");
+    contexts.push_back(manager->backend_params_ptr_->qnn_context_ptr_.get());
+  }
+  return QnnContext::ConfigureDeserializeBatch(contexts);
+}
+
+Error QnnManager::FinishContextAfterBatch() {
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_params_ptr_ != nullptr &&
+          backend_params_ptr_->backend_init_state_ ==
+              BackendInitializeState::UNINITIALIZED,
+      InvalidState,
+      "QNN manager is not prepared for batch completion");
+  for (const std::string& graph_name :
+       backend_params_ptr_->qnn_context_ptr_->GetGraphNames()) {
+    ET_CHECK_OR_RETURN_ERROR(
+        backend_params_ptr_->qnn_graph_ptr_->Configure(graph_name) == Error::Ok,
+        Internal,
+        "Failed to configure QNN graph after batch restore");
+  }
+  backend_params_ptr_->backend_init_state_ = BackendInitializeState::INITIALIZED;
+  return Error::Ok;
+}
+
 Error QnnManager::InitContextCache() {
   if (backend_params_ptr_->backend_init_state_ ==
       BackendInitializeState::UNINITIALIZED) {

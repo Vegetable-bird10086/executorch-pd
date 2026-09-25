@@ -22,7 +22,7 @@ MAX_AUXILIARY_STATIC_PAYLOAD_BYTES = 1 << 20
 # re-exported as a smaller GraphModule, so its counters restart at zero even
 # though decoder bindings keep the original layer ids.  Normalize only the FX
 # lookup key; QNN operation and tensor names must remain exactly as exported.
-INDEXED_FX_LAYER_STRIDES = {
+QWEN3_INDEXED_FX_LAYER_STRIDES = {
     "aten_rms_norm_default": 4,
     "aten_matmul_default": 4,
     "aten_mul_tensor": 10,
@@ -37,8 +37,14 @@ INDEXED_FX_LAYER_STRIDES = {
     "aten_sigmoid_default": 1,
 }
 
+LLAMA_INDEXED_FX_LAYER_STRIDES = {
+    **QWEN3_INDEXED_FX_LAYER_STRIDES,
+    "aten_rms_norm_default": 2,
+    "aten_matmul_default": 2,
+}
 
-def normalize_supplemental_fx_names(shard):
+
+def normalize_supplemental_fx_names(shard, indexed_fx_layer_strides):
     layer_start = int(shard["layer_start"])
     if layer_start <= 0:
         return 0
@@ -49,7 +55,7 @@ def normalize_supplemental_fx_names(shard):
         if len(binding_layers) != 1 or binding_layers[0] < layer_start:
             continue
         fx_name = source["fx_node_name"]
-        for stem, stride in INDEXED_FX_LAYER_STRIDES.items():
+        for stem, stride in indexed_fx_layer_strides.items():
             match = re.fullmatch(
                 rf"{re.escape(stem)}(?:_(\d+))?(_h_\d+)?", fx_name
             )
@@ -378,7 +384,9 @@ def validate_compact_manifest(manifest, compact):
     return statistics
 
 
-def apply_supplemental_profile_shards(manifest, supplemental):
+def apply_supplemental_profile_shards(
+    manifest, supplemental, indexed_fx_layer_strides
+):
     if supplemental.get("num_decoder_layers") != manifest.get("num_decoder_layers"):
         raise ValueError("supplemental manifest changed decoder layer count")
     profile = manifest["graphs"]["prefill_forward"]["llama_qnn_quant_profile"]
@@ -397,7 +405,7 @@ def apply_supplemental_profile_shards(manifest, supplemental):
     shards_by_scope = {shard["scope"]: shard for shard in profile["shards"]}
     replaced_scopes = []
     for shard in supplemental_profile["shards"]:
-        normalize_supplemental_fx_names(shard)
+        normalize_supplemental_fx_names(shard, indexed_fx_layer_strides)
         scope = shard["scope"]
         original = shards_by_scope.get(scope)
         if original is None:
@@ -428,6 +436,12 @@ def main():
             "a no-output graph prunes decode-only projections"
         ),
     )
+    parser.add_argument(
+        "--fx-layout",
+        choices=("qwen3", "llama"),
+        default="qwen3",
+        help="indexed FX suffix stride layout used by supplemental shards",
+    )
     parser.add_argument("--gguf", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument(
@@ -444,11 +458,18 @@ def main():
     with args.manifest.open("r", encoding="utf-8") as source:
         manifest = json.load(source)
     replaced_scopes = []
+    indexed_fx_layer_strides = (
+        LLAMA_INDEXED_FX_LAYER_STRIDES
+        if args.fx_layout == "llama"
+        else QWEN3_INDEXED_FX_LAYER_STRIDES
+    )
     for supplemental_path in args.supplemental_manifest:
         with supplemental_path.open("r", encoding="utf-8") as source:
             supplemental = json.load(source)
         replaced_scopes.extend(
-            apply_supplemental_profile_shards(manifest, supplemental)
+            apply_supplemental_profile_shards(
+                manifest, supplemental, indexed_fx_layer_strides
+            )
         )
     compact = compact_manifest(manifest)
     statistics = validate_compact_manifest(manifest, compact)

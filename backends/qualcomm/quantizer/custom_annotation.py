@@ -23,7 +23,11 @@ from executorch.backends.qualcomm.quantizer.rules import (
 )
 from executorch.exir.dialects._ops import ops as exir_ops
 from torch.fx import Node
-from torchao.quantization.pt2e import MinMaxObserver, PerChannelMinMaxObserver
+from torchao.quantization.pt2e import (
+    HistogramObserver,
+    MinMaxObserver,
+    PerChannelMinMaxObserver,
+)
 from torchao.quantization.pt2e.quantizer import (
     annotate_input_qspec_map,
     annotate_output_qspec,
@@ -82,6 +86,216 @@ def annotate_llm_residual_token_axis_a8(gm: torch.fx.GraphModule) -> None:
         raise RuntimeError(
             f"Expected {expected} layer6-35 residual adds for token-axis A8, "
             f"annotated {annotated}"
+        )
+
+
+
+def annotate_llama_residual_fp16(gm: torch.fx.GraphModule) -> None:
+    """Keep Llama residual paths out of static per-tensor quantization."""
+    layout_ops = {
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.unsqueeze.default,
+    }
+
+    def clear_projection_output_path(node: Node) -> None:
+        """Clear QDQ from an add input back through views to its producer."""
+        annotation = node.meta.get(Q_ANNOTATION_KEY)
+        if annotation is None:
+            return
+        annotation.output_qspec = None
+        if node.target not in layout_ops:
+            return
+        for input_node in list(annotation.input_qspec_map):
+            if not _is_float_tensor(input_node) or input_node.op == "get_attr":
+                continue
+            annotation.input_qspec_map.pop(input_node, None)
+            clear_projection_output_path(input_node)
+
+    residual_adds = 0
+    residual_inputs = 0
+    rmsnorm_inputs = 0
+    for node in gm.graph.nodes:
+        annotation = node.meta.get(Q_ANNOTATION_KEY)
+        if annotation is None:
+            continue
+        stack = node.meta.get("nn_module_stack", {})
+        paths = [
+            str(value[0]) if isinstance(value, (tuple, list)) and value else str(value)
+            for value in stack.values()
+        ]
+        if not any(re.search(r"(?:^|\.)layers\.\d+(?:\.|\Z)", path) for path in paths):
+            continue
+        deepest = paths[-1] if paths else ""
+        if (
+            node.target == torch.ops.aten.add.Tensor
+            and re.fullmatch(r"layers\.\d+", deepest) is not None
+        ):
+            annotation.output_qspec = None
+            for input_node in list(annotation.input_qspec_map):
+                annotation.input_qspec_map.pop(input_node, None)
+                clear_projection_output_path(input_node)
+                residual_inputs += 1
+            for user in node.users:
+                user_annotation = user.meta.get(Q_ANNOTATION_KEY)
+                if user_annotation is not None:
+                    user_annotation.input_qspec_map.pop(node, None)
+            residual_adds += 1
+        if node.target == torch.ops.aten.rms_norm.default:
+            for input_node in list(annotation.input_qspec_map):
+                if not _is_float_tensor(input_node) or input_node.op == "get_attr":
+                    continue
+                annotation.input_qspec_map.pop(input_node, None)
+                producer_annotation = input_node.meta.get(Q_ANNOTATION_KEY)
+                if producer_annotation is not None:
+                    producer_annotation.output_qspec = None
+                rmsnorm_inputs += 1
+    if residual_adds == 0 or residual_inputs == 0 or rmsnorm_inputs == 0:
+        raise RuntimeError(
+            "Llama residual-fp16 annotation matched no residual path: "
+            f"adds={residual_adds} add_inputs={residual_inputs} "
+            f"rmsnorm_inputs={rmsnorm_inputs}"
+        )
+
+
+class LlamaResidualPercentileObserver(HistogramObserver):
+    """Clip only the handful of BOS residual outliers during calibration."""
+
+    def calculate_qparams(self):
+        if self.min_val == float("inf") or self.max_val == float("-inf"):
+            return self._calculate_qparams(self.min_val, self.max_val)
+        total = self.histogram.sum()
+        if total <= 0 or self.max_val <= self.min_val:
+            return self._calculate_qparams(self.min_val, self.max_val)
+
+        retained = float(
+            os.environ.get("ET_QNN_LLAMA_RESIDUAL_RETAINED_PERCENTILE", "0.99999")
+        )
+        if not 0.0 < retained <= 1.0:
+            raise ValueError(
+                "ET_QNN_LLAMA_RESIDUAL_RETAINED_PERCENTILE must be in (0, 1], "
+                f"got {retained}"
+            )
+        tail = (1.0 - retained) / 2.0
+        cumulative = torch.cumsum(self.histogram, dim=0)
+        lower_bin = int(torch.searchsorted(cumulative, total * tail).item())
+        upper_bin = int(
+            torch.searchsorted(cumulative, total * (1.0 - tail)).item()
+        )
+        lower_bin = max(0, min(lower_bin, self.bins - 1))
+        upper_bin = max(lower_bin, min(upper_bin, self.bins - 1))
+        bin_width = (self.max_val - self.min_val) / self.bins
+        clipped_min = self.min_val + bin_width * lower_bin
+        clipped_max = self.min_val + bin_width * (upper_bin + 1)
+        zero = torch.zeros_like(clipped_min)
+        return self._calculate_qparams(
+            torch.minimum(clipped_min, zero), torch.maximum(clipped_max, zero)
+        )
+
+
+def annotate_llama_residual_percentile_a16(gm: torch.fx.GraphModule) -> None:
+    """Use per-tensor A16 residuals while excluding sparse BOS outliers."""
+
+    def make_qspec():
+        return QuantizationSpec(
+            dtype=torch.uint16,
+            quant_min=0,
+            quant_max=65535,
+            qscheme=torch.per_tensor_affine,
+            observer_or_fake_quant_ctr=LlamaResidualPercentileObserver.with_args(
+                bins=262144, eps=2**-20
+            ),
+        )
+
+    layout_ops = {
+        torch.ops.aten.permute.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.transpose.int,
+    }
+    down_outputs = 0
+    for node in gm.graph.nodes:
+        if node.target not in {
+            torch.ops.aten.conv2d.default,
+            torch.ops.aten.convolution.default,
+        }:
+            continue
+        stack = node.meta.get("nn_module_stack", {})
+        paths = [
+            str(value[0]) if isinstance(value, (tuple, list)) and value else str(value)
+            for value in stack.values()
+        ]
+        matches = [
+            re.fullmatch(r"layers\.(\d+)\.feed_forward\.w2_conv", path)
+            for path in paths
+        ]
+        match = next((candidate for candidate in matches if candidate), None)
+        if match is None or int(match.group(1)) < 1:
+            continue
+        value = node.meta.get("val")
+        if not isinstance(value, torch.Tensor) or 128 not in value.shape:
+            continue
+        annotation = node.meta.get(Q_ANNOTATION_KEY)
+        if annotation is None:
+            continue
+        qspec = make_qspec()
+        annotation.output_qspec = qspec
+        current = node
+        while len(current.users) == 1:
+            user = next(iter(current.users))
+            user_annotation = user.meta.get(Q_ANNOTATION_KEY)
+            if user_annotation is None:
+                break
+            if current in user_annotation.input_qspec_map:
+                user_annotation.input_qspec_map[current] = qspec
+            if user.target not in layout_ops:
+                break
+            user_annotation.output_qspec = qspec
+            current = user
+        down_outputs += 1
+
+    annotated = 0
+    for node in gm.graph.nodes:
+        if node.target != torch.ops.aten.add.Tensor:
+            continue
+        stack = node.meta.get("nn_module_stack", {})
+        deepest = str(list(stack.values())[-1][0]) if stack else ""
+        match = re.fullmatch(r"layers\.(\d+)", deepest)
+        if match is None or int(match.group(1)) < 1:
+            continue
+        value = node.meta.get("val")
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.dim() != 3
+            or value.shape[1] <= 1
+        ):
+            continue
+        annotation = node.meta.get(Q_ANNOTATION_KEY)
+        if annotation is None:
+            continue
+        qspec = make_qspec()
+        annotation.output_qspec = qspec
+        for user in node.users:
+            user_annotation = user.meta.get(Q_ANNOTATION_KEY)
+            if (
+                user_annotation is not None
+                and node in user_annotation.input_qspec_map
+            ):
+                user_annotation.input_qspec_map[node] = qspec
+        annotated += 1
+
+    if annotated and annotated % 2 != 0:
+        raise RuntimeError(
+            f"Expected pairs of Llama residual Add outputs, annotated {annotated}"
+        )
+    if annotated and down_outputs * 2 != annotated:
+        raise RuntimeError(
+            "Expected one clipped W2/down output for each layer pair of "
+            f"residual Adds, got down={down_outputs} adds={annotated}"
         )
 
 

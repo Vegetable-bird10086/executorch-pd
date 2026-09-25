@@ -487,8 +487,10 @@ DecoderRunner::~DecoderRunner() {
 void DecoderRunner::use_qwen3_prefill_static_plan(
     bool enabled,
     int32_t aux_size,
-    int32_t hidden_size) {
+    int32_t hidden_size,
+    bool llama3_layout) {
   prefill_qwen3_static_plan_ = enabled;
+  prefill_llama3_static_layout_ = enabled && llama3_layout;
   prefill_static_aux_size_ = aux_size;
   prefill_static_hidden_size_ = hidden_size;
 }
@@ -664,7 +666,7 @@ void DecoderRunner::release_prefill_rebuild_buffer(
   }
 }
 
-void DecoderRunner::preload_prefill_shard(PrefillShardPlan& shard) {
+void DecoderRunner::preload_prefill_shard_inputs(PrefillShardPlan& shard) {
   if (!shard.rebuild_on_execute) {
     return;
   }
@@ -685,6 +687,14 @@ void DecoderRunner::preload_prefill_shard(PrefillShardPlan& shard) {
         shard.stripped_pte_bytes->size(),
         shard.index_bytes->size(),
         shard.runtime_stats.preload_ms);
+  }
+
+}
+
+void DecoderRunner::preload_prefill_shard(PrefillShardPlan& shard) {
+  preload_prefill_shard_inputs(shard);
+  if (!shard.rebuild_on_execute) {
+    return;
   }
 
   if (prefill_shard_rebuild_.source_kind ==
@@ -769,6 +779,7 @@ void DecoderRunner::preload_prefill_shard(PrefillShardPlan& shard) {
 
 PteRebuildResult DecoderRunner::rebuild_prefill_shard(
     PrefillShardPlan& shard) {
+  preload_prefill_shard(shard);
   ET_CHECK_MSG(
       prefill_shard_rebuild_.source_kind !=
           PrefillShardRebuildConfig::SourceKind::None,
@@ -816,6 +827,7 @@ PteRebuildResult DecoderRunner::rebuild_prefill_shard(
           *shard.gguf_rebuild_recipe,
           acquire_prefill_rebuild_buffer(
               pte_rebuild_output_size(*shard.gguf_rebuild_recipe)));
+        shard.gguf_rebuild_recipe.reset();
 #ifndef QNN_LLAMA_PD_JOINT
         discard_pte_gguf_rebuild_source_pages(prefill_gguf_rebuild_context_);
 #endif
@@ -1603,10 +1615,16 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
       prefill_static_aux_size_,
       prefill_static_hidden_size_);
 
-  prefill_intermediate_aux_workspace_.reserve(2);
+  prefill_intermediate_aux_workspace_.reserve(
+      prefill_llama3_static_layout_ ? 3 : 2);
   for (size_t i = 0; i < 2; ++i) {
     prefill_intermediate_aux_workspace_.push_back(make_tensor_ptr_from_sizes(
         {prefill_prompt_ar_len_, prefill_static_aux_size_}, activation_type));
+  }
+  if (prefill_llama3_static_layout_) {
+    // Llama 3 exports the reshaped attention mask as a shard-boundary value.
+    prefill_intermediate_aux_workspace_.push_back(make_tensor_ptr_from_sizes(
+        {1, 1, prefill_prompt_ar_len_, prefill_context_len_}, activation_type));
   }
   prefill_intermediate_hidden_workspace_.reserve(2);
   for (size_t i = 0; i < 2; ++i) {
@@ -1614,15 +1632,19 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
         {1, prefill_prompt_ar_len_, prefill_static_hidden_size_},
         activation_type));
   }
-  const size_t intermediate_workspace_bytes =
-      prefill_intermediate_aux_workspace_[0]->nbytes() +
-      prefill_intermediate_aux_workspace_[1]->nbytes() +
-      prefill_intermediate_hidden_workspace_[0]->nbytes() +
-      prefill_intermediate_hidden_workspace_[1]->nbytes();
+  size_t intermediate_workspace_bytes = 0;
+  for (const auto& tensor : prefill_intermediate_aux_workspace_) {
+    intermediate_workspace_bytes += tensor->nbytes();
+  }
+  for (const auto& tensor : prefill_intermediate_hidden_workspace_) {
+    intermediate_workspace_bytes += tensor->nbytes();
+  }
   ET_LOG(
       Info,
-      "configured qwen3 prefill intermediate workspace: hidden_slots=2 "
-      "aux_tensors=2 bytes=%zu",
+      "configured static prefill intermediate workspace: hidden_slots=2 "
+      "aux_tensors=%zu llama3_layout=%d bytes=%zu",
+      prefill_intermediate_aux_workspace_.size(),
+      static_cast<int>(prefill_llama3_static_layout_),
       intermediate_workspace_bytes);
 
   size_t layer_offset = 0;
@@ -1640,21 +1662,43 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
     }
 
     if (shard_index == 0) {
-      if (prefill_separate_embed_) {
-        // Separate-embedding exports use input_pos, atten_mask, then hidden_states.
-        shard.input_bindings.push_back({PrefillShardPlan::InputKind::Position, 0});
-        shard.input_bindings.push_back({PrefillShardPlan::InputKind::AttentionMask, 0});
-        shard.input_bindings.push_back({PrefillShardPlan::InputKind::Tokens, 0});
+      if (prefill_llama3_static_layout_) {
+        // Llama 3 separate-embedding shard 0 takes mask, position, hidden.
+        ET_CHECK_MSG(prefill_separate_embed_,
+            "Llama3 static layout currently requires separate embedding");
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::AttentionMask, 0});
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Position, 0});
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Tokens, 0});
+      } else if (prefill_separate_embed_) {
+        // Qwen3 separate-embedding exports use position, mask, then hidden.
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Position, 0});
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::AttentionMask, 0});
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Tokens, 0});
       } else {
-        shard.input_bindings.push_back({PrefillShardPlan::InputKind::Tokens, 0});
-        shard.input_bindings.push_back({PrefillShardPlan::InputKind::Position, 0});
-        shard.input_bindings.push_back({PrefillShardPlan::InputKind::AttentionMask, 0});
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Tokens, 0});
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::Position, 0});
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::AttentionMask, 0});
       }
     } else {
-      shard.input_bindings.push_back({PrefillShardPlan::InputKind::PreviousAux, 0});
-      shard.input_bindings.push_back({PrefillShardPlan::InputKind::PreviousAux, 1});
-      shard.input_bindings.push_back({PrefillShardPlan::InputKind::PreviousHidden, 0});
-      shard.input_bindings.push_back({PrefillShardPlan::InputKind::AttentionMask, 0});
+      shard.input_bindings.push_back(
+          {PrefillShardPlan::InputKind::PreviousAux, 0});
+      shard.input_bindings.push_back(
+          {PrefillShardPlan::InputKind::PreviousAux, 1});
+      shard.input_bindings.push_back(
+          {PrefillShardPlan::InputKind::PreviousHidden, 0});
+      if (!prefill_llama3_static_layout_) {
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::AttentionMask, 0});
+      }
     }
     // Without logits, the final transformer layer only emits K/V. Its
     // attention/MLP path is pruned, so its old KV cache is not a graph input.
@@ -1667,10 +1711,22 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
           {PrefillShardPlan::InputKind::VCache, local_layer});
       shard.input_bindings.push_back(
           {PrefillShardPlan::InputKind::KCache, local_layer});
+      if (prefill_llama3_static_layout_ && shard_index > 0 &&
+          local_layer == 0) {
+        // Llama 3 shard boundaries carry the rank-4 reshaped mask after the
+        // first local layer cache pair. Aux slot 2 owns that invariant value.
+        shard.input_bindings.push_back(
+            {PrefillShardPlan::InputKind::PreviousAux, 2});
+      }
     }
 
     size_t owned_aux = 0;
     if (shard_index == 0) {
+      if (prefill_llama3_static_layout_) {
+        shard.owned_outputs.push_back(prefill_intermediate_aux_workspace_[2]);
+        shard.output_bindings.push_back(
+            {PrefillShardPlan::OutputKind::IntermediateAux, 2, owned_aux++});
+      }
       shard.owned_outputs.push_back(prefill_intermediate_aux_workspace_[0]);
       shard.output_bindings.push_back(
           {PrefillShardPlan::OutputKind::IntermediateAux, 0, owned_aux++});
@@ -1759,7 +1815,7 @@ void DecoderRunner::configure_qwen3_static_prefill_shards() {
   for (size_t shard_index = 0; shard_index < prefill_shards_.size();
        ++shard_index) {
     auto& shard = prefill_shards_[shard_index];
-    preload_prefill_shard(shard);
+    preload_prefill_shard_inputs(shard);
     if (shard.stripped_pte_bytes) {
       preloaded_bytes += shard.stripped_pte_bytes->size();
     }
@@ -2299,6 +2355,46 @@ DecoderRunner::execute_prefill_shard(
       ET_CHECK_MSG(
           outputs_res->get()[i].isTensor(),
           "Non Tensor Output returned from prefill shard");
+      if (std::getenv("ET_SHARD_OUTPUT_POINTER_DIAG") != nullptr &&
+          shard.runtime_stats.execution_count == 1) {
+        const Tensor& returned = outputs_res->get()[i].toTensor();
+        const Tensor& bound = shard.output_tensors[i];
+        ET_LOG(Info, "prefill output pointer diag: shard=%zu output=%zu kind=%d returned_ptr=%p bound_ptr=%p same=%d returned_nbytes=%zu bound_nbytes=%zu returned_scalar=%d bound_scalar=%d", shard.shard_index, i, static_cast<int>(shard.output_bindings[i].kind), returned.const_data_ptr(), bound.const_data_ptr(), static_cast<int>(returned.const_data_ptr() == bound.const_data_ptr()), returned.nbytes(), bound.nbytes(), static_cast<int>(returned.scalar_type()), static_cast<int>(bound.scalar_type()));
+      }
+      if (std::getenv("ET_SHARD_OUTPUT_DIAG") != nullptr &&
+          shard.runtime_stats.execution_count == 1 &&
+          (shard.output_bindings[i].kind ==
+               PrefillShardPlan::OutputKind::FinalKCache ||
+           shard.output_bindings[i].kind ==
+               PrefillShardPlan::OutputKind::FinalVCache)) {
+        const Tensor& tensor = shard.output_tensors[i];
+        const uint8_t* raw = tensor.const_data_ptr<uint8_t>();
+        const float* fp32 = tensor.const_data_ptr<float>();
+        size_t raw_zero = 0;
+        size_t fp32_finite = 0;
+        size_t fp32_plausible = 0;
+        for (size_t v = 0; v < 256; ++v) {
+          raw_zero += raw[v] == 0;
+        }
+        for (size_t v = 0; v < 64; ++v) {
+          const float x = fp32[v];
+          fp32_finite += x == x && x > -1.0e30f && x < 1.0e30f;
+          fp32_plausible += x == x && x > -100.0f && x < 100.0f &&
+              (x < -1.0e-8f || x > 1.0e-8f);
+        }
+        ET_LOG(
+            Info,
+            "shard_output_format_summary shard=%zu kind=%s "
+            "raw_zero_256=%zu fp32_finite_64=%zu fp32_plausible_64=%zu",
+            shard.shard_index,
+            shard.output_bindings[i].kind ==
+                    PrefillShardPlan::OutputKind::FinalKCache
+                ? "K"
+                : "V",
+            raw_zero,
+            fp32_finite,
+            fp32_plausible);
+      }
       if (shard_tensor_dump_enabled() &&
           shard.output_bindings[i].kind !=
               PrefillShardPlan::OutputKind::FinalKCache &&
@@ -2362,8 +2458,11 @@ DecoderRunner::execute_prefill_shard(
   }
   for (const auto& binding : shard.output_bindings) {
     if (binding.kind == PrefillShardPlan::OutputKind::IntermediateAux) {
-      next_stage.aux.push_back(
-          clone_tensor(*shard.owned_outputs[binding.owned_index]));
+      if (next_stage.aux.size() <= binding.index) {
+        next_stage.aux.resize(binding.index + 1);
+      }
+      next_stage.aux[binding.index] =
+          clone_tensor(*shard.owned_outputs[binding.owned_index]);
     } else if (binding.kind == PrefillShardPlan::OutputKind::IntermediateHidden) {
       next_stage.hidden = clone_tensor(*shard.owned_outputs[binding.owned_index]);
     }
@@ -2416,6 +2515,9 @@ Error DecoderRunner::end_prefill_shard_stage(size_t shard_index) {
     const auto release_start = SteadyClock::now();
     release_prefill_shard(shard);
     shard.runtime_stats.release_ms += elapsed_ms(release_start);
+    if (shard_index == 0) {
+      prefill_persistent_shard0_prepared_ = false;
+    }
   } else if (
       prefill_shard_rebuild_.unload_prepared_shard0_method_after_execute) {
     const auto release_start = SteadyClock::now();
@@ -2497,6 +2599,8 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
       !prefill_output_values_.empty(),
       "Prefill shard outputs are not bound before execution");
   const bool restore_decode_method = module_->is_method_loaded("kv_forward");
+  const bool load_decode_after_prefill =
+      restore_decode_method || module_->method_names()->count("kv_forward") > 0;
   if (restore_decode_method) {
     ET_CHECK_MSG(
         module_->unload_method("kv_forward"),
@@ -2749,6 +2853,12 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
       ET_CHECK_MSG(
           outputs_res.get()[i].isTensor(),
           "Non Tensor Output returned from prefill shard");
+      if (std::getenv("ET_SHARD_OUTPUT_POINTER_DIAG") != nullptr &&
+          shard.runtime_stats.execution_count == 1) {
+        const Tensor& returned = outputs_res.get()[i].toTensor();
+        const Tensor& bound = shard.output_tensors[i];
+        ET_LOG(Info, "prefill output pointer diag: shard=%zu output=%zu kind=%d returned_ptr=%p bound_ptr=%p same=%d returned_nbytes=%zu bound_nbytes=%zu returned_scalar=%d bound_scalar=%d", shard.shard_index, i, static_cast<int>(shard.output_bindings[i].kind), returned.const_data_ptr(), bound.const_data_ptr(), static_cast<int>(returned.const_data_ptr() == bound.const_data_ptr()), returned.nbytes(), bound.nbytes(), static_cast<int>(returned.scalar_type()), static_cast<int>(bound.scalar_type()));
+      }
       copy_tensor_data(outputs_res.get()[i].toTensor(), shard.output_tensors[i]);
     }
     shard.runtime_stats.output_copy_ms += elapsed_ms(output_copy_start);
@@ -2831,8 +2941,31 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
         const Tensor& t = shard.output_tensors[oi];
         const size_t n = std::min<size_t>(8, static_cast<size_t>(t.numel()));
         std::ostringstream oss;
-        if (t.scalar_type() == executorch::aten::ScalarType::Float ||
-            t.scalar_type() == executorch::aten::ScalarType::Half) {
+        if (t.scalar_type() == executorch::aten::ScalarType::Float) {
+          const uint8_t* raw = t.const_data_ptr<uint8_t>();
+          const float* fp32 = t.const_data_ptr<float>();
+          oss << "raw_u8=";
+          for (size_t v = 0; v < n; ++v) {
+            if (v) oss << " ";
+            oss << static_cast<unsigned>(raw[v]);
+          }
+          oss << " fp32=";
+          for (size_t v = 0; v < n; ++v) {
+            if (v) oss << " ";
+            oss << fp32[v];
+          }
+          size_t raw_zero = 0;
+          size_t fp32_finite = 0;
+          size_t fp32_plausible = 0;
+          for (size_t v = 0; v < 256; ++v) raw_zero += raw[v] == 0;
+          for (size_t v = 0; v < 64; ++v) {
+            const float x = fp32[v];
+            fp32_finite += x == x && x > -1.0e30f && x < 1.0e30f;
+            fp32_plausible += x == x && x > -100.0f && x < 100.0f &&
+                (x < -1.0e-8f || x > 1.0e-8f);
+          }
+          ET_LOG(Info, "shard_output_format_summary layer_offset=%zu kind=%s raw_zero_256=%zu fp32_finite_64=%zu fp32_plausible_64=%zu", shard.layer_offset, b.kind == PrefillShardPlan::OutputKind::FinalKCache ? "K" : "V", raw_zero, fp32_finite, fp32_plausible);
+        } else if (t.scalar_type() == executorch::aten::ScalarType::Half) {
           const uint16_t* p = t.const_data_ptr<uint16_t>();
           for (size_t v = 0; v < n; ++v) {
             if (v) oss << " ";
@@ -2851,17 +2984,27 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
       }
     }
 
-    std::vector<Tensor> next_aux;
+    std::vector<const Tensor*> next_aux_by_index;
     previous_hidden = nullptr;
     for (const auto& binding : shard.output_bindings) {
       if (binding.kind == PrefillShardPlan::OutputKind::IntermediateAux) {
-        next_aux.push_back(*shard.owned_outputs[binding.owned_index]);
+        if (next_aux_by_index.size() <= binding.index) {
+          next_aux_by_index.resize(binding.index + 1, nullptr);
+        }
+        next_aux_by_index[binding.index] =
+            shard.owned_outputs[binding.owned_index].get();
       } else if (
           binding.kind == PrefillShardPlan::OutputKind::IntermediateHidden) {
         previous_hidden = shard.owned_outputs[binding.owned_index].get();
       }
     }
-    if (!next_aux.empty()) {
+    if (!next_aux_by_index.empty()) {
+      std::vector<Tensor> next_aux;
+      next_aux.reserve(next_aux_by_index.size());
+      for (const Tensor* tensor : next_aux_by_index) {
+        ET_CHECK_MSG(tensor != nullptr, "Missing indexed prefill aux output");
+        next_aux.push_back(*tensor);
+      }
       if (prefill_shard_swap_aux() && next_aux.size() == 2) {
         std::swap(next_aux[0], next_aux[1]);
       }
@@ -2879,9 +3022,13 @@ Result<Tensor> DecoderRunner::step_prefill_shards(std::vector<EValue>& inputs) {
         memory_after_release.hwm_bytes);
     shard.runtime_stats.total_ms += elapsed_ms(shard_total_start);
   }
-  if (restore_decode_method) {
+  if (load_decode_after_prefill) {
     ET_CHECK_OK_OR_RETURN_ERROR(module_->load_method("kv_forward"));
-    ET_LOG(Info, "restored kv_forward after streamed prefill shards");
+    ET_LOG(
+        Info,
+        restore_decode_method
+            ? "restored kv_forward after streamed prefill shards"
+            : "loaded deferred kv_forward after streamed prefill shards");
   }
   return prefill_output_values_[0];
 }
@@ -2910,6 +3057,24 @@ double DecoderRunner::prefill_persistent_shard0_prepare_ms() const {
 
 bool DecoderRunner::prefill_persistent_shard0_prepared() const {
   return prefill_persistent_shard0_prepared_;
+}
+
+double DecoderRunner::prepare_persistent_prefill_shard0_for_next_request() {
+  ET_CHECK_MSG(
+      prefill_shard_three_stage_pipeline_ == nullptr,
+      "Cannot prepare persistent shard0 while the Prefill pipeline is active");
+  ET_CHECK_MSG(
+      !prefill_shard_stage_pending_rebuild_.valid(),
+      "Cannot prepare persistent shard0 while a rebuild is pending");
+  if (!prefill_shards_.empty()) {
+    auto& shard0 = prefill_shards_.front();
+    shard0.runtime_stats = {};
+    shard0.runtime_stats.layer_offset = shard0.layer_offset;
+    shard0.runtime_stats.layer_count = shard0.layer_count;
+  }
+  const auto prepare_start = SteadyClock::now();
+  prepare_persistent_prefill_shard0();
+  return elapsed_ms(prepare_start);
 }
 
 void DecoderRunner::release_prefill_resources_before_decode() {

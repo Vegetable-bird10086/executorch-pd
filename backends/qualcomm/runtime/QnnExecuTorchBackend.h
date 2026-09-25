@@ -18,12 +18,14 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace executorch {
 namespace backends {
 namespace qnn {
 
 class QnnExecuTorchBackend;
+class QnnManager;
 
 // Minimal execution owner detached from an ExecuTorch Method/Program. It owns
 // one external reference to the initialized QNN delegate and needs no PTE
@@ -132,6 +134,7 @@ class QnnExecuTorchBackend final
       executorch::runtime::DelegateHandle*,
       DelegateOwnership>
       delegate_ownership_;
+  mutable std::vector<QnnManager*> pending_batch_contexts_;
 
   RuntimeOption qnn_runtime_log_level_{false, 0};
   RuntimeOption qnn_runtime_performance_mode_{false, 0};

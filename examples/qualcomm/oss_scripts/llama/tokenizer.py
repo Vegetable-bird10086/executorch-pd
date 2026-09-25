@@ -140,6 +140,12 @@ class TokenizerWrapper:
             if not self.repo_id and tokenizer_model:
                 try:
                     tokenizer = get_tokenizer(tokenizer_model)
+                    if self.decoder_model == "llama3-8b_instruct":
+                        # A standalone HF tokenizer.json preserves the Llama 3
+                        # vocabulary but does not expose tokenizer_config.json's
+                        # special-token roles through pytorch_tokenizers.
+                        tokenizer.bos_id = 128000
+                        tokenizer.eos_id = 128009  # <|eot_id|>
                     runtime_tokenizer_path = tokenizer_model
                     chat_template = None
                     return runtime_tokenizer_path, tokenizer, chat_template

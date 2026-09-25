@@ -45,6 +45,7 @@ class PromptProcessor {
     bool embedding_qnn_u16_input{false};
     float embedding_qnn_u16_scale{0.0f};
     int32_t embedding_qnn_u16_zero_point{0};
+    int32_t logits_bit_width{static_cast<int32_t>(sizeof(T) * 8)};
   };
   PromptProcessor(
       DecoderRunner* decoder_runner,
@@ -152,7 +153,8 @@ class PromptProcessor {
   // Prefill masks remain A16 independently of KV storage type T.
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;
-  TensorStruct<T> logits_;
+  // Logits may use a different quantized I/O width than KV.
+  TensorStruct<uint8_t> logits_;
 
   // layer -> TensorImpl
   std::vector<std::unique_ptr<executorch::aten::TensorImpl>> k_cache_in_;

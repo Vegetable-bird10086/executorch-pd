@@ -41,11 +41,15 @@ from transformers.tokenization_utils_base import (
     PreTokenizedInput,
     PreTokenizedInputPair,
     PreTrainedTokenizerBase,
-    SpecialTokensMixin,
     TextInput,
     TextInputPair,
     TruncationStrategy,
 )
+try:
+    from transformers.tokenization_utils_base import SpecialTokensMixin
+except ImportError:
+    # transformers 5 folds this mixin into PreTrainedTokenizerBase.
+    SpecialTokensMixin = PreTrainedTokenizerBase
 from transformers.utils import add_end_docstrings, logging, PaddingStrategy
 
 

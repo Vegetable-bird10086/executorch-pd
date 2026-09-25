@@ -64,6 +64,10 @@ DEFINE_string(
     "",
     "Path to the llama.cpp GPTQ2_32 GGUF model used to rebuild stripped decoder blocks in memory.");
 DEFINE_bool(
+    decode_lazy_lm_head_after_prefill,
+    false,
+    "Experimental Qwen3-14B: discard output pages before Prefill and restore with lazy metadata.");
+DEFINE_bool(
     model_ram_store,
     true,
     "Load the shared Prefill/Decode GGUF into a sealed memfd before E2E timing.");
@@ -114,6 +118,11 @@ DEFINE_string(
     tokenized_prompt,
     "",
     "Optional raw uint64 token file used instead of string prompt.");
+DEFINE_int32(
+    tokenized_prompt_repeat,
+    1,
+    "Repeat the same tokenized prompt in one resident PD session for "
+    "multi-request lifecycle and steady-state measurements.");
 DEFINE_string(
     session_prompts_path,
     "",
@@ -215,6 +224,12 @@ DEFINE_bool(
     true,
     "Release an early-prepared shard0 immediately after its only QNN execute "
     "so unused rebuilt-PTE pages do not remain resident during CPU Decode.");
+DEFINE_bool(
+    prefill_prepare_shard0_after_decode,
+    true,
+    "For multi-request sessions, rebuild and QNN-load shard0 after Decode "
+    "finishes, outside Prefill and Decode timing, retain it only until the "
+    "next request executes shard0, then release it immediately.");
 DEFINE_bool(
     prefill_unload_shard0_method_after_execute,
     false,
@@ -1227,13 +1242,15 @@ PrefillShardFiles read_prefill_shard_files(const std::string& manifest_path) {
       manifest_dir,
       read_string_array_field(manifest, graph_pos, "index_bin_paths"));
   const std::string plan_type = read_string_field(manifest, graph_pos, "prefill_plan_type");
-  // The static Qwen3 ABI is independent of the number of evenly split
-  // decoder shards. Keep accepting the legacy 4x7 name and support names
-  // such as qwen3_14x2_static emitted by a 14-shard export.
+  // The manifest-only static shard ABI is shared by Qwen3 and Llama 3 and is
+  // independent of the number of evenly split decoder shards. Keep accepting
+  // the legacy name as well as architecture-qualified export names such as
+  // qwen3_14x2_static and llama3_16x2_static.
   const std::string static_suffix = "_static";
   files.qwen3_static_plan =
       plan_type == "qwen3_static" ||
-      (plan_type.rfind("qwen3_", 0) == 0 &&
+      ((plan_type.rfind("qwen3_", 0) == 0 ||
+        plan_type.rfind("llama3_", 0) == 0) &&
        plan_type.size() > std::strlen("qwen3_") + static_suffix.size() &&
        plan_type.compare(
            plan_type.size() - static_suffix.size(),
@@ -1839,7 +1856,23 @@ void start_resident_decode_runtime_prepare(int control_fd) {
       std::strerror(errno));
   ET_LOG(
       Info,
-      "Prefill released rebuild inputs; Decode metadata/context/KV preparation started asynchronously");
+      "Decode metadata/context/KV preparation requested");
+}
+
+void wait_resident_decode_runtime_prepared(int control_fd) {
+  PdResidentReady ready;
+  ssize_t received;
+  do {
+    received = recv(control_fd, &ready, sizeof(ready), 0);
+  } while (received < 0 && errno == EINTR);
+  ET_CHECK_MSG(
+      received == static_cast<ssize_t>(sizeof(ready)) &&
+          ready.magic == PD_RESIDENT_READY_MAGIC &&
+          ready.version == PD_RESIDENT_PROTOCOL_VERSION,
+      "resident Decode runtime preparation failed (recv=%zd errno=%s)",
+      received,
+      std::strerror(errno));
+  ET_LOG(Info, "Resident Decode context and warmup complete before Prefill");
 }
 
 void send_resident_handoff(
@@ -1936,6 +1969,22 @@ void begin_resident_decode_handoff(
 }
 #else
 std::shared_ptr<example::ReadOnlyMappedFile> g_joint_model_source;
+size_t g_deferred_output_offset = 0;
+size_t g_deferred_output_bytes = 0;
+bool g_deferred_output_pending = false;
+
+bool restore_joint_output(void*) {
+  if (!g_deferred_output_pending) return true;
+  try {
+    g_joint_model_source->restore_shared_range(
+        FLAGS_gguf_model_path, g_deferred_output_offset, g_deferred_output_bytes);
+    g_deferred_output_pending = false;
+    return true;
+  } catch (const std::exception& error) {
+    ET_LOG(Error, "Output restore failed: %s", error.what());
+    return false;
+  }
+}
 
 void log_joint_model_residency(const char* stage) {
   if (!FLAGS_model_residency_probe || !g_joint_model_source) {
@@ -2692,6 +2741,24 @@ void begin_resident_decode_handoff(
           !memory_handoff.bytes->empty(),
       "joint Decode requires a direct-pointer KV handoff");
 
+  // Opt-in diagnostic only: preserve the exact direct-pointer payload before
+  // Decode consumes it. This is intentionally disabled in production runs.
+  if (const char* dump_path = std::getenv("ET_PD_DUMP_MEMORY_HANDOFF");
+      dump_path != nullptr && dump_path[0] != "\0"[0]) {
+    std::ofstream dump(dump_path, std::ios::binary | std::ios::trunc);
+    ET_CHECK_MSG(dump.is_open(), "failed to open memory handoff dump: %s", dump_path);
+    dump.write(
+        reinterpret_cast<const char*>(memory_handoff.bytes->data()),
+        static_cast<std::streamsize>(memory_handoff.bytes->size()));
+    ET_CHECK_MSG(dump.good(), "failed to write memory handoff dump: %s", dump_path);
+    ET_LOG(
+        Info,
+        "Diagnostic direct-pointer handoff dumped: path=%s bytes=%zu prompt=%d",
+        dump_path,
+        memory_handoff.bytes->size(),
+        memory_handoff.prompt_length);
+  }
+
   if (!resident.lazy_quant_profile_after_prefill &&
       FLAGS_decode_defer_runtime_until_after_prefill &&
       FLAGS_decode_stage_model_only_before_prefill &&
@@ -2767,6 +2834,11 @@ void begin_resident_decode_handoff(
   request.result = &inprocess_result;
   request.lazy_quant_profile_after_prefill =
       resident.lazy_quant_profile_after_prefill;
+  if (FLAGS_decode_lazy_lm_head_after_prefill) {
+    ET_CHECK_MSG(resident.lazy_quant_profile_after_prefill,
+                 "Deferred output requires lazy quant profile");
+    request.restore_deferred_weights = restore_joint_output;
+  }
   if (FLAGS_model_residency_probe) {
     request.decode_event_callback = joint_pd_decode_event_probe;
     request.decode_event_call_limit = 2;
@@ -3076,6 +3148,33 @@ PdE2ERuntimeStats run_pd_e2e_request(
           &stats.memory_handoff) == executorch::runtime::Error::Ok,
       "PD prefill export failed");
   stats.qnn_export_total_ms = elapsed_ms(qnn_export_start);
+  if (const char* dump_path = std::getenv("ET_PD_DUMP_MEMORY_HANDOFF");
+      dump_path != nullptr && dump_path[0] != "\0"[0]) {
+    std::vector<uint8_t> fd_bytes;
+    const uint8_t* dump_data = nullptr;
+    size_t dump_size = 0;
+    if (stats.memory_handoff.bytes && !stats.memory_handoff.bytes->empty()) {
+      dump_data = stats.memory_handoff.bytes->data();
+      dump_size = stats.memory_handoff.bytes->size();
+    } else {
+      ET_CHECK_MSG(stats.memory_handoff.fd >= 0 && stats.memory_handoff.size_bytes > 0,
+                   "memory handoff dump requires vector or memfd payload");
+      fd_bytes.resize(stats.memory_handoff.size_bytes);
+      const ssize_t count = pread(stats.memory_handoff.fd, fd_bytes.data(),
+                                  fd_bytes.size(), 0);
+      ET_CHECK_MSG(count == static_cast<ssize_t>(fd_bytes.size()),
+                   "failed to read complete memory handoff memfd");
+      dump_data = fd_bytes.data();
+      dump_size = fd_bytes.size();
+    }
+    std::ofstream dump(dump_path, std::ios::binary | std::ios::trunc);
+    ET_CHECK_MSG(dump.is_open(), "failed to open memory handoff dump: %s", dump_path);
+    dump.write(reinterpret_cast<const char*>(dump_data),
+               static_cast<std::streamsize>(dump_size));
+    ET_CHECK_MSG(dump.good(), "failed to write memory handoff dump: %s", dump_path);
+    ET_LOG(Info, "Diagnostic memory handoff dumped: path=%s bytes=%zu",
+           dump_path, dump_size);
+  }
   const auto runner_stats = session.runner->last_runtime_stats();
   stats.prompt_tokens = runner_stats.prompt_tokens;
   stats.prefill.prompt_tokens = runner_stats.prompt_tokens;
@@ -3127,6 +3226,12 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
 
   const bool use_tokenized_prompt =
       !gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default;
+  ET_CHECK_MSG(
+      FLAGS_tokenized_prompt_repeat > 0,
+      "--tokenized_prompt_repeat must be positive");
+  ET_CHECK_MSG(
+      use_tokenized_prompt || FLAGS_tokenized_prompt_repeat == 1,
+      "--tokenized_prompt_repeat requires --tokenized_prompt");
   ET_CHECK_MSG(
       !use_tokenized_prompt || !use_session_prompt_file,
       "--session_prompts_path cannot be combined with --tokenized_prompt");
@@ -3206,7 +3311,9 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
   }
   auto prefill_shard_rebuild =
       make_prefill_shard_rebuild_config(prefill_shard_files);
-  const size_t request_count = use_tokenized_prompt ? 1 : prompts.size();
+  const size_t request_count = use_tokenized_prompt
+      ? static_cast<size_t>(FLAGS_tokenized_prompt_repeat)
+      : prompts.size();
   ET_CHECK_MSG(
       FLAGS_decode_lazy_quant_profile_after_prefill >= -1 &&
           FLAGS_decode_lazy_quant_profile_after_prefill <= 1,
@@ -3257,12 +3364,23 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
         FLAGS_prefill_only,
         request_count);
   }
-  if (request_count > 1 &&
-      prefill_shard_rebuild.release_prepared_shard0_after_execute) {
+  if (request_count > 1 && FLAGS_prefill_prepare_shard0_after_decode) {
+    ET_CHECK_MSG(
+        FLAGS_prefill_persistent_shard0,
+        "--prefill_prepare_shard0_after_decode requires "
+        "--prefill_persistent_shard0");
+    prefill_shard_rebuild.release_prepared_shard0_after_execute = true;
+    ET_LOG(
+        Info,
+        "multi-request shard0 lifecycle: release_after_execute=1 "
+        "prepare_after_decode=1 request_count=%zu",
+        request_count);
+  } else if (request_count > 1 &&
+             prefill_shard_rebuild.release_prepared_shard0_after_execute) {
     prefill_shard_rebuild.release_prepared_shard0_after_execute = false;
     ET_LOG(
         Info,
-        "retaining persistent shard0 across a multi-request session: "
+        "legacy multi-request shard0 lifecycle: retain_across_decode=1 "
         "request_count=%zu",
         request_count);
   }
@@ -3358,6 +3476,16 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
         start_resident_decode_process(
             resident_embedding_matrix_path, use_lazy_quant_profile);
 #ifdef QNN_LLAMA_PD_JOINT
+    resident_decode.runtime_prepare_sent = true;
+#else
+    if (!use_lazy_quant_profile &&
+        !FLAGS_decode_defer_runtime_until_after_prefill) {
+      start_resident_decode_runtime_prepare(resident_decode.control_fd);
+      wait_resident_decode_runtime_prepared(resident_decode.control_fd);
+      resident_decode.runtime_prepare_sent = true;
+    }
+#endif
+#ifdef QNN_LLAMA_PD_JOINT
     attach_joint_sidecar_residency_source(resident_decode.runtime);
     if (use_decode_sidecar_streaming) {
       const size_t sidecar_shard_count = prefill_shard_files.pte_paths.size();
@@ -3379,16 +3507,46 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
           };
     }
 #endif
-    prefill_shard_rebuild.final_shard_overlap_callback =
-        [&resident_decode]() {
-          start_resident_decode_runtime_prepare(resident_decode.control_fd);
-          resident_decode.runtime_prepare_sent = true;
-        };
+    if (!resident_decode.runtime_prepare_sent) {
+      prefill_shard_rebuild.final_shard_overlap_callback =
+          [&resident_decode]() {
+            start_resident_decode_runtime_prepare(resident_decode.control_fd);
+            resident_decode.runtime_prepare_sent = true;
+          };
+    }
   }
 
 #ifdef QNN_LLAMA_PD_JOINT
   set_joint_model_residency_stage(JointResidencyStage::PrefillSetup);
 #endif
+  if (FLAGS_decode_lazy_lm_head_after_prefill) {
+#ifdef QNN_LLAMA_PD_JOINT
+    ET_CHECK_MSG(effective_prefill_no_output && use_lazy_quant_profile &&
+                     !FLAGS_prefill_only && prefill_shard_files.num_layers == 40 &&
+                     FLAGS_model_ram_store && !FLAGS_model_anonymous_buffer,
+                 "Deferred output requires Qwen3-14B no-output joint PD with lazy metadata and memfd");
+    const void* output_data = nullptr;
+    size_t output_bytes = 0;
+    ET_CHECK_MSG(llama_pd_inprocess_output_span(
+                     resident_decode.runtime, &output_data, &output_bytes),
+                 "No Q8_0 output tensor available");
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(g_joint_model_source->data());
+    const uintptr_t output = reinterpret_cast<uintptr_t>(output_data);
+    ET_CHECK_MSG(output >= begin && output - begin <= g_joint_model_source->size() &&
+                     output_bytes <= g_joint_model_source->size() - (output - begin),
+                 "Output is not zero-copy in shared GGUF; cannot safely discard");
+    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    const size_t offset = output - begin;
+    g_deferred_output_offset = ((offset + page - 1) / page) * page;
+    const size_t end = ((offset + output_bytes) / page) * page;
+    ET_CHECK_MSG(end > g_deferred_output_offset, "Empty deferred output range");
+    g_deferred_output_bytes = end - g_deferred_output_offset;
+    ET_LOG(Info, "Deferred output range: offset=%zu bytes=%zu tensor_bytes=%zu",
+           g_deferred_output_offset, g_deferred_output_bytes, output_bytes);
+#else
+    ET_CHECK_MSG(false, "Deferred output requires joint PD");
+#endif
+  }
   PdPrefillSession<uint8_t> prefill_session =
       create_pd_prefill_session<uint8_t>(
           std::move(module_bundle),
@@ -3405,6 +3563,16 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
   for (size_t request_index = 0; request_index < request_count;
        ++request_index) {
     const auto request_start = SteadyClock::now();
+#ifdef QNN_LLAMA_PD_JOINT
+    if (FLAGS_decode_lazy_lm_head_after_prefill) {
+      ET_CHECK_MSG(!g_deferred_output_pending, "Output restore missing from previous request");
+      g_joint_model_source->discard_shared_range(
+          g_deferred_output_offset, g_deferred_output_bytes);
+      g_deferred_output_pending = true;
+      ET_LOG(Info, "Deferred output pages released before Prefill: bytes=%zu",
+             g_deferred_output_bytes);
+    }
+#endif
     ET_LOG(
         Info,
         "PD session request begin: index=%zu total=%zu",
@@ -3414,7 +3582,10 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
     std::atomic<bool> stop_memory_monitor{false};
     std::atomic<bool> memory_monitor_running{false};
     std::thread memory_monitor;
-    if (!FLAGS_prefill_only) {
+    const char* disable_memory_monitor = std::getenv("LLAMA_PD_DISABLE_MEMORY_MONITOR");
+    if (!FLAGS_prefill_only &&
+        !(disable_memory_monitor != nullptr &&
+          std::strcmp(disable_memory_monitor, "1") == 0)) {
       memory_monitor = std::thread([&]() {
         memory_monitor_running.store(true, std::memory_order_release);
         while (!stop_memory_monitor.load(std::memory_order_relaxed)) {
@@ -3559,20 +3730,18 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
     // Send the ready KV
 #endif
 
-#ifdef QNN_LLAMA_PD_JOINT
     // Dense /proc sampling perturbs GGML worker scheduling. Treat monitor
-    // shutdown as a hard production-Decode lifecycle invariant.
+    // shutdown as a hard production-Decode lifecycle invariant for both the
+    // joint and external-resident Decode paths.
     stop_and_join_memory_monitor();
     ET_LOG(
         Info,
-        "PD memory monitor stopped before joint Decode: active=0");
-#endif
+        "PD memory monitor stopped before Decode: active=0");
     // Send the ready KV after the Prefill memory monitor has exited.
     begin_resident_decode_handoff(
         resident_decode,
         prefill_runtime.memory_handoff);
 #ifndef QNN_LLAMA_PD_JOINT
-    stop_and_join_memory_monitor();
     // The forked Decode path completes asynchronously after the handoff. Wait
     // for the child before reading its result; the joint path is synchronous
     // and has already populated resident_decode.result at this point.
@@ -3600,6 +3769,21 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
         request_index,
         decode.generated_tokens,
         elapsed_ms(request_start));
+    if (request_index + 1 < request_count &&
+        FLAGS_prefill_prepare_shard0_after_decode) {
+      const auto background_prepare_start = SteadyClock::now();
+      const double shard0_prepare_ms =
+          prefill_session.runner->prepare_persistent_prefill_shard0_for_next_request();
+      ET_LOG(
+          Info,
+          "PD background shard0 prepared after Decode: completed_request=%zu "
+          "next_request=%zu prepare_ms=%.3f wall_ms=%.3f "
+          "excluded_from_prefill_decode_timing=1",
+          request_index,
+          request_index + 1,
+          shard0_prepare_ms,
+          elapsed_ms(background_prepare_start));
+    }
   }
 
   if (!FLAGS_prefill_only) {
@@ -3617,7 +3801,7 @@ int qnn_llama_pd_e2e_main(int argc, char** argv) {
       request_count,
       elapsed_ms(e2e_start));
 #ifdef QNN_LLAMA_PD_JOINT
-  if (request_count > 1) {
+  if (request_count >= 1) {
     // Release live QNN contexts explicitly, then avoid the Android QNN SDK's
     // process-global static teardown path. The OS reclaims the process-lifetime
     // backend/device bundle.

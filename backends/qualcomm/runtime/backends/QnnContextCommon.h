@@ -14,6 +14,7 @@
 #include <executorch/backends/qualcomm/runtime/backends/QnnDeviceCommon.h>
 
 #include <memory>
+#include <vector>
 
 namespace executorch {
 namespace backends {
@@ -39,6 +40,11 @@ class QnnContext {
   virtual ~QnnContext();
 
   executorch::runtime::Error Configure();
+
+  // Restore serialized contexts in one QNN call so HTP can share resources
+  // and virtual-address space across sequentially executed graphs.
+  static executorch::runtime::Error ConfigureDeserializeBatch(
+      const std::vector<QnnContext*>& contexts);
 
   Qnn_ContextHandle_t GetHandle() const {
     return handle_;

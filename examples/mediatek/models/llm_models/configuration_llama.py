@@ -78,6 +78,18 @@ class LlamaConfig(BaseConfig):
             raise ValueError("Positional embedding must be one of: rope, alibi")
         self.position_embedding = position_embedding
         self.ntk_scaling_factor = kwargs.pop("ntk_scaling_factor", 1.0)
+        self.rope_theta = kwargs.pop("rope_theta", 10000.0)
+        self.rope_scaling = kwargs.pop("rope_scaling", None)
+        if self.rope_scaling is not None:
+            self.rope_scaling = dict(self.rope_scaling)
+            if "type" not in self.rope_scaling and "rope_type" in self.rope_scaling:
+                self.rope_scaling["type"] = self.rope_scaling["rope_type"]
+        self.original_max_position_embeddings = kwargs.pop(
+            "original_max_position_embeddings",
+            self.rope_scaling.get("original_max_position_embeddings")
+            if self.rope_scaling is not None
+            else None,
+        )
         if self.ntk_scaling_factor != 1.0 and self.position_embedding != "rope":
             raise KeyError("ntk_scaling_factor is strictly for position_embedding=rope")
         self.max_position_embeddings = max_position_embeddings

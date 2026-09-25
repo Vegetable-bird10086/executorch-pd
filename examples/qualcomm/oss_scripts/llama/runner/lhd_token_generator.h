@@ -30,6 +30,7 @@ class LhdTokenGenerator : public TokenGenerator<T> {
     int32_t gcap;
     int sliding_window;
     CacheMode cache_mode;
+    int32_t logits_bit_width{static_cast<int32_t>(sizeof(T) * 8)};
   };
   LhdTokenGenerator(
       tokenizers::Tokenizer* tokenizer,
@@ -53,7 +54,11 @@ class LhdTokenGenerator : public TokenGenerator<T> {
                 metadata.vocab_size,
                 metadata.use_int64_token,
                 metadata.sliding_window,
-                metadata.cache_mode},
+                metadata.cache_mode,
+                false,
+                0,
+                nullptr,
+                metadata.logits_bit_width},
             stats),
         metadata_(metadata),
         lhd_branch_(metadata.ngram - 1, std::vector<int32_t>(metadata.window)),

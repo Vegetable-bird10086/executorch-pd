@@ -58,6 +58,9 @@ class QnnInterface {
   DEFINE_SHIM_FUNCTION_INTERFACE(
       context_create_from_binary,
       contextCreateFromBinary);
+  DEFINE_SHIM_FUNCTION_INTERFACE(
+      context_create_from_binary_list_async,
+      contextCreateFromBinaryListAsync);
   DEFINE_SHIM_FUNCTION_INTERFACE(context_free, contextFree);
   // --------- QnnGraph ---------
   DEFINE_SHIM_FUNCTION_INTERFACE(graph_create, graphCreate);

@@ -38,6 +38,7 @@ class TokenGenerator {
     bool use_separate_embed{false};
     int32_t embedding_dim{0};
     const SeparateEmbedding* separate_embedding{nullptr};
+    int32_t logits_bit_width{static_cast<int32_t>(sizeof(T) * 8)};
   };
   TokenGenerator(
       tokenizers::Tokenizer* tokenizer,
@@ -121,9 +122,14 @@ class TokenGenerator {
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint8_t> input_embedding_;
   TensorStruct<int32_t> input_pos_;
-  TensorStruct<T> attention_mask_;
-  TensorStruct<T> window_attention_mask_;
-  TensorStruct<T> logits_;
+  // Attention activations follow the A16 model recipe independently of the
+  // KV-cache I/O width. In particular Qwen3 W4A16 uses uint8 KV tensors but
+  // uint16 attention masks; tying these buffers to T under-allocates them and
+  // corrupts the first decode step after prefill.
+  TensorStruct<uint16_t> attention_mask_;
+  TensorStruct<uint16_t> window_attention_mask_;
+  // Qwen W4A16 uses KV8 together with logits16, so logits cannot share T.
+  TensorStruct<uint8_t> logits_;
 
   // layer -> TensorImpl
   std::vector<std::unique_ptr<executorch::aten::TensorImpl>> k_cache_in_;
@@ -146,6 +152,13 @@ class TokenGenerator {
    * @param start_pos Starting position.
    */
   virtual void prepare_io(uint64_t cur_token, int64_t start_pos);
+
+  uint32_t logit_at(size_t index) const {
+    if (metadata_.logits_bit_width == 8) {
+      return logits_.data[index];
+    }
+    return reinterpret_cast<const uint16_t*>(logits_.data)[index];
+  }
 
  private:
   // metadata

@@ -716,6 +716,40 @@ def get_master_rot_emb(config, dtype, **kwargs):
 
             rot_emb = np.concatenate((master_cos, master_sin), axis=1)
 
+        elif config.rope_scaling["type"] == "llama3":
+            scaling_factor = config.rope_scaling["factor"]
+            low_freq_factor = config.rope_scaling.get("low_freq_factor", 1.0)
+            high_freq_factor = config.rope_scaling.get("high_freq_factor", 4.0)
+            original_context = config.rope_scaling.get(
+                "original_max_position_embeddings",
+                config.original_max_position_embeddings,
+            )
+            assert original_context is not None, (
+                "Llama3 RoPE scaling requires original_max_position_embeddings"
+            )
+            inv_freq = 1.0 / (
+                base ** (np.arange(0, rot_dim, 2, dtype=np.float32) / rot_dim)
+            )
+            wavelen = 2 * math.pi / inv_freq
+            low_freq_wavelen = original_context / low_freq_factor
+            high_freq_wavelen = original_context / high_freq_factor
+            smooth = (
+                original_context / wavelen - low_freq_factor
+            ) / (high_freq_factor - low_freq_factor)
+            scaled = inv_freq / scaling_factor
+            smoothed = (1.0 - smooth) * scaled + smooth * inv_freq
+            inv_freq = np.where(
+                wavelen < high_freq_wavelen,
+                inv_freq,
+                np.where(wavelen > low_freq_wavelen, scaled, smoothed),
+            )
+            t = np.arange(length, dtype=np.float32)
+            freqs = np.einsum("i,j->ij", t, inv_freq)
+            emb = np.concatenate((freqs, freqs), axis=-1)
+            master_cos = np.cos(emb)[None, None, :, :]
+            master_sin = np.sin(emb)[None, None, :, :]
+            rot_emb = np.concatenate((master_cos, master_sin), axis=1)
+
         elif config.rope_scaling["type"] == "linear":
             inv_freq = 1.0 / (
                 base ** (np.arange(0, rot_dim, 2, dtype=np.float32) / rot_dim)
@@ -730,7 +764,7 @@ def get_master_rot_emb(config, dtype, **kwargs):
 
         else:
             assert False, (
-                f"Rope scaling only supports longrope, mrope, yarn and linear,"
+                f"Rope scaling only supports longrope, mrope, yarn, llama3 and linear,"
                 f'but got {config.rope_scaling["type"]}'
             )
 

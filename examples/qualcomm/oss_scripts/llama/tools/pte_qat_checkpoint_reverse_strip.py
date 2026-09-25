@@ -60,8 +60,8 @@ TARGET_MAP = {
     "feed_forward.w2_conv": "mlp.down_proj",
 }
 BINARY_INDEX_MAGIC = 0x49515445
-BINARY_INDEX_VERSION = 2
-BINARY_INDEX_HEADER_SIZE = 32
+BINARY_INDEX_VERSION = 4
+BINARY_INDEX_HEADER_SIZE = 40
 BINARY_INDEX_RECORD_SIZE = 20
 WEIGHT_KIND_OUTPUT_CONV = 0
 WEIGHT_KIND_DECODER_LINEAR = 1
@@ -362,6 +362,22 @@ def _prepare_qat_qweight(
     return q_unpacked.transpose(0, 1).contiguous()
 
 
+def _permute_llama_rope_output_rows(tensor: torch.Tensor, heads: int) -> torch.Tensor:
+    """Match checkpoint output rows to transformed Llama Q/K graph layout."""
+    out_features = int(tensor.shape[0])
+    rows_per_pair = out_features // heads // 2
+    if heads <= 0 or rows_per_pair <= 0 or out_features % (heads * 2) != 0:
+        raise ValueError(
+            f"invalid Llama RoPE row permutation: shape={tuple(tensor.shape)} heads={heads}"
+        )
+    return (
+        tensor.reshape(heads, -1, rows_per_pair, 2, *tensor.shape[1:])
+        .transpose(2, 3)
+        .reshape(tensor.shape)
+        .contiguous()
+    )
+
+
 def _prepare_output_qweight_int8(q_packed: torch.Tensor, bits_hint: int) -> torch.Tensor:
     del bits_hint
     if q_packed.ndim != 2:
@@ -413,6 +429,8 @@ def split_blocks_encoded_from_qat(
     bits_hint: int,
     group_size: int,
     qweight_mode: str,
+    llama_rope_q_heads: int = 0,
+    llama_rope_kv_heads: int = 0,
 ) -> List[bytes]:
     base = spec.qat_base_key
     qkey = f"{base}.qweight"
@@ -440,6 +458,13 @@ def split_blocks_encoded_from_qat(
         bits_hint=bits_hint,
         group_size_hint=group_size,
     )
+    rope_heads = 0
+    if spec.name.endswith("attention.wq_conv"):
+        rope_heads = llama_rope_q_heads
+    elif spec.name.endswith("attention.wk_conv"):
+        rope_heads = llama_rope_kv_heads
+    if rope_heads > 0:
+        q_target = _permute_llama_rope_output_rows(q_target, rope_heads)
     arr = _to_checked_int4_matrix(q_target, spec)
 
     h, w = arr.shape
@@ -511,6 +536,8 @@ def realtime_delete(
     bits_hint: int,
     group_size: int,
     qweight_mode: str,
+    llama_rope_q_heads: int,
+    llama_rope_kv_heads: int,
     include_output: bool,
     strict: bool = True,
     show_progress: bool = True,
@@ -563,6 +590,8 @@ def realtime_delete(
             bits_hint=bits_hint,
             group_size=group_size,
             qweight_mode=qweight_mode,
+            llama_rope_q_heads=llama_rope_q_heads,
+            llama_rope_kv_heads=llama_rope_kv_heads,
         )
         layer_done += 1
 
@@ -687,6 +716,8 @@ def realtime_delete(
         "deleted_intervals_merged_count": len(deleted_merged),
         "keep_intervals_count": len(keep_intervals),
         "qweight_mode": qweight_mode,
+        "llama_rope_q_heads": llama_rope_q_heads,
+        "llama_rope_kv_heads": llama_rope_kv_heads,
         "bits_hint": bits_hint,
         "group_size": group_size,
         "num_splits": num_splits,
@@ -702,14 +733,11 @@ def realtime_delete(
     }
     return stripped_buf, index_payload, report_lines, source_bytes
 
-
-
-
 def write_binary_index(index_bin: Path, index_payload: Dict[str, Any]) -> None:
     records = [rec for rec in index_payload["records"] if rec.get("deleted", False)]
     records.sort(key=lambda rec: int(rec["source_offset"]))
     header = struct.pack(
-        "<IHHHHIQQ",
+        "<IHHHHIQQHHBBH",
         BINARY_INDEX_MAGIC,
         BINARY_INDEX_VERSION,
         BINARY_INDEX_HEADER_SIZE,
@@ -718,6 +746,11 @@ def write_binary_index(index_bin: Path, index_payload: Dict[str, Any]) -> None:
         len(records),
         int(index_payload["old_pte_size"]),
         int(index_payload["final_pte_size"]),
+        int(index_payload.get("llama_rope_q_heads", 0)),
+        int(index_payload.get("llama_rope_kv_heads", 0)),
+        int(index_payload.get("llama_rope_q_permutations", 0)),
+        int(index_payload.get("llama_rope_kv_permutations", 0)),
+        0,
     )
     payload = bytearray(header)
     for rec in records:
@@ -1026,6 +1059,39 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bits-hint", type=int, default=2, help="Packed source bits hint")
     ap.add_argument("--group-size", type=int, default=32, help="QAT source group size")
     ap.add_argument(
+        "--llama-rope-q-heads",
+        type=int,
+        default=0,
+        help="Apply transformed Llama RoPE row layout to Q projection blocks (0 disables).",
+    )
+    ap.add_argument(
+        "--llama-rope-kv-heads",
+        type=int,
+        default=0,
+        help="Apply transformed Llama RoPE row layout to K projection blocks (0 disables).",
+    )
+    ap.add_argument(
+        "--qat-qk-row-layout",
+        choices=["raw", "rope_transformed"],
+        default="raw",
+        help=(
+            "Q/K output-row layout stored by the QAT checkpoint. With 'raw', "
+            "the configured Llama RoPE head counts transform Q/K during strip "
+            "matching and runtime rebuild. With 'rope_transformed', Q/K are "
+            "already graph-ready and the transform is disabled."
+        ),
+    )
+    ap.add_argument(
+        "--runtime-qk-row-layout",
+        choices=["raw", "rope_transformed"],
+        default="raw",
+        help=(
+            "Q/K output-row layout stored by the runtime GGUF source. This is "
+            "independent of --qat-qk-row-layout: strip matching reconstructs "
+            "from the QAT checkpoint, while index.bin rebuilds from GGUF."
+        ),
+    )
+    ap.add_argument(
         "--num-splits",
         type=int,
         default=None,
@@ -1289,6 +1355,26 @@ def main() -> None:
         layer_start=layer_start,
         layer_end_exclusive=layer_end_exclusive,
     )
+    if (args.llama_rope_q_heads > 0) != (args.llama_rope_kv_heads > 0):
+        raise ValueError(
+            "--llama-rope-q-heads and --llama-rope-kv-heads must both be enabled or disabled"
+        )
+    match_rope_q_heads = (
+        args.llama_rope_q_heads if args.qat_qk_row_layout == "raw" else 0
+    )
+    match_rope_kv_heads = (
+        args.llama_rope_kv_heads if args.qat_qk_row_layout == "raw" else 0
+    )
+    runtime_rope_q_heads = (
+        args.llama_rope_q_heads if args.runtime_qk_row_layout == "raw" else 0
+    )
+    runtime_rope_kv_heads = (
+        args.llama_rope_kv_heads
+        if args.runtime_qk_row_layout == "raw"
+        else 0
+    )
+    runtime_rope_q_permutations = 1 if runtime_rope_q_heads > 0 else 0
+    runtime_rope_kv_permutations = 1 if runtime_rope_kv_heads > 0 else 0
     strict = not args.no_strict
 
     stripped, index_payload, report_lines, complete_pte_bytes = realtime_delete(
@@ -1298,6 +1384,8 @@ def main() -> None:
         bits_hint=args.bits_hint,
         group_size=args.group_size,
         qweight_mode=args.qweight_mode,
+        llama_rope_q_heads=match_rope_q_heads,
+        llama_rope_kv_heads=match_rope_kv_heads,
         include_output=include_output,
         strict=strict,
         show_progress=not args.no_progress,
@@ -1313,6 +1401,23 @@ def main() -> None:
             manifest_shard["shard_index"] if manifest_shard is not None else None
         ),
         final_layer_kv_only=final_layer_kv_only,
+    )
+    index_payload["qat_qk_row_layout"] = args.qat_qk_row_layout
+    index_payload["runtime_qk_row_layout"] = args.runtime_qk_row_layout
+    index_payload["configured_llama_rope_q_heads"] = args.llama_rope_q_heads
+    index_payload["configured_llama_rope_kv_heads"] = args.llama_rope_kv_heads
+    index_payload["llama_rope_q_heads"] = runtime_rope_q_heads
+    index_payload["llama_rope_kv_heads"] = runtime_rope_kv_heads
+    index_payload["llama_rope_q_permutations"] = runtime_rope_q_permutations
+    index_payload["llama_rope_kv_permutations"] = runtime_rope_kv_permutations
+    report_lines.insert(
+        0,
+        "[INFO] Q/K checkpoint row layout="
+        f"{args.qat_qk_row_layout}; match RoPE heads="
+        f"({match_rope_q_heads}, {match_rope_kv_heads}); runtime GGUF row layout="
+        f"{args.runtime_qk_row_layout}; runtime RoPE heads="
+        f"({runtime_rope_q_heads}, {runtime_rope_kv_heads}); permutations="
+        f"({runtime_rope_q_permutations}, {runtime_rope_kv_permutations})",
     )
     qnn_compile_spec_bytes = extract_qnn_compile_spec_from_complete_pte(
         complete_pte_bytes

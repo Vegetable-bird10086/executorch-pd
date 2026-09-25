@@ -27,6 +27,9 @@ template <typename T>
 int64_t PromptProcessor<T>::prepare_logits_row_for_sampling(
     int64_t logits_pos) {
   if constexpr (std::is_same_v<T, uint8_t>) {
+    if (metadata_.logits_bit_width != 8) {
+      return logits_pos;
+    }
     if (metadata_.ar_len > 1 &&
         std::getenv("ET_QNN_A8_VOCAB_MAJOR_LOGITS") != nullptr) {
       std::vector<T> selected(static_cast<size_t>(metadata_.vocab_size));
@@ -93,7 +96,8 @@ PromptProcessor<T>::PromptProcessor(
   }
 
   if (metadata_.outputs_logits) {
-    logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(T);
+    logits_.size = metadata_.ar_len * metadata_.vocab_size *
+        static_cast<size_t>(metadata_.logits_bit_width / 8);
   }
 };
 template <typename T>
@@ -220,7 +224,7 @@ void PromptProcessor<T>::init_io(
   if (metadata_.outputs_logits) {
     // [O]: logits
     Result<TensorInfo> logits = method_meta->output_tensor_meta(index++);
-    logits_.data = reinterpret_cast<T*>(buffer_manager->allocate(logits_.size));
+    logits_.data = reinterpret_cast<uint8_t*>(buffer_manager->allocate(logits_.size));
     logits_.tensor = std::make_unique<TensorImpl>(
         logits->scalar_type(),
         logits->sizes().size(),
@@ -384,7 +388,7 @@ void PromptProcessor<T>::init_io_from_metadata(IMemAlloc* buffer_manager) {
   }
 
   if (metadata_.outputs_logits) {
-    logits_.data = reinterpret_cast<T*>(buffer_manager->allocate(logits_.size));
+    logits_.data = reinterpret_cast<uint8_t*>(buffer_manager->allocate(logits_.size));
     logits_.tensor = make_tensor(
         logits_type,
         {1,
@@ -693,6 +697,34 @@ Result<uint64_t> PromptProcessor<T>::prefill(
         const int64_t stage_pos = shifted_pos + stage_prompt_pos;
         kv_manager_->init_attention_mask(
             attention_mask_.data, attention_map, metadata_.ar_len, stage_pos);
+        if (shard_index == 0 && i == 0 &&
+            std::getenv("ET_QNN_PREFILL_MASK_STATS") != nullptr) {
+          const uint16_t mask_positive = std::numeric_limits<uint16_t>::max();
+          const int rows_to_log = std::min<int>(metadata_.ar_len, 12);
+          for (int row = 0; row < rows_to_log; ++row) {
+            size_t allowed = 0;
+            int first = -1;
+            int last = -1;
+            const size_t row_offset =
+                static_cast<size_t>(row) * metadata_.context_len;
+            for (int col = 0; col < metadata_.context_len; ++col) {
+              if (attention_mask_.data[row_offset + col] == mask_positive) {
+                if (first < 0) {
+                  first = col;
+                }
+                last = col;
+                ++allowed;
+              }
+            }
+            ET_LOG(
+                Info,
+                "PD prefill mask stats: row=%d allowed=%zu first=%d last=%d",
+                row,
+                allowed,
+                first,
+                last);
+          }
+        }
         if (metadata_.cache_mode == CacheMode::HybridCache) {
           kv_manager_->init_attention_mask(
               window_attention_mask_.data,
@@ -819,8 +851,10 @@ Result<uint64_t> PromptProcessor<T>::prefill(
   }
   const int64_t logits_pos =
       (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len;
-  if (std::getenv("ET_A8_IO_DIAG") != nullptr) {
-    const T* row = logits_.data + logits_pos * metadata_.vocab_size;
+  if (std::getenv("ET_A8_IO_DIAG") != nullptr &&
+      metadata_.logits_bit_width == static_cast<int32_t>(sizeof(T) * 8)) {
+    const T* raw_logits = reinterpret_cast<const T*>(logits_.data);
+    const T* row = raw_logits + logits_pos * metadata_.vocab_size;
     T raw_min = std::numeric_limits<T>::max();
     T raw_max = std::numeric_limits<T>::min();
     std::array<bool, 1u << (sizeof(T) * 8)> seen{};
@@ -859,7 +893,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
       size_t strided_distinct = 0;
       int32_t strided_top1 = 0;
       for (int32_t i = 0; i < metadata_.vocab_size; ++i) {
-        const T raw = logits_.data[
+        const T raw = raw_logits[
             static_cast<size_t>(i) * metadata_.ar_len + logits_pos];
         strided_min = std::min(strided_min, raw);
         strided_max = std::max(strided_max, raw);
@@ -867,7 +901,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
           strided_seen[static_cast<size_t>(raw)] = true;
           ++strided_distinct;
         }
-        if (raw > logits_.data[
+        if (raw > raw_logits[
                       static_cast<size_t>(strided_top1) * metadata_.ar_len +
                       logits_pos]) {
           strided_top1 = i;

@@ -169,7 +169,8 @@ class DecoderRunner {
   void use_qwen3_prefill_static_plan(
       bool enabled,
       int32_t aux_size = 64,
-      int32_t hidden_size = 2048);
+      int32_t hidden_size = 2048,
+      bool llama3_layout = false);
   void set_prefill_outputs_logits(bool enabled);
   void set_prefill_separate_embed(bool enabled);
   void set_prefill_etdump_config(PrefillEtDumpConfig config);
@@ -184,6 +185,7 @@ class DecoderRunner {
   bool prefill_qnn_backend_prewarmed() const;
   double prefill_persistent_shard0_prepare_ms() const;
   bool prefill_persistent_shard0_prepared() const;
+  double prepare_persistent_prefill_shard0_for_next_request();
   void set_prefill_active_execute_callback(std::function<void()> callback);
   void release_prefill_resources_before_decode();
   void begin_prefill_request();
@@ -265,6 +267,10 @@ class DecoderRunner {
           logits_last, logits_last + vocab_size) - logits_last);
     }
     auto* logits_last = logits_ptr_for_pos<uint16_t>(logits_tensor, pos);
+    if (logits_quantized_) {
+      return static_cast<int32_t>(std::max_element(
+          logits_last, logits_last + vocab_size) - logits_last);
+    }
     int32_t best_token = 0;
     float best_logit = -std::numeric_limits<float>::infinity();
     bool found_finite_logit = false;
@@ -301,6 +307,10 @@ class DecoderRunner {
         "Unsupported logits bit width: %d",
         bit_width);
     logits_bit_width_ = bit_width;
+  }
+
+  void set_logits_quantized(bool quantized) {
+    logits_quantized_ = quantized;
   }
 
  protected:
@@ -387,6 +397,7 @@ class DecoderRunner {
     std::thread load_worker;
   };
 
+  void preload_prefill_shard_inputs(PrefillShardPlan& shard);
   void preload_prefill_shard(PrefillShardPlan& shard);
   PteRebuildResult rebuild_prefill_shard(PrefillShardPlan& shard);
   void attach_rebuilt_prefill_shard(
@@ -452,11 +463,13 @@ class DecoderRunner {
   int32_t prefill_vocab_size_{0};
   bool prefill_has_window_attention_mask_{false};
   bool prefill_qwen3_static_plan_{false};
+  bool prefill_llama3_static_layout_{false};
   int32_t prefill_static_aux_size_{64};
   int32_t prefill_static_hidden_size_{2048};
   bool prefill_outputs_logits_{true};
   bool prefill_separate_embed_{false};
   int32_t logits_bit_width_{16};
+  bool logits_quantized_{false};
   PrefillEtDumpConfig prefill_etdump_config_;
   std::vector<std::chrono::steady_clock::time_point> prefill_shard_stage_starts_;
   std::future<PteRebuildResult> prefill_shard_stage_pending_rebuild_;

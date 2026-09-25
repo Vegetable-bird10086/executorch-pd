@@ -717,6 +717,18 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        "--qat_qk_row_layout",
+        default="raw",
+        choices=["raw", "rope_transformed"],
+        type=str,
+        help=(
+            "Q/K output-row layout stored by the QAT checkpoint. 'raw' keeps "
+            "the historical behavior and applies the Llama RoPE transform; "
+            "'rope_transformed' skips that transform because the checkpoint "
+            "already stores the graph-ready row layout."
+        ),
+    )
+    parser.add_argument(
         "--qat_replace_debug",
         action="store_true",
         help=(

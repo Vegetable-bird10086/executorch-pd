@@ -69,7 +69,8 @@ uint8_t Quantize(float real, float scale, int32_t offset, QnnKvAbiStats& stats) 
 
 } // namespace
 
-QnnKvAbi::QnnKvAbi(const std::string& path) {
+QnnKvAbi::QnnKvAbi(const std::string& path, bool llama3Layout)
+    : llama3Layout_(llama3Layout) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("unable to open QNN KV ABI: " + path);
@@ -195,8 +196,14 @@ void QnnKvAbi::ConvertCanonicalFp16Layers(
             FastWalshHadamard(transformed.data(), headDim_);
           }
           for (size_t dim = 0; dim < headDim_; ++dim) {
+            size_t sourceDim = dim;
+            if (kind == 0 && llama3Layout_) {
+              const size_t half = headDim_ / 2;
+              sourceDim = (sourceDim % 2) * half + sourceDim / 2;
+              sourceDim = (sourceDim % 2) * half + sourceDim / 2;
+            }
             const float real = kind == 0
-                ? transformed[dim] * metadata.rotationUnit
+                ? transformed[sourceDim] * metadata.rotationUnit
                 : transformed[dim];
             output[outputTokenBase + dim] = Quantize(
                 real, qparams[head].scale, qparams[head].offset, local);
@@ -268,8 +275,14 @@ void QnnKvAbi::ConvertCacheLayer(
         FastWalshHadamard(transformed.data(), headDim_);
       }
       for (size_t dim = 0; dim < headDim_; ++dim) {
+        size_t sourceDim = dim;
+        if (kind == 0 && llama3Layout_) {
+          const size_t half = headDim_ / 2;
+          sourceDim = (sourceDim % 2) * half + sourceDim / 2;
+          sourceDim = (sourceDim % 2) * half + sourceDim / 2;
+        }
         const float real = kind == 0
-            ? transformed[dim] * metadata.rotationUnit
+            ? transformed[sourceDim] * metadata.rotationUnit
             : transformed[dim];
         output[outputTokenBase + dim] = Quantize(
             real, qparams[head].scale, qparams[head].offset, local);

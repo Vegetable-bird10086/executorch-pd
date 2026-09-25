@@ -721,8 +721,11 @@ class TextDecoder(Component):
 
         decoder.load_state_dict(state_dict, strict=True, assign=True)
 
-        # apply spin quant if required
-        if any([self.config.r1, self.config.r2]):
+        # Apply SpinQuant if required. Keep model defaults unchanged, but allow
+        # opt-in diagnostic exports for activation-outlier investigations.
+        spin_r1 = self.config.r1 or os.environ.get("ET_QNN_LLAMA_SPIN_R1", "") == "1"
+        spin_r2 = self.config.r2 or os.environ.get("ET_QNN_LLAMA_SPIN_R2", "") == "1"
+        if any([spin_r1, spin_r2]):
             decoder.config = types.SimpleNamespace(
                 dim=decoder.dim,
                 head_dim=decoder.dim // decoder.n_heads,
@@ -731,8 +734,8 @@ class TextDecoder(Component):
             )
             apply_spinquant(
                 decoder,
-                use_r1=self.config.r1,
-                use_r2=self.config.r2,
+                use_r1=spin_r1,
+                use_r2=spin_r2,
                 use_r4=False,
                 pretrained_rotation_path=None,
                 qkv_split=True,
@@ -2848,6 +2851,32 @@ class TextDecoder(Component):
 
         return fallback_group_size
 
+    def _permute_qat_rope_output_rows(
+        self, tensor: torch.Tensor, heads: int
+    ) -> torch.Tensor:
+        """Match QAT output-channel rows to the transformed Llama Q/K graph."""
+        out_features = int(tensor.shape[0])
+        partial_rotary_dim = int(1 // self.model_args.partial_rotary_factor)
+        rows_per_pair = out_features // heads // 2 // partial_rotary_dim
+        if (
+            heads <= 0
+            or rows_per_pair <= 0
+            or out_features % (heads * 2 * partial_rotary_dim) != 0
+        ):
+            raise RuntimeError(
+                f"invalid Llama RoPE QAT row permutation: "
+                f"shape={tuple(tensor.shape)} heads={heads} "
+                f"partial_rotary_dim={partial_rotary_dim}"
+            )
+        transformed = (
+            tensor.reshape(
+                heads, -1, rows_per_pair, 2, *tensor.shape[1:]
+            )
+            .transpose(2, 3)
+            .reshape(tensor.shape)
+        )
+        return transformed.contiguous()
+
     def _prepare_qat_qweight_for_target(
         self,
         q_packed: torch.Tensor,
@@ -3184,20 +3213,62 @@ class TextDecoder(Component):
             "qat_qweight_mode",
             "qweight_minus_qzeros",
         )
+        qk_row_layout = getattr(self.control_args, "qat_qk_row_layout", "raw")
+        if qk_row_layout not in {"raw", "rope_transformed"}:
+            raise ValueError(f"unsupported QAT Q/K row layout: {qk_row_layout}")
         bits_hint = int(getattr(self.control_args, "qat_source_wbits", 2))
         group_size_hint = int(getattr(self.control_args, "qat_source_group_size", 32))
         debug = getattr(self.control_args, "qat_replace_debug", False)
         verify_chain = getattr(self.control_args, "qat_verify_chain", False)
 
         try:
-            from safetensors.torch import load_file
+            from safetensors import safe_open
 
-            qat_sd = load_file(qat_path)
+            qat_file = safe_open(
+                qat_path, framework="pt", device="cpu"
+            )
+            qat_keys = set(qat_file.keys())
+
+            class _LazySafetensors:
+                def __contains__(self, key):
+                    return key in qat_keys
+
+                def __getitem__(self, key):
+                    if key not in qat_keys:
+                        raise KeyError(key)
+                    return qat_file.get_tensor(key)
+
+                def get(self, key, default=None):
+                    return qat_file.get_tensor(key) if key in qat_keys else default
+
+            qat_sd = _LazySafetensors()
         except Exception as e:
             logger.warning("[qat_replace] failed to load checkpoint %s: %s", qat_path, e)
             return
 
         layer_count = int(self.meta.get("get_n_layers", 28))
+        replace_layer_start = int(os.getenv("ET_QNN_QAT_REPLACE_LAYER_START", "0"))
+        replace_layer_limit = int(os.getenv("ET_QNN_QAT_REPLACE_LAYER_LIMIT", "0"))
+        replace_layer_end = layer_count if replace_layer_limit <= 0 else min(
+            layer_count, replace_layer_start + replace_layer_limit
+        )
+        if not (0 <= replace_layer_start < replace_layer_end <= layer_count):
+            raise RuntimeError(
+                "invalid QAT replacement layer range: "
+                f"start={replace_layer_start} end={replace_layer_end} "
+                f"layers={layer_count}"
+            )
+        logger.info(
+            "[qat_replace] layer range [%d, %d) of %d",
+            replace_layer_start,
+            replace_layer_end,
+            layer_count,
+        )
+        logger.info(
+            "[qat_replace] Q/K checkpoint row layout=%s; apply_rope_row_transform=%s",
+            qk_row_layout,
+            qk_row_layout == "raw",
+        )
         target_map = {
             "attention.wq_conv": "self_attn.q_proj",
             "attention.wk_conv": "self_attn.k_proj",
@@ -3217,7 +3288,7 @@ class TextDecoder(Component):
         matched = 0
         replaced_attr_names = set()
 
-        for layer_i in range(layer_count):
+        for layer_i in range(replace_layer_start, replace_layer_end):
             for local_key, qat_local in target_map.items():
                 layer_keyword = f"layers.{layer_i}.{local_key}"
                 refs = self._find_qweight_scale_zero_attrs_for_layer(gm, layer_keyword)
@@ -3315,6 +3386,20 @@ class TextDecoder(Component):
                         )
                         if q_src_prepared is not None:
                             q_src_for_target = q_src_prepared
+                        if (
+                            self.config.transform_weight
+                            and qk_row_layout == "raw"
+                            and qat_local in {"self_attn.q_proj", "self_attn.k_proj"}
+                            and isinstance(q_src_for_target, torch.Tensor)
+                        ):
+                            rope_heads = (
+                                self.model_args.n_heads
+                                if qat_local == "self_attn.q_proj"
+                                else self.model_args.n_kv_heads
+                            )
+                            q_src_for_target = self._permute_qat_rope_output_rows(
+                                q_src_for_target, rope_heads
+                            )
 
                     if self._replace_attr_tensor(
                         gm,
@@ -3336,6 +3421,20 @@ class TextDecoder(Component):
                         if isinstance(s_target_tensor, torch.Tensor):
                             s_src_for_target = self._prepare_qat_scale_for_target(
                                 s_src, s_target_tensor
+                            )
+                        if (
+                            self.config.transform_weight
+                            and qk_row_layout == "raw"
+                            and qat_local in {"self_attn.q_proj", "self_attn.k_proj"}
+                            and isinstance(s_src_for_target, torch.Tensor)
+                        ):
+                            rope_heads = (
+                                self.model_args.n_heads
+                                if qat_local == "self_attn.q_proj"
+                                else self.model_args.n_kv_heads
+                            )
+                            s_src_for_target = self._permute_qat_rope_output_rows(
+                                s_src_for_target, rope_heads
                             )
                         if self._replace_attr_tensor(
                             gm,

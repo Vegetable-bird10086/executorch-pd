@@ -11,6 +11,8 @@ import torch
 from executorch.backends.qualcomm.quantizer.custom_annotation import (
     annotate_kv_8bit,
     annotate_kv_8bit_a8,
+    annotate_llama_residual_fp16,
+    annotate_llama_residual_percentile_a16,
     annotate_llm_all_token_axis_a8,
     annotate_llm_residual_token_axis_a8,
     annotate_llm_v_projection_token_axis_a8,
@@ -289,6 +291,12 @@ class Llama3_8BQuantRecipe(StaticLLMQuantRecipe):
 
         # KV cache 用 8bit（非常关键）
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+        if os.environ.get("ET_QNN_LLAMA_RESIDUAL_FP16", "") == "1":
+            self.recipe.custom_quant_annotations.append(annotate_llama_residual_fp16)
+        if os.environ.get("ET_QNN_LLAMA_RESIDUAL_PERCENTILE_A16", "") == "1":
+            self.recipe.custom_quant_annotations.append(
+                annotate_llama_residual_percentile_a16
+            )
 
 class Llama2_7BQuantRecipe(StaticLLMQuantRecipe):
     # Default to groupwise 4-bit weights with 16-bit activations.
